@@ -1,7 +1,7 @@
 import json
 
 from stages.eval import agreement
-from stages.package import modelfile
+from stages.package import modelfile, template_family
 
 REF = json.dumps({"category": "billing", "priority": "high",
                   "summary": "Customer was double-charged and wants a refund.", "customer_sentiment": "negative"})
@@ -30,3 +30,22 @@ def test_modelfile_chatml():
     mf = modelfile("Be terse.", "{% for m in messages %}<|im_start|>{{ m.role }}...")
     assert mf.startswith("FROM ./model.gguf")
     assert 'PARAMETER stop "<|im_end|>"' in mf and 'SYSTEM """Be terse."""' in mf
+
+
+def test_modelfile_gemma4():
+    mf = modelfile("Be terse.", "{{ bos_token }}{{ '<|turn>' + role + '\\n' }}...{{ '<turn|>\\n' }}")
+    assert "<|turn>system\n{{ .System }}<turn|>" in mf and "<|turn>model\n" in mf
+    assert 'PARAMETER stop "<turn|>"' in mf and "<|im_end|>" not in mf
+
+
+def test_modelfile_gemma3_folds_system_into_user():
+    mf = modelfile("Be terse.", "{{ '<start_of_turn>' + role }}...")
+    assert "<start_of_turn>user" in mf and 'PARAMETER stop "<end_of_turn>"' in mf
+    assert "<start_of_turn>system" not in mf
+
+
+def test_template_family_falls_back_to_model_id():
+    assert template_family("", "google/gemma-4-E4B-it") == "gemma4"
+    assert template_family("", "google/gemma-3-4b-it") == "gemma3"
+    assert template_family("", "Qwen/Qwen3-4B-Instruct-2507") == "chatml"
+    assert template_family("{{ unknown }}", "google/gemma-4-E4B-it") is None  # readable but unknown: leave it to Ollama

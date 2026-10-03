@@ -4,9 +4,10 @@ Writes:
   out/model.gguf   the model the TUI downloads
   out/Modelfile    for `ollama create <name> -f Modelfile`
 
-The Modelfile spells out the ChatML template and stop tokens for Qwen-family
-models instead of relying on Ollama to recognise the GGUF's Jinja template,
-so a REAP-pruned model still chats correctly in any Ollama version.
+The Modelfile spells out the chat template and stop tokens (ChatML for Qwen,
+Gemma 4's <|turn> format, Gemma 2/3's <start_of_turn>) instead of relying on
+Ollama to recognise the GGUF's Jinja template, so the model still chats
+correctly in an Ollama version that does not know the family yet.
 """
 
 from __future__ import annotations
@@ -43,11 +44,57 @@ def chat_template(job: Job, gguf_path) -> str:
         return ""
 
 
-def modelfile(system: str, template: str) -> str:
+# Gemma 4: system is its own turn; the assistant role is "model".
+GEMMA4_TEMPLATE = """{{- if .System }}<|turn>system
+{{ .System }}<turn|>
+{{ end }}{{- range .Messages }}{{- if ne .Role "system" }}<|turn>{{ if eq .Role "assistant" }}model{{ else }}{{ .Role }}{{ end }}
+{{ .Content }}<turn|>
+{{ end }}{{- end }}<|turn>model
+"""
+
+# Gemma 2/3 have no system role: the system prompt is folded into the first user turn.
+GEMMA3_TEMPLATE = """{{- $sys := .System }}{{- $first := true }}{{- range .Messages }}{{- if eq .Role "user" }}<start_of_turn>user
+{{ if and $first $sys }}{{ $sys }}
+
+{{ end }}{{ .Content }}<end_of_turn>
+{{ $first = false }}{{- else if eq .Role "assistant" }}<start_of_turn>model
+{{ .Content }}<end_of_turn>
+{{ end }}{{- end }}<start_of_turn>model
+"""
+
+FAMILIES = {
+    "chatml": (CHATML_TEMPLATE, ["<|im_end|>", "<|im_start|>"]),
+    "gemma4": (GEMMA4_TEMPLATE, ["<turn|>", "<|turn>"]),
+    "gemma3": (GEMMA3_TEMPLATE, ["<end_of_turn>", "<start_of_turn>"]),
+}
+
+
+def template_family(template: str, model_id: str = "") -> str | None:
+    """Which explicit template to write: from the GGUF's Jinja template, else
+    (unreadable, e.g. dry run) from the HF model id. None leaves it to Ollama."""
+    if "<|turn>" in template:
+        return "gemma4"
+    if "<start_of_turn>" in template:
+        return "gemma3"
+    if "<|im_start|>" in template:
+        return "chatml"
+    if template:
+        return None
+    m = model_id.lower()
+    if "gemma-4" in m or "gemma4" in m:
+        return "gemma4"
+    if "gemma" in m:
+        return "gemma3"
+    return "chatml"  # Qwen family (also the dry-run default)
+
+
+def modelfile(system: str, template: str, model_id: str = "") -> str:
     lines = ["FROM ./model.gguf"]
-    if "<|im_start|>" in template or not template:  # Qwen family (also the dry-run default)
-        lines += [f'TEMPLATE """{CHATML_TEMPLATE}"""',
-                  'PARAMETER stop "<|im_end|>"', 'PARAMETER stop "<|im_start|>"']
+    family = template_family(template, model_id)
+    if family:
+        tmpl, stops = FAMILIES[family]
+        lines.append(f'TEMPLATE """{tmpl}"""')
+        lines += [f'PARAMETER stop "{s}"' for s in stops]
     lines += ["PARAMETER temperature 0.3", "PARAMETER num_ctx 8192", f'SYSTEM """{system}"""']
     return "\n".join(lines) + "\n"
 
@@ -65,7 +112,8 @@ def run_stage(job: Job) -> None:
     os.link(src, dst)  # same filesystem; avoids copying several GB
 
     system = system_prompt(spec).replace('"""', "'''")
-    job.path("out", "Modelfile").write_text(modelfile(system, chat_template(job, dst)))
+    model_id = job.config.student if report["winner"] == "dense" else job.config.teacher
+    job.path("out", "Modelfile").write_text(modelfile(system, chat_template(job, dst), model_id))
     job.mark_done(STAGE, {"winner": report["winner"]})
     emit(STAGE, "done", 100, f"{report['winner']} ready at out/model.gguf")
 

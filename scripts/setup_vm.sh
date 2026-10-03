@@ -9,7 +9,7 @@ set -euo pipefail
 NVME=${NVME:-/mnt/nvme}
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 TEACHER=${TEACHER:-Qwen/Qwen3-30B-A3B-Instruct-2507}
-STUDENT=${STUDENT:-Qwen/Qwen3-4B-Instruct-2507}
+STUDENT=${STUDENT:-google/gemma-4-E4B-it}
 
 say() { printf '\n==> %s\n' "$*"; }
 
@@ -39,7 +39,7 @@ uv pip install -q --python "$NVME/venv-vllm/bin/python" -e "$REPO" --no-deps
 say "Training venv (reap, heal, quantize, eval, package, API)"
 uv venv -q --python 3.12 "$NVME/venv-train"
 uv pip install -q --python "$NVME/venv-train/bin/python" \
-  "torch>=2.7" "transformers>=4.57" "peft>=0.17" accelerate safetensors \
+  "torch>=2.7" "transformers>=5.5" "peft>=0.17" accelerate safetensors \
   anthropic httpx fastapi uvicorn sentencepiece gguf
 uv pip install -q --python "$NVME/venv-train/bin/python" -e "$REPO" --no-deps
 

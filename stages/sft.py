@@ -44,6 +44,12 @@ def _lora_model(model, r: int, alpha: int, targets: list[str], train_experts: bo
     if train_experts or not blocks:
         targets = list(targets) + MLP  # expert MLPs (4.x ModuleList) or dense MLPs
     targets = [t for t in dict.fromkeys(targets) if t in names]
+    attn_only = [t for t in targets if t not in MLP]
+    if hasattr(getattr(model, "model", None), "language_model"):
+        # multimodal checkpoint (Gemma 4): LoRA the text decoder only, not the
+        # vision/audio towers that reuse the same projection names
+        targets = rf".*language_model\..*\.({'|'.join(targets)})"
+        attn_only = rf".*language_model\..*\.({'|'.join(attn_only)})"
     extra = {}
     if blocks and train_experts and not isinstance(blocks[0][1].experts, nn.ModuleList):
         # fused experts (transformers 5.x): LoRA on the stacked expert weights
@@ -58,7 +64,7 @@ def _lora_model(model, r: int, alpha: int, targets: list[str], train_experts: bo
             raise
         log(f"heal: LoRA on fused experts unsupported here ({e}); training attention and router only")
         cfg = LoraConfig(r=r, lora_alpha=alpha, lora_dropout=0.0,
-                         target_modules=[t for t in targets if t not in MLP],
+                         target_modules=attn_only,
                          modules_to_save=modules_to_save, task_type="CAUSAL_LM")
         pm = get_peft_model(model, cfg)
     for p in pm.parameters():  # keep trainable weights in fp32 for stable updates

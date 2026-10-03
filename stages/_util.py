@@ -23,7 +23,7 @@ class Config:
     """Backend knobs. Override per job with <job>/config.json."""
 
     teacher: str = "Qwen/Qwen3-30B-A3B-Instruct-2507"
-    student: str = "Qwen/Qwen3-4B-Instruct-2507"
+    student: str = "google/gemma-4-E4B-it"  # dense fallback; Qwen/Qwen3-4B-Instruct-2507 also works
     models_dir: str = os.environ.get("LOBBOT_MODELS", "/mnt/nvme/models")
     llama_cpp: str = os.environ.get("LOBBOT_LLAMA_CPP", "/mnt/nvme/llama.cpp")
     # Data
@@ -48,7 +48,7 @@ class Config:
     bit_floor: str = "q2_k"
     bit_ceiling: str = "q6_k"
     # Eval
-    judge_model: str = "claude-sonnet-5-5"
+    judge_model: str = "gemini-3.8-flash"  # gemini-* needs GEMINI_API_KEY, claude-* ANTHROPIC_API_KEY
     laptop_bandwidth_gb_s: float = 120.0  # MacBook Air M4; M5 is ~153
 
 

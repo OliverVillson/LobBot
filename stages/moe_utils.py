@@ -10,9 +10,20 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def decoder_layers(model):
+    """The text decoder layers, also for multimodal checkpoints such as Gemma 4
+    (Gemma4ForConditionalGeneration keeps them under model.language_model)."""
+    inner = getattr(model, "model", model)
+    for owner in (inner, getattr(inner, "language_model", None), getattr(model, "language_model", None)):
+        layers = getattr(owner, "layers", None) if owner is not None else None
+        if layers is not None:
+            return layers
+    raise AttributeError(f"cannot find decoder layers in {type(model).__name__}")
+
+
 def find_moe_blocks(model) -> list[tuple[int, nn.Module]]:
     """(decoder layer index, moe block) for every sparse layer."""
-    layers = model.model.layers
+    layers = decoder_layers(model)
     out = []
     for i, layer in enumerate(layers):
         mlp = getattr(layer, "mlp", None) or getattr(layer, "block_sparse_moe", None)

@@ -5,8 +5,9 @@ held-out inputs with the same system prompt the training data used. Every
 answer is scored two ways:
   agreement  match with the teacher's reference answer (field-level for JSON
              outputs, token F1 otherwise). Needs no API key.
-  judge      Claude scores each answer 0-10 against the TaskSpec criteria
-             (teacher references included). Used as `score` when available.
+  judge      an LLM judge (Gemini by default, cfg.judge_model) scores each
+             answer 0-10 against the TaskSpec criteria (teacher references
+             included). Used as `score` when available.
 Also records the decode speed measured on the VM. Writes out/eval.json, the
 contract the scoreboard screen reads.
 """
@@ -19,6 +20,7 @@ import os
 import re
 import statistics
 import subprocess
+import threading
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
@@ -133,24 +135,66 @@ def agreement(answer: str, reference: str) -> float:
     return _f1(answer, reference)
 
 
-def judge(spec, model: str, inputs: list[str], answers: list[str]) -> float | None:
-    """Mean Claude score in [0, 1]; None if no answer could be judged."""
-    import anthropic
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 
-    client = anthropic.Anthropic(max_retries=6)
+
+def judge_key(model: str) -> str | None:
+    """The API key the judge model needs, or None if it is not set."""
+    if model.startswith("gemini"):
+        return os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    return os.environ.get("ANTHROPIC_API_KEY")
+
+
+def _ask_gemini(model: str, prompt: str) -> str:
+    """One Gemini call over its OpenAI-compatible endpoint, retrying rate limits."""
+    import httpx
+
+    for attempt in range(6):
+        r = httpx.post(GEMINI_URL, timeout=120, headers={"Authorization": f"Bearer {judge_key(model)}"}, json={
+            "model": model, "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.0, "max_tokens": 1024, "reasoning_effort": "low",
+        })
+        if r.status_code in (429, 500, 502, 503, 504) and attempt < 5:
+            time.sleep(2 ** attempt)
+            continue
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"].get("content") or ""
+    return ""
+
+
+def judge(spec, model: str, inputs: list[str], answers: list[str]) -> float | None:
+    """Mean judge score in [0, 1]; None if no answer could be judged. gemini-*
+    models go to the Gemini API; claude-* go to Anthropic, through condense.chat
+    when CONDENSE_API_KEY is set."""
+    if model.startswith("gemini"):
+        ask = lambda prompt: _ask_gemini(model, prompt)
+    else:
+        from stages.condense import anthropic_client
+
+        client = anthropic_client(max_retries=6)
+        ask = lambda prompt: client.messages.create(
+            model=model, max_tokens=20, messages=[{"role": "user", "content": prompt}]).content[0].text
+
+    broken = threading.Event()  # a 4xx (bad key or model id) will not fix itself: stop calling
 
     def one(pair) -> float | None:
         text, answer = pair
+        if broken.is_set():
+            return None
         try:
-            msg = client.messages.create(model=model, max_tokens=20, messages=[{"role": "user", "content": (
+            reply = ask(
                 f"Task: {spec.description}\nOutput format: {spec.output_format}\nCriteria: {spec.eval_criteria}\n\n"
                 f"<input>\n{text}\n</input>\n<answer>\n{answer}\n</answer>\n\n"
-                "Score how well the answer meets the criteria from 0 to 10. Reply with the number only."
-            )}])
+                "Score how well the answer meets the criteria from 0 to 10. Reply with the number only.")
         except Exception as e:
-            print(f"[eval] judge call failed: {e}", flush=True)
+            status = getattr(getattr(e, "response", None), "status_code", None) or getattr(e, "status_code", None)
+            if isinstance(status, int) and 400 <= status < 500 and status != 429 and not broken.is_set():
+                broken.set()
+                print(f"[eval] judge disabled after HTTP {status}: {e}", flush=True)
+            elif not broken.is_set():
+                print(f"[eval] judge call failed: {e}", flush=True)
             return None
-        m = re.search(r"\d+(\.\d+)?", msg.content[0].text)
+        m = re.search(r"\d+(\.\d+)?", reply)
         return min(10.0, float(m.group(0))) / 10 if m else None
 
     with ThreadPoolExecutor(16) as ex:
@@ -177,9 +221,10 @@ def run_stage(job: Job) -> None:
     refs = [h["reference"] for h in held]
     system = system_prompt(spec)
     teacher_name = cfg.teacher.split("/")[-1]
-    use_judge = bool(os.environ.get("ANTHROPIC_API_KEY")) and not DRY_RUN
+    use_judge = bool(judge_key(cfg.judge_model)) and not DRY_RUN
     if not use_judge and not DRY_RUN:
-        emit(STAGE, msg="ANTHROPIC_API_KEY not set on the VM; scoring by agreement with the teacher")
+        need = "GEMINI_API_KEY" if cfg.judge_model.startswith("gemini") else "ANTHROPIC_API_KEY"
+        emit(STAGE, msg=f"{need} not set on the VM; scoring by agreement with the teacher")
 
     results: dict[str, dict] = {}
     teacher_judge = None

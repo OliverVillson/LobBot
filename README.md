@@ -24,7 +24,7 @@ data      teacher (vLLM) writes ~2k task examples from the TaskSpec seeds
 reap      REAP 50% expert pruning, calibrated on that task data; per-layer importance
 heal      LoRA distillation of the pruned model on teacher answers (+ dense 4B fallback)
 quantize  dynamic per-layer expert bit widths from importance + static types for the rest
-eval      held-out answers judged by Claude; size and tok/s estimate; pick the winner
+eval      held-out answers judged by Gemini; size and tok/s estimate; pick the winner
 package   out/model.gguf + out/Modelfile for Ollama
 ```
 
@@ -43,7 +43,9 @@ Per-job overrides of `stages/_util.py:Config` go in `<dir>/config.json`.
 NVME=/mnt/nvme bash scripts/setup_vm.sh       # venvs, llama.cpp, weights
 source .env.vm
 mkdir -p /mnt/nvme/jobs/demo && cp examples/support-tickets.taskspec.json /mnt/nvme/jobs/demo/taskspec.json
-export ANTHROPIC_API_KEY=...                   # for the eval judge
+export GEMINI_API_KEY=...                      # eval judge (Gemini, cfg.judge_model)
+# optional: a claude-* judge_model uses ANTHROPIC_API_KEY, and goes through
+# condense.chat when CONDENSE_API_KEY is set (check: python -m stages.condense)
 python pipeline.py --job /mnt/nvme/jobs/demo
 ```
 
