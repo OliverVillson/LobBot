@@ -1,12 +1,13 @@
 """Gemini over its OpenAI-compatible endpoint, optionally through condense.chat.
 
-GEMINI_API_KEY (or GOOGLE_API_KEY) is required. When CONDENSE_API_KEY is also
-set, calls go to condense.chat's provider passthrough first. If that route
-fails for any reason, it is switched off for the rest of the process and the
-call goes straight to Gemini, so condense can never block a stage.
+GEMINI_API_KEY (or GOOGLE_API_KEY) is required. When CONDENSE_API_KEY and
+CONDENSE_GEMINI_URL are set, calls go through that condense.chat route first.
+If it fails for any reason, it is switched off for the rest of the process and
+the call goes straight to Gemini, so condense can never block a stage.
 
-The condense route is CONDENSE_GEMINI_URL, or the first of CONDENSE_GEMINI_ROUTES
-that `python -m stages.condense --gemini` finds working.
+condense's /gemini/ passthrough only reaches Vertex AI (Google Cloud OAuth), so
+with an AI Studio key the proxy is off and condense is used through its
+compression API instead (stages/condense.py compress()).
 """
 
 from __future__ import annotations
@@ -37,7 +38,9 @@ def condense_url() -> str | None:
 
     if _condense_off or not condense.enabled():
         return None
-    return os.environ.get("CONDENSE_GEMINI_URL") or CONDENSE_GEMINI_ROUTES[0]
+    # Tested 2026-10-03: condense's /gemini/ passthrough goes to Vertex AI and
+    # rejects AI Studio keys, so the proxy route is opt-in.
+    return os.environ.get("CONDENSE_GEMINI_URL")
 
 
 def _post(url: str, extra_headers: dict, body: dict, retries: int):

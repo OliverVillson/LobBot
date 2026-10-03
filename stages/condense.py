@@ -1,4 +1,4 @@
-"""condense.chat in front of the Anthropic API (and Gemini, see stages/gemini.py).
+"""condense.chat: its compression API, and its proxy in front of the Anthropic API.
 
 condense.chat is a proxy that compresses the aged part of a conversation
 before it reaches the model provider, so long multi-turn sessions bill fewer
@@ -10,10 +10,16 @@ made through anthropic_client() goes through https://api.condense.chat/anthropic
 Without the key the client talks to Anthropic directly, so nothing breaks.
 Optional: CONDENSE_USER_ID, CONDENSE_SESSION_ID, CONDENSE_BASE_URL.
 
+condense also has a compression API (compress() below): it shortens text
+before we send it to any provider. Gemini's test writer uses it on the
+examples it is shown (stages/testgen.py). condense's proxy only forwards
+Gemini to Vertex AI (Google Cloud OAuth), not to AI Studio keys, so Gemini
+calls themselves go direct unless CONDENSE_GEMINI_URL is set.
+
 Check the wiring with one real request:
+  python -m stages.condense --compress # compression API on a sample email
   python -m stages.condense            # Claude through condense
   python -m stages.condense --gemini   # Gemini: direct, then each condense route
-Gemini calls (the judge and the held-out test writer) go through stages/gemini.py.
 """
 
 from __future__ import annotations
@@ -47,6 +53,45 @@ def anthropic_client(**kw):
         kw.setdefault("base_url", os.environ.get("CONDENSE_BASE_URL", BASE_URL))
         kw["default_headers"] = {**kw.get("default_headers", {}), **headers()}
     return anthropic.Anthropic(**kw)
+
+
+COMPRESS_URL = "https://api.condense.chat/v1/compress"
+COMPRESS_MODELS = ("helene-1.1", "adeline-1")  # extractive, fast / abstractive, deeper
+
+
+def compress(texts: list[str], model: str | None = None) -> list[str]:
+    """Compress each text with condense.chat's compression model (one request).
+    Returns the originals unchanged if condense is off or anything goes wrong,
+    so callers can always use the result. Model: CONDENSE_MODEL or helene-1.1."""
+    if not enabled() or not texts:
+        return texts
+    import httpx
+
+    model = model or os.environ.get("CONDENSE_MODEL", COMPRESS_MODELS[0])
+    try:
+        r = httpx.post(os.environ.get("CONDENSE_COMPRESS_URL", COMPRESS_URL), timeout=60, headers=headers(),
+                       json={"model": model, "messages": [{"role": "user", "content": t} for t in texts]})
+        r.raise_for_status()
+        out = [m.get("content") or "" for m in r.json().get("messages", [])]
+    except Exception as e:
+        print(f"[condense] compression failed ({e}); using the uncompressed text", flush=True)
+        return texts
+    if len(out) != len(texts) or not all(out):
+        print(f"[condense] compression returned {len(out)} of {len(texts)} texts; using the uncompressed text", flush=True)
+        return texts
+    before, after = sum(len(t.split()) for t in texts), sum(len(t.split()) for t in out)
+    print(f"[condense] {model}: {before} -> {after} words ({1 - after / max(before, 1):.0%} smaller)", flush=True)
+    return out
+
+
+def check_compress(model: str) -> None:
+    text = ("Hi team, our invoice #9921 was charged in USD although the account is set to EUR. This is the "
+            "third time this happens. We already contacted support twice last month and got no answer. "
+            "Please fix the invoice and confirm by email. Thanks, Anna")
+    out = compress([text], model)[0]
+    print(f"before: {text}\nafter:  {out}")
+    if out == text:
+        raise SystemExit("compression did not run (see the line above)")
 
 
 def check_claude(model: str) -> None:
@@ -104,12 +149,15 @@ def main() -> None:
     import argparse
 
     ap = argparse.ArgumentParser(description="Send one real request through condense.chat and print the result.")
-    ap.add_argument("--gemini", action="store_true", help="check the Gemini routes instead of Claude")
+    ap.add_argument("--gemini", action="store_true", help="check the Gemini proxy routes instead of Claude")
+    ap.add_argument("--compress", action="store_true", help="check the compression API on a sample email")
     ap.add_argument("--model", help="default claude-haiku-4-5-20251001, or gemini-3.8-flash with --gemini")
     args = ap.parse_args()
     if not enabled():
         raise SystemExit("CONDENSE_API_KEY is not set; nothing to check")
-    if args.gemini:
+    if args.compress:
+        check_compress(args.model or COMPRESS_MODELS[0])
+    elif args.gemini:
         check_gemini(args.model or "gemini-3.8-flash")
     else:
         check_claude(args.model or "claude-haiku-4-5-20251001")

@@ -46,6 +46,8 @@ mkdir -p /mnt/nvme/jobs/demo && cp examples/support-tickets.taskspec.json /mnt/n
 export GEMINI_API_KEY=...                      # eval judge (Gemini, cfg.judge_model)
 # optional: a claude-* judge_model uses ANTHROPIC_API_KEY, and goes through
 # condense.chat when CONDENSE_API_KEY is set (check: python -m stages.condense)
+# CONDENSE_API_KEY also compresses the examples Gemini sees when it writes the
+# held-out tests (check: python -m stages.condense --compress)
 python pipeline.py --job /mnt/nvme/jobs/demo
 ```
 
