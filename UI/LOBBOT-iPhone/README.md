@@ -9,14 +9,13 @@ bordeaux stage, a speech bubble under him, and a panel that follows the consulta
    mascot loads (1.9 s min, 4 s max), then Lobbot greets you.
    **Home**: tagline, *New surgery*, *Talk to Dr. Lobbot*, how it works, recent surgeries. Tap the
    logo to come back (not during surgery).
-1. **Intake** (Lobbot listens and takes notes): model size and weights file, capability
-   to preserve, target hardware and max capability loss, then the signed chart.
-2. **Pre-op plan** (Lobbot thinks).
-3. **Surgery**: Lobbot masks up and walks into the operating room (`task` held). The panel
-   shows vitals (size, capability %, cuts) and a live log: every cut is tested, damaging
-   cuts are undone.
-4. **Result**: he walks out with the distilled model in a jar. Before/after, fit on the
-   device, share report, new patient.
+1. **The job**: describe one job in a sentence (Lobbot listens and takes notes).
+2. **The chart**: the task spec Gemini drafts (input, output, grading, an example).
+3. **Going home to**: a 16 GB laptop, ≤ 7 GB, ≥ 40 tokens/s; starting from Qwen3-30B-A3B (61 GB).
+4. **Surgery**: the six real stages (data, reap, heal, quantize, eval, package) on a live board; Lobbot is in the
+   operating room. Until the backend is wired, it replays the real run of Oct 3, 2026 in about 20 s.
+5. **Discharge**: 61 GB → 6.52 GB, 9.7/10 vs 9.8/10, the three candidates, a real email → JSON ticket, and the
+   `lobbot save` command for the Mac.
 
 Open `LOBBOT.xcodeproj` in Xcode 26, pick an iPhone simulator, run. iOS 17+, portrait, light.
 
@@ -26,16 +25,16 @@ That file is gitignored; `Secrets.example.xcconfig` is the committed template. A
 flows xcconfig → `LOBBOT/Info.plist` → `VoiceConfig.apiKey`; it never appears in Swift source.
 Bottom bar: type a message (he answers out loud, words in the bubble, no mic needed) or tap the
 mic to call him: the stage fills the screen (close-up framing), with Mute, Type and End buttons and
-captions of what you said. He chats about anything; when you talk about a model he fills the chart
-through `update_chart` and starts the surgery with `start_surgery` (the call then folds back so the
+captions of what you said. He chats about anything; when you ask for a model he writes your job on the chart
+through `set_job` and starts the surgery with `start_surgery` (the call then folds back so the
 surgery log is visible, and he keeps listening).
 Model id, voice and persona: `VoiceConfig` in `Voice.swift`.
 Any key shipped inside an app binary can be extracted: fine for the hackathon; for a release,
 keep the key on a server that hands the app short-lived Gemini tokens.
 
 ## Files
-- `Session.swift`: the consultation state and the surgery simulation (`operate()`).
-  Replace the scripted cuts there with the agent's real event stream.
+- `Session.swift`: the consultation state, the stage board (`apply(_:)` takes the backend's events) and
+  `QualityRun`, the real results. `replay()` stands in for the live stream until it is wired.
 - `LobbotController.swift`: one persistent `WKWebView` running `Resources/Lobbot/lobbot.html`
   and the JS bridge (`play`, `finish`, `stop`, events `ready/started/ended/tap`).
 - `ContentView.swift`, `Home.swift` (splash + home), `Panels.swift`, `MascotStage.swift`, `VoiceViews.swift`, `Brand.swift`: UI.
@@ -44,4 +43,4 @@ keep the key on a server that hands the app short-lived Gemini tokens.
 Adding a Swift file: run `python3 create-project.py` to regenerate the project.
 Codex's earlier palette-comparison UI is archived in `../archive/codex-v1-ios/`.
 
-**Simulation only:** no model weights are read or modified; all numbers are illustrative.
+**Replay:** the app doesn't run a job yet. It replays the real Oct 3, 2026 run; every number comes from that run.

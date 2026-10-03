@@ -95,7 +95,7 @@ button:focus-visible { outline: 2px solid var(--wine); outline-offset: 2px; }
       <div class="vitals">
         <div><span>Status</span><b id="vState">Idle</b></div>
         <div><span>BPM</span><b id="vBpm">72</b></div>
-        <div><span>Model</span><b id="vParams">70B</b></div>
+        <div><span>Model</span><b id="vParams">61 GB</b></div>
       </div>
     </div>
     <div class="controls">
@@ -410,7 +410,7 @@ const ONO = [[4.0, 'zzzip!', -0.35, 0.55, '#ffffff'], [4.7, 'clack', 0.45, 1.0, 
     return { at, dx, dy, sp };
   });
 
-// specimen jar holding the distilled mini-brain
+// specimen jar holding the small model he brings home
 const jar = new THREE.Group();
 {
   const glass = new THREE.Mesh(new THREE.CylinderGeometry(0.26, 0.26, 0.5, 40, 1, true),
@@ -420,7 +420,7 @@ const jar = new THREE.Group();
   const lid = new THREE.Mesh(new THREE.CylinderGeometry(0.28, 0.28, 0.08, 40), darkMetal); lid.position.y = 0.29;
   const base = new THREE.Mesh(new THREE.CylinderGeometry(0.27, 0.27, 0.04, 40), darkMetal); base.position.y = -0.27;
   const mini = new THREE.Mesh(brainGeo, brainMat); mini.scale.set(0.2 * 1.12, 0.2 * 0.92, 0.2); mini.position.y = -0.04;
-  const tag = label('3B', { bg: '#fcf3f2', color: '#96445a', size: 44, h: 0.13, weight: 800, radius: 8 });
+  const tag = label('6.52 GB', { bg: '#fcf3f2', color: '#96445a', size: 44, h: 0.13, weight: 800, radius: 8 });
   tag.position.set(0, -0.16, 0.3); sizeSprite(tag, 1);
   jar.add(mini, liquid, glass, lid, base, tag);
   jar.userData.mini = mini;
@@ -472,7 +472,7 @@ const cloud = new THREE.Group();
     const d = new THREE.Mesh(new THREE.SphereGeometry(r, 20, 14), m); d.position.set(x, y, z); rig.add(d); d.visible = false; return d;
   });
 }
-const GLYPHS = ['{ }', 'θ → θ′', '70B?', 'if (…)', '∑ wᵢxᵢ', 'hmm…', '3B!'];
+const GLYPHS = ['{ }', 'experts?', '61 GB?', 'if (…)', '2–6 bits', 'hmm…', '6.52 GB!'];
 const glyph = label(GLYPHS[0], { color: '#96445a', size: 64, h: 0.2, weight: 800 });
 glyph.position.set(0, 0.03, 0.4); cloud.add(glyph);
 cloud.position.set(1.32, 1.36, 0.3); cloud.visible = false; rig.add(cloud);
@@ -526,7 +526,7 @@ const CHEST_REST = new THREE.Vector3(0.05, -1.32, 0.95);
 
 // doctor's clipboard: wooden board, metal clip, an A4 sheet he fills in by hand
 const clipboard = new THREE.Group();
-const NOTES = ['Patient: GPT-70B', 'Symptoms: parameter obesity', 'Treatment: distillation', '→ 3B, same capability ✓'];
+const NOTES = ['Patient: Qwen3-30B, 61 GB', 'Job: support email → ticket', 'Treatment: remove unused experts', '→ 6.52 GB, 99% of the score ✓'];
 const notesCv = document.createElement('canvas'); notesCv.width = 600; notesCv.height = 780;
 const nctx = notesCv.getContext('2d');
 const notesTex = new THREE.CanvasTexture(notesCv); notesTex.encoding = THREE.sRGBEncoding; notesTex.anisotropy = renderer.capabilities.getMaxAnisotropy();
@@ -581,7 +581,7 @@ function drawNotes(w) {
   c.fillStyle = '#96445a'; c.font = '800 30px Manrope, sans-serif'; c.textBaseline = 'alphabetic';
   c.fillText('Dr. Lobbot · Consultation', LINE_X, 80);
   c.fillStyle = '#74505c'; c.font = '600 21px Manrope, sans-serif';
-  c.fillText('Distillation ward · bed no. 3B', LINE_X, 112);
+  c.fillText('Pruning ward · bed no. 64', LINE_X, 112);
   c.strokeStyle = '#96445a'; c.lineWidth = 3; c.beginPath(); c.moveTo(LINE_X, 136); c.lineTo(600 - LINE_X, 136); c.stroke();
   c.strokeStyle = 'rgba(150,68,90,0.18)'; c.lineWidth = 2;
   for (let i = 0; i < 5; i++) { c.beginPath(); c.moveTo(LINE_X, LINE_Y(i) + 14); c.lineTo(600 - LINE_X, LINE_Y(i) + 14); c.stroke(); }
@@ -786,12 +786,12 @@ const SCENES = {
   },
   task: {
     name: 'Run a task', dur: 12.2,
-    desc: 'He masks up, grabs his scalpel and rushes into surgery. He comes back with the distilled model in a jar.',
+    desc: 'He masks up, grabs his scalpel and rushes into surgery. He comes back with the small model in a jar.',
     run(s, p) {
       p.label = s < 3.5 ? 'New task' : s < 8.05 ? 'In surgery' : 'Task done';
       p.bpm = s < 3.5 ? 110 : s < 8.05 ? 152 : 108;
       p.ecgColor = s >= 3.5 && s < 8.05 ? '#d9708a' : null;
-      p.model = s < 3.6 ? 70 : s < 7.6 ? 70 * Math.pow(3 / 70, eio(seg(s, 3.6, 7.6))) : 3;
+      p.model = s < 3.6 ? 61.1 : s < 7.6 ? 61.1 * Math.pow(6.52 / 61.1, eio(seg(s, 3.6, 7.6))) : 6.52;
       if (s < 0.5) { p.eyes = 'big'; p.brow = 0.9; p.mouth = 'O'; }
       else if (s < 8.05) { p.eyeScale = 0.82; p.brow = 0.1; p.browTilt = 0.7; p.mouth = 'flat'; p.gaze = { x: 0, y: 0 }; }
       else { p.eyes = 'happy'; p.mouth = 'happy'; p.brow = 0.4; }
@@ -1048,7 +1048,7 @@ function frame(now) {
   Object.assign(pose, {
     x: 0, y: 0, sq: 0, sx: 0, tilt: 0, turn: 0, shake: 0, hidden: false, snapX: false,
     eyes: 'normal', mouth: 'smile', brow: 0, browTilt: 0, browOne: 0, eyeScale: 1, gaze: null, cross: 0, talk: 0, masked: false,
-    wobble: 0.35, speed: 0.8, glow: 0, bpm: 72, ecg: 'normal', ecgColor: null, label: 'Idle', model: 70
+    wobble: 0.35, speed: 0.8, glow: 0, bpm: 72, ecg: 'normal', ecgColor: null, label: 'Idle', model: 61.1
   });
   for (const o of ALL_PROPS) o.visible = false;
   SCENES[current].run(sceneT, pose);
@@ -1105,7 +1105,7 @@ function frame(now) {
     uiT = 0.1;
     vState.textContent = pokeT > 0 ? 'Tickled' : pose.label;
     vBpm.textContent = Math.round(bpm);
-    vParams.textContent = (pose.model >= 10 ? pose.model.toFixed(0) : pose.model.toFixed(1)) + 'B';
+    vParams.textContent = (pose.model >= 10 ? pose.model.toFixed(0) : pose.model.toFixed(2)) + ' GB';
   }
   requestAnimationFrame(frame);
 }

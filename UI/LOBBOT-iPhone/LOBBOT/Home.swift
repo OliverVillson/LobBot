@@ -56,7 +56,7 @@ struct HomePanel: View {
                     .font(.system(size: 30, weight: .heavy))
                     .foregroundStyle(Brand.ink)
                     .fixedSize(horizontal: false, vertical: true)
-                Text("Dr. Lobbot shrinks a large model and tests the skill you care about after every cut. Cuts that hurt it are undone.")
+                Text("Describe one job. Dr. Lobbot turns a big AI model into a small one that does just that job, on your laptop, offline.")
                     .font(.subheadline)
                     .foregroundStyle(Brand.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -77,10 +77,26 @@ struct HomePanel: View {
             VStack(alignment: .leading, spacing: 14) {
                 Field(label: "How it works") {
                     VStack(alignment: .leading, spacing: 12) {
-                        HowStep(number: 1, title: "The chart", text: "Pick the model, the skill to keep and the device it must fit.")
-                        HowStep(number: 2, title: "The surgery", text: "Cut a block, test the skill, keep the cut or undo it. Repeat.")
-                        HowStep(number: 3, title: "The patient goes home", text: "A smaller model that still does the job.")
+                        HowStep(number: 1, title: "The chart", text: "One sentence. Gemini drafts what goes in, what comes out and how to grade it.")
+                        HowStep(number: 2, title: "The surgery", text: "The big model practises your job, Dr. Lobbot removes the experts it never uses, then heals and packs the patient.")
+                        HowStep(number: 3, title: "Check-up and discharge", text: "Gemini grades it on new cases, then it goes home to your laptop and runs offline.")
                     }
+                }
+            }
+            .card()
+
+            Field(label: "A real patient") {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Support emails → JSON tickets")
+                        .font(.headline)
+                        .foregroundStyle(Brand.ink)
+                    Text("\(QualityRun.teacherGB) → \(QualityRun.modelGB) · \(QualityRun.score) vs \(QualityRun.teacherScore) for the big model · \(QualityRun.speed)")
+                        .font(.subheadline)
+                        .foregroundStyle(Brand.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text("Run of \(QualityRun.date) on \(QualityRun.gpu) GPU, graded by Gemini on \(QualityRun.tests) new emails.")
+                        .font(.caption)
+                        .foregroundStyle(Brand.secondary)
                 }
             }
             .card()
@@ -102,7 +118,7 @@ struct HomePanel: View {
             }
             .card()
 
-            Text("Simulated runs: no model is modified.")
+            Text("In this app the surgery replays that real run.")
                 .font(.caption)
                 .foregroundStyle(Brand.secondary)
                 .padding(.horizontal, 4)
@@ -136,16 +152,15 @@ private struct RecordRow: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            Image(systemName: record.capability.symbol)
+            Image(systemName: "cross.case.fill")
                 .foregroundStyle(Brand.accent)
                 .frame(width: 24)
             VStack(alignment: .leading, spacing: 2) {
-                Text(record.patient)
+                Text(record.job)
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(Brand.ink)
                     .lineLimit(1)
-                    .truncationMode(.middle)
-                Text("\(Session.format(record.fromB))B → \(Session.format(record.toB))B · \(record.capability.title) \(Session.format(record.retained))%")
+                Text("\(QualityRun.teacherGB) → \(QualityRun.modelGB) · \(QualityRun.score) · replay")
                     .font(.caption)
                     .foregroundStyle(Brand.secondary)
             }

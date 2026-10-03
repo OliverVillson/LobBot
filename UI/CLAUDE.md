@@ -10,8 +10,9 @@ Everything under `UI/` is the product's design: the iOS app, Dr. Lobbot (the 3D 
    no UI library.
 2. **Wire the backend through these points only:**
    - `LOBBOT-iPhone/LOBBOT/Session.swift`
-     - `operate()`: replace the scripted cuts with the agent's real event stream. Keep the same published fields:
-       `params`, `score`, `cuts`, `phase`, `history`.
+     - `apply(_:)`: feed it the job's progress events (`GET /jobs/{id}/events`, same shape: stage, status,
+       pct, msg) and drop `replay()`, which replays the Oct 3 quality run until then.
+     - `QualityRun`: the real results shown on screen. Replace with the job's results once wired; never invent numbers.
      - `voiceTool(_:args:)`: what the voice can do in the app.
      - Add data fields there if needed. Views keep reading them as they are.
    - `LOBBOT-iPhone/LOBBOT/Voice.swift`: `VoiceConfig` (Gemini model id, persona, tools).
@@ -25,5 +26,6 @@ Everything under `UI/` is the product's design: the iOS app, Dr. Lobbot (the 3D 
    Never hand-edit `project.pbxproj`.
 6. **Secrets:** the Gemini key lives only in `LOBBOT-iPhone/Secrets.xcconfig`, which is gitignored. Never
    commit it, never paste it in code, logs or docs.
-7. **Honesty:** keep the "Simulation" labels until real results are wired. Never invent benchmark numbers.
+7. **Honesty:** words and numbers follow Oliver's `motion-ad-brief.md` fact sheet. Keep the "Replay" labels while
+   the surgery is a replay. Never invent numbers, never claim it runs on the phone.
 8. **When you commit changes under `UI/`,** list the UI files you touched in the commit message.

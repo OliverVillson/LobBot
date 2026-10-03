@@ -97,13 +97,13 @@ struct ContentView: View {
             .accessibilityLabel("lobbot, home")
             .accessibilityAddTraits(.isHeader)
             Spacer()
-            Text("Simulation")
+            Text("Replay")
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(Brand.accent)
                 .padding(.horizontal, 10)
                 .padding(.vertical, 5)
                 .background(Brand.rose.opacity(0.45), in: Capsule())
-                .accessibilityLabel("Simulated runs, no real model is modified")
+                .accessibilityLabel("Surgeries replay a real run from October 3, 2026")
         }
         .padding(.horizontal, 20)
         .padding(.top, 4)
@@ -113,7 +113,6 @@ struct ContentView: View {
         switch session.phase {
         case .home: HomePanel()
         case .intake(let step): IntakePanel(step: step)
-        case .planning: PlanningPanel()
         case .surgery: SurgeryPanel()
         case .done: ResultPanel()
         }

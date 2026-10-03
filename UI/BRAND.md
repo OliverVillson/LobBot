@@ -3,9 +3,10 @@
 **Owner: Nolann Petri (design). This is the approved identity and the source of truth for everything in `UI/`.**
 Anything that contradicts it (including `archive/`) is outdated. Changes to this chart go through Nolann.
 
-lobbot is an autonomous compression agent: it shrinks a large model while testing, after every cut, the one
-capability the user wants to keep. The brand tells that story as **awake brain surgery**, embodied by
-**Dr. Lobbot**, a funny, nerdy, energetic and joyful surgeon for AI models.
+LobBot turns a big, general AI model into a small one that does **one job** and runs on your laptop, offline.
+The brand tells that story as **brain surgery**, embodied by **Dr. Lobbot**, a funny, nerdy, energetic and
+joyful surgeon for AI models. What the product says (facts, numbers, claims to avoid) follows Oliver's
+`motion-ad-brief.md`; the numbers live in `QualityRun` (`LOBBOT-iPhone/LOBBOT/Session.swift`).
 
 ---
 
@@ -61,8 +62,9 @@ One palette, **Anatomie: bordeaux and rose**, light only. No dark mode, no other
   and the composer are capsules. Use the continuous corner style.
 - Card = `surface` fill, 1 pt `line` border, 18 pt padding (`.card()` modifier). Don't nest cards in cards.
 - Side gutter 16 pt, gaps 10 to 18 pt. Minimum touch target 44 pt; primary buttons are 54 pt high.
-- **One screen, built around the mascot:** header (logo + "Simulation" pill), Dr. Lobbot's stage with his
-  speech bubble under it, the panel for the current phase (home → intake → plan → surgery → result), and the
+- **One screen, built around the mascot:** header (logo + "Replay" pill), Dr. Lobbot's stage with his
+  speech bubble under it, the panel for the current phase (home → the job → the chart → the target → the
+  surgery board → discharge), and the
   composer docked at the bottom (text field + mic). The mic opens a full-screen call where the stage fills the page.
 - Components to reuse: `PrimaryButton`, `OptionTile`, `Field`, `.card()` (`Brand.swift`), `SpeechBubble`,
   `MascotStage` (`MascotStage.swift`).
@@ -71,7 +73,7 @@ One palette, **Anatomie: bordeaux and rose**, light only. No dark mode, no other
 
 - **Look:** a pink brain (`#FF8A9C`, soft clearcoat), round white nerd glasses, a doctor's head mirror on a white
   band, expressive eyes, brows and mouth drawn on his face. He always stands on the bordeaux stage.
-- **Personality:** a funny doctor, nerdy, energetic, joyful. Surgery humour: patient, chart, scalpel, "cuts kept / undone".
+- **Personality:** a funny doctor, nerdy, energetic, joyful. Surgery humour: patient, chart, scalpel, physio, check-up, "the patient goes home".
 - **Scenes** (`window.lobbot.play(id, {loop, hold})` from `LobbotController`):
 
 | Scene | Meaning |
@@ -101,9 +103,13 @@ One palette, **Anatomie: bordeaux and rose**, light only. No dark mode, no other
 ## 7. Voice and copy
 
 - English, short and plain. Name things the way a user would ("New surgery", "Talk to Dr. Lobbot", "Stop").
-- Medical metaphors are the brand: patient, chart, pre-op plan, surgery, cuts kept / undone, the patient goes home.
-- **Honesty:** until the real agent is wired, every number is illustrative. Keep the "Simulation" pill and the
-  "Simulated run: no model is modified." lines. Never quote real benchmark results or customer claims.
+- Medical metaphors follow the real pipeline: the chart (task spec), practice cases (data), the operation (REAP
+  removes the experts the job uses least), physio (heal), packing (2 to 6 bits per layer), the check-up (Gemini
+  grades 100 new cases), discharge (the model goes home to the Mac).
+- **Honesty:** until the app is wired to the backend, the surgery replays the real run of Oct 3, 2026 and says so
+  ("Replay" pill, replay lines). Only use numbers from the brief's fact sheet (`QualityRun`). Never say it runs on
+  a phone, that cuts are tested and undone one by one, "10×", "lossless", a parameter count for the small model,
+  or anything about pricing.
 
 ## 8. Don't
 
