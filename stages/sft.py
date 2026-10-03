@@ -115,9 +115,13 @@ def train_sft(base: str, examples: list[dict], out_dir: Path, *,
     tok = AutoTokenizer.from_pretrained(base)
     pad_id = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
     data = [tokenize_example(tok, ex["messages"], max_len) for ex in examples]
+    n_cut = sum(len(d["input_ids"]) >= max_len for d in data)
     data = [d for d in data if any(l != -100 for l in d["labels"][1:])]
     if not data:
         raise ValueError("no training examples with answer tokens")
+    if n_cut:
+        log(f"sft: {n_cut}/{len(examples)} examples hit max_len={max_len} and were cut short "
+            f"(raise LOBBOT_HEAL_MAX_LEN for long answers)")
 
     progress(1, f"loading {base}")
     model = load_causal_lm(base)
@@ -152,17 +156,19 @@ def train_sft(base: str, examples: list[dict], out_dir: Path, *,
             ids, lab, att = _collate(data, idxs, pad_id, device)
             with amp:
                 out = model(input_ids=ids, attention_mask=att)
-                logits = out.logits[:, :-1].float()
                 tgt = lab[:, 1:]
                 mask = tgt != -100
-                ce = F.cross_entropy(logits[mask], tgt[mask])
+                # fp32 only for the answer positions: a full fp32 copy of the
+                # logits is tokens x vocab x 4 bytes (17 GB for 16k tokens of Gemma 4)
+                logits = out.logits[:, :-1][mask].float()
+                ce = F.cross_entropy(logits, tgt[mask])
                 loss = ce
                 if teacher is not None:
                     with torch.no_grad():
                         t_logits = teacher(input_ids=ids.to(teacher.device), attention_mask=att.to(teacher.device)
-                                           ).logits[:, :-1].float().to(device)
-                    s = F.log_softmax(logits[mask] / kd_temp, -1)
-                    t = F.log_softmax(t_logits[mask] / kd_temp, -1)
+                                           ).logits[:, :-1][mask.to(teacher.device)].float().to(device)
+                    s = F.log_softmax(logits / kd_temp, -1)
+                    t = F.log_softmax(t_logits / kd_temp, -1)
                     kl = F.kl_div(s, t, log_target=True, reduction="batchmean") * kd_temp ** 2
                     loss = (1 - kd_weight) * ce + kd_weight * kl
             (loss / grad_accum).backward()
