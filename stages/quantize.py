@@ -179,7 +179,7 @@ def layer_importance(job: Job, n_layers: int) -> list[float] | None:
     if p.exists():
         imp = json.loads(p.read_text())
     else:
-        sal = next((q for q in (job.path("work", "saliency.json"), job.path("reap", "saliency.json")) if q.exists()), None)
+        sal = next((q for q in (job.path("work", "reap_saliency.json"), job.path("reap", "saliency.json")) if q.exists()), None)
         if sal is None:
             return None
         layers = sorted(json.loads(sal.read_text())["layers"], key=lambda l: l["layer"])
