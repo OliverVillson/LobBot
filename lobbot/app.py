@@ -45,6 +45,9 @@ PRESETS: dict[str, dict] = {
 }
 
 
+GITHUB_URL = "https://github.com/OliverVillson/LobBot"
+
+
 class CliError(RuntimeError):
     pass
 
@@ -229,6 +232,34 @@ def gpu_processes(r: Remote) -> list[str]:
     out = r.sh("command -v nvidia-smi >/dev/null || exit 0; "
                "nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader", check=False)
     return [l.strip() for l in out.splitlines() if l.strip()]
+
+
+def disk_state(r: Remote, ids: list[str]) -> dict[str, dict]:
+    """What the job dirs say, for jobs the API has no events for (run directly with pipeline.py)."""
+    if not ids:
+        return {}
+    jobs = rpath(r.s.jobs.rstrip("/"))
+    script = "".join(
+        f'd={jobs}/{i}; done=$(ls "$d/.done" 2>/dev/null | tr "\\n" ,); run=0; model=0\n'
+        f'pgrep -f "[p]ipeline.py --job [^ ]*/{i}( |$)" >/dev/null && run=1\n'
+        f'[ -f "$d/.done/package" ] && [ -f "$d/out/model.gguf" ] && model=1\n'
+        f'echo "{i}|$done|$run|$model"\n' for i in ids if i.replace("-", "").replace("_", "").isalnum())
+    out = {}
+    for line in r.sh(script, check=False).splitlines():
+        i, done, run, model = (line.split("|") + ["", "", "", ""])[:4]
+        out[i] = {"done": [x for x in done.split(",") if x in STAGES], "running": run == "1", "model": model == "1"}
+    return out
+
+
+def disk_label(d: dict) -> str:
+    if d["running"]:
+        return "running*"
+    if len(d["done"]) == len(STAGES):
+        return "done*"
+    if d["done"]:
+        last = [st for st in STAGES if st in d["done"]][-1]
+        return f"stopped*:{last}"
+    return "queued"
 
 
 def example_text(r: Remote) -> str:
@@ -497,19 +528,42 @@ def cmd_status(a) -> None:
         api = Api(base, r.token())
         if a.job:
             st = api.get(f"/jobs/{check_job_id(a.job)}")
-            print(c(f"job {st['job_id']}", "1") + f"  {st['task_name']}  "
-                  + c(st["state"], STATE_COLOR.get(st["state"], "0")) + c(f"  created {ago(st['created'])}", "2"))
-            for line in Board(st["stages"]).lines():
-                print(line)
-            if st.get("error"):
-                print(c("error: ", "31") + st["error"])
-            return
-        jobs = api.get("/jobs")
+        else:
+            jobs = api.get("/jobs")
+    direct = "  * run directly with pipeline.py; read from the job dir's .done markers"
+    if a.job:
+        state, stages = st["state"], st["stages"]
+        if state == "queued":  # no API events: fall back to the job dir
+            d = disk_state(r, [st["job_id"]]).get(st["job_id"])
+            if d and (d["done"] or d["running"]):
+                state = disk_label(d)
+                for name in d["done"]:
+                    stages[name] = {"status": "done", "pct": 100, "msg": "done (.done marker)"}
+                if d["running"]:
+                    nxt = next((x for x in STAGES if x not in d["done"]), None)
+                    if nxt:
+                        stages[nxt] = {"status": "running", "pct": 0, "msg": f"see: lobbot logs {st['job_id']}"}
+        color = STATE_COLOR.get(state.rstrip("*").split("*")[0], "0")
+        print(c(f"job {st['job_id']}", "1") + f"  {st['task_name']}  " + c(state, color)
+              + c(f"  created {ago(st['created'])}", "2"))
+        for line in Board(stages).lines():
+            print(line)
+        if st.get("error"):
+            print(c("error: ", "31") + st["error"])
+        if "*" in state:
+            print(c(direct, "2"))
+        return
     if not jobs:
         print("No jobs yet. Start one with: lobbot run --example --fast")
+    disk = disk_state(r, [j["job_id"] for j in jobs if j["state"] == "queued"])
+    starred = False
     for j in jobs:
-        print(f" {j['job_id']:<12} {c(j['state'], STATE_COLOR.get(j['state'], '0')):<18} "
-              f"{(j['task_name'] or '')[:36]:<36} {ago(j['created'])}")
+        state = disk_label(disk[j["job_id"]]) if j["job_id"] in disk else j["state"]
+        starred |= "*" in state
+        color = STATE_COLOR.get(state.split("*")[0], "0")
+        print(f" {j['job_id']:<12} {c(f'{state:<16}', color)} {(j['task_name'] or '')[:36]:<36} {ago(j['created'])}")
+    if starred:
+        print(c(direct, "2"))
     busy = gpu_processes(r)
     print(c(f"GPU: {len(busy)} process(es) running" if busy else "GPU: idle", "2"))
 
@@ -613,14 +667,25 @@ def remote_sha256(r: Remote, job: str) -> str:
     return out.strip().split()[0]
 
 
+def require_packaged(r: Remote, api: Api, job: str) -> dict:
+    """The job's API state, or an error if it has no packaged model. The job dir
+    (.done/package plus out/model.gguf) wins over the API, which has no state for
+    jobs run directly with pipeline.py."""
+    st = api.get(f"/jobs/{job}")
+    if st["stages"]["package"]["status"] in ("done", "skipped"):
+        return st
+    if disk_state(r, [job]).get(job, {}).get("model"):
+        return st
+    raise CliError(f"job {job} has no packaged model yet (no .done/package and out/model.gguf on the VM); "
+                   f"see: lobbot status {job}")
+
+
 def do_download(a, r: Remote, s: cfgmod.Settings) -> Path:
     """Download the job's GGUF, Modelfile and eval report, and verify the GGUF's sha256."""
     job = check_job_id(a.job)
     with r.tunnel() as base:
         api = Api(base, r.token())
-        st = api.get(f"/jobs/{job}")
-        if st["stages"]["package"]["status"] not in ("done", "skipped"):
-            raise CliError(f"job {job} has no packaged model yet (state {st['state']}); see: lobbot status {job}")
+        require_packaged(r, api, job)
         d = model_dir(s, api, job, a.out)
         d.mkdir(parents=True, exist_ok=True)
         dest = d / "model.gguf"
@@ -705,7 +770,7 @@ def cmd_save(a) -> None:
     job = check_job_id(a.job)
     if not a.no_backup:
         with r.tunnel() as base:
-            task = Api(base, r.token()).get(f"/jobs/{job}").get("task_name") or "model"
+            task = require_packaged(r, Api(base, r.token()), job).get("task_name") or "model"
         backup_on_vm(r, job, f"{task}-{job}")
     d = do_download(a, r, s)
     name = a.name or "lobbot-" + d.name.rsplit("-", 1)[0]
@@ -730,6 +795,18 @@ def cmd_save(a) -> None:
         os.execvp("ollama", ["ollama", "run", name])
 
 
+def pull_script(r: Remote, repo: str) -> str:
+    return r.sh(f"""set -e
+export GIT_TERMINAL_PROMPT=0
+cd {repo}
+before=$(git rev-parse HEAD)
+git fetch -q origin
+git pull -q --ff-only
+[ "$before" = "$(git rev-parse HEAD)" ] && echo "moved=no" || echo "moved=yes"
+echo "head=$(git log -1 --format='%h %s')"
+git diff --quiet "$before" HEAD -- agent/ common/ || echo "api=changed" """, timeout=180)
+
+
 def cmd_pull(a) -> None:
     """Update the VM checkout (git pull --ff-only)."""
     s = settings(a)
@@ -738,6 +815,14 @@ def cmd_pull(a) -> None:
         raise CliError("a job is using the GPU; its next stage would pick up the new code. "
                        "Wait for it, or add --force.")
     repo = rpath(s.repo)
+    url = r.sh(f"cd {repo} && git remote get-url origin", check=False).strip()
+    if a.set_origin:
+        r.sh(f"cd {repo} && git remote set-url origin {shlex.quote(a.set_origin)}")
+        ok(f"VM checkout origin: {url or '(none)'} -> {a.set_origin}")
+        url = a.set_origin
+    elif "github.com" not in url:
+        raise CliError(f"the VM checkout's origin is {url or '(none)'}, not GitHub, so pulling can't bring new code.\n"
+                       f"Point it at GitHub with: lobbot pull --set-origin {GITHUB_URL}")
     dirty = [l for l in r.sh(f"cd {repo} && git status --porcelain --untracked-files=no").splitlines() if l.strip()]
     if dirty:
         files = "\n  ".join(l[3:] for l in dirty)
@@ -751,14 +836,18 @@ def cmd_pull(a) -> None:
         label = "lobbot pull " + time.strftime("%Y-%m-%d %H:%M:%S")
         r.sh(f"cd {repo} && git stash push -q -m {shlex.quote(label)}")
         ok(f'stashed {len(dirty)} file(s) on the VM as "{label}" (get them back with: git stash pop)')
-    out = r.sh(f"""set -e
-cd {repo}
-before=$(git rev-parse HEAD)
-git pull -q --ff-only
-echo "head=$(git log -1 --format='%h %s')"
-git diff --quiet "$before" HEAD -- agent/ common/ || echo "api=changed" """, timeout=120)
+    try:
+        out = pull_script(r, repo)
+    except RemoteError as e:
+        if "Username" in str(e) or "Authentication" in str(e) or "terminal prompts" in str(e):
+            raise CliError(f"the VM can't log in to {url}: {e}\nThe VM needs read access to the repo "
+                           "(for example a deploy key or a token in the URL).")
+        raise
     info = dict(l.split("=", 1) for l in out.splitlines() if "=" in l)
-    ok(f"VM checkout now at {info.get('head', '?')}")
+    if info.get("moved") == "no":
+        ok(f"VM checkout already up to date with {url} at {info.get('head', '?')}")
+    else:
+        ok(f"VM checkout updated to {info.get('head', '?')}")
     if "api" in info:
         print("The API code changed; restart it when no job is running: lobbot up --restart")
 
@@ -865,6 +954,8 @@ def parser() -> argparse.ArgumentParser:
     sp = add("pull", cmd_pull, "update the LobBot checkout on the VM (git pull --ff-only)")
     sp.add_argument("--force", action="store_true", help="pull even while the GPU is busy")
     sp.add_argument("--stash", action="store_true", help="git stash local changes on the VM first")
+    sp.add_argument("--set-origin", nargs="?", const=GITHUB_URL, metavar="URL",
+                    help=f"re-point the VM checkout's origin first (default {GITHUB_URL})")
     sp.add_argument("-y", "--yes", action="store_true", help="don't ask before stashing")
 
     sp = add("chat", cmd_chat, "chat with an installed model in Ollama")

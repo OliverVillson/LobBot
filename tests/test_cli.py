@@ -165,11 +165,35 @@ def test_pull_dirty_checkout(cli, tmp_path):
 
     conf = json.loads((cli.tmp / "config.json").read_text())
     (cli.tmp / "config.json").write_text(json.dumps({**conf, "repo": str(vm)}))
-    p = cli("pull", ok=False)
+    p = cli("pull", ok=False)  # origin is not GitHub (on the VM it was a bundle file)
+    assert "not GitHub" in p.stderr and "--set-origin" in p.stderr
+    p = cli("pull", "--set-origin", str(origin), ok=False)
     assert "local changes" in p.stderr and "data.py" in p.stderr and "--stash" in p.stderr
     assert (vm / "data.py").read_text() == "hotfix on the vm\n"  # nothing touched
 
-    p = cli("pull", "--stash", "-y")
-    assert "stashed 1 file" in p.stdout and "v2" in p.stdout
+    p = cli("pull", "--set-origin", str(origin), "--stash", "-y")
+    assert "stashed 1 file" in p.stdout and "updated to" in p.stdout and "v2" in p.stdout
     assert (vm / "data.py").read_text() == "v2 upstream\n"
     assert "lobbot pull" in subprocess.run(["git", "stash", "list"], cwd=vm, capture_output=True, text=True).stdout
+    assert "already up to date" in cli("pull", "--set-origin", str(origin)).stdout
+
+
+def test_job_run_directly_with_pipeline(cli):
+    """Jobs started with pipeline.py (not the API) show their real state and can be saved."""
+    cli("up")
+    job = cli.tmp / "jobs/direct"
+    job.mkdir(parents=True)
+    (job / "taskspec.json").write_text((ROOT / "examples/support-tickets.taskspec.json").read_text())
+    env = {**os.environ, "LOBBOT_DRY_RUN": "1"}
+    subprocess.run([sys.executable, "pipeline.py", "--job", str(job), "--only", "data"], cwd=ROOT, env=env, check=True,
+                   capture_output=True)
+    # Newer APIs read the job dir themselves; older ones say "queued" and the CLI reads it.
+    assert any(w in cli("status").stdout for w in ("stopped*:data", "running"))
+    assert "no packaged model" in cli("save", "direct", ok=False).stderr
+    subprocess.run([sys.executable, "pipeline.py", "--job", str(job)], cwd=ROOT, env=env, check=True,
+                   capture_output=True)
+    assert " done" in cli("status").stdout
+    assert "queued" not in cli("status", "direct").stdout
+    p = cli("save", "direct", "--no-ollama")
+    assert "verified" in p.stdout
+    assert (cli.tmp / "models/support-email-to-ticket-direct/model.gguf").exists()
