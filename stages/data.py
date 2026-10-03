@@ -15,7 +15,9 @@ is JSON) and splits off a held-out set. Writes:
 
 Knobs (env vars, defaults in brackets): LOBBOT_DATA_SCENARIOS [40],
 LOBBOT_DATA_PER_PROMPT [8], LOBBOT_DATA_MAX_LEN [8192], LOBBOT_DATA_GPU_UTIL [0.85],
-LOBBOT_DATA_TP [1], LOBBOT_DATA_BATCH [256]. Sizes come from Config
+LOBBOT_DATA_TP [1], LOBBOT_DATA_BATCH [256], LOBBOT_DATA_ANSWER_MAX_TOKENS [1536]
+(answers that hit it are dropped as truncated; raise it for code or other long
+outputs, together with LOBBOT_DATA_MAX_LEN and heal's max_len). Sizes come from Config
 (n_generate, n_heldout).
 """
 
@@ -50,7 +52,7 @@ MAX_ROUNDS = 6
 MAX_INPUT_CHARS = 6000  # keeps every answer prompt well inside MAX_MODEL_LEN
 FEWSHOT = 6          # seed examples shown to the teacher when answering
 SEED_REPEAT = 2      # human-written seeds appear this many times in train
-ANSWER_MAX_TOKENS = 1536
+ANSWER_MAX_TOKENS = int(os.environ.get("LOBBOT_DATA_ANSWER_MAX_TOKENS", 1536))
 
 STYLE_HINTS = [
     "short and terse", "long and detailed", "messy, with typos and informal language",
