@@ -85,3 +85,14 @@ def test_parse_array():
         "an input as an object", "a plain string input"]
     assert parse_array("no list at all") == []
     assert parse_array("[broken") == []
+
+
+def test_failing_stage_reports_cause_and_logs(job):
+    (job / "taskspec.json").write_text((job / "taskspec.json").read_text())
+    (job / "config.json").write_text(json.dumps({"n_generate": 200, "n_heldout": 5000}))
+    p = run_data(job)
+    assert p.returncode == 1
+    from common.progress import parse
+    err = [e for e in map(parse, p.stdout.splitlines()) if e and e["status"] == "error"][0]
+    assert "RuntimeError" in err["msg"] and "usable" in err["msg"]
+    assert "Traceback" in (job / "logs/data.log").read_text()

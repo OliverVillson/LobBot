@@ -12,11 +12,13 @@ from __future__ import annotations
 
 import argparse
 import os
+import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
-from common.progress import emit
+from common.progress import emit, parse
 from stages._util import Job
 
 STAGES = ["data", "reap", "heal", "quantize", "eval", "package"]
@@ -49,13 +51,66 @@ def main() -> int:
             emit(stage, "skipped", 100, "cached")
             continue
         emit(stage, "running", 0, "starting")
-        proc = subprocess.run([STAGE_PYTHON.get(stage) or sys.executable, "-m", f"stages.{stage}", "--job", str(job.root)], cwd=ROOT)
-        if proc.returncode != 0 or not job.is_done(stage):
-            emit(stage, "error", msg=f"stage exited with {proc.returncode}")
+        rc, tail = run_stage(stage, job)
+        if rc != 0 or not job.is_done(stage):
+            emit(stage, "error", msg=error_message(rc, tail))
             return 1
     emit("pipeline", "done", 100, str(job.path("out", "model.gguf")))
     return 0
 
 
+_child: subprocess.Popen | None = None
+
+
+def run_stage(stage: str, job: Job) -> tuple[int, list[str]]:
+    """Run one stage, relaying its output and teeing it to <job>/logs/<stage>.log.
+
+    Returns the exit code and the last non-protocol lines (for the error message).
+    """
+    global _child
+    cmd = [STAGE_PYTHON.get(stage) or sys.executable, "-u", "-m", f"stages.{stage}", "--job", str(job.root)]
+    log_dir = job.path("logs")
+    log_dir.mkdir(exist_ok=True)
+    tail: list[str] = []
+    with open(log_dir / f"{stage}.log", "a") as log:
+        log.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} {' '.join(cmd)}\n")
+        _child = subprocess.Popen(cmd, cwd=ROOT, env={**os.environ, "PYTHONUNBUFFERED": "1"},
+                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+                                  errors="replace")
+        assert _child.stdout
+        for line in _child.stdout:
+            log.write(line)
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            if parse(line) is None and line.strip():
+                tail = (tail + [line.rstrip()])[-30:]
+        rc = _child.wait()
+        _child = None
+    return rc, tail
+
+
+def error_message(rc: int, tail: list[str]) -> str:
+    """Best one-line explanation: the exception line of a traceback, else the last log line."""
+    for line in reversed(tail):
+        if line and not line.startswith(" ") and ("Error" in line or "Exception" in line):
+            return line[:400]
+    if rc < 0:
+        return f"stage killed by signal {-rc}"
+    return (tail[-1][:400] if tail else f"stage exited with {rc}")
+
+
+def _stop(signum, _frame):
+    """Forward SIGTERM/SIGINT to the running stage so the GPU is freed, then exit."""
+    if _child and _child.poll() is None:
+        _child.terminate()
+        try:
+            _child.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            _child.kill()
+    sys.exit(128 + signum)
+
+
 if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
     sys.exit(main())
