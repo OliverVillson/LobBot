@@ -90,7 +90,7 @@ def dur(s: float) -> str:
 
 ICON = {"pending": c("·", "2"), "running": c("▸", "36"), "done": c("✓", "32"),
         "skipped": c("↷", "2"), "error": c("✗", "31")}
-STATE_COLOR = {"done": "32", "running": "36", "error": "31", "queued": "2", "partial": "33"}
+STATE_COLOR = {"done": "32", "running": "36", "error": "31", "queued": "2", "partial": "33", "stopped": "33"}
 
 
 class Board:
@@ -242,6 +242,9 @@ def watch(r: Remote, job_id: str) -> str:
         print()
         show_results(r, job_id)
         return "done"
+    if final["status"] == "stopped":
+        warn(f"job {job_id} was stopped; finished stages stay cached. Continue with: lobbot resume {job_id}")
+        return "stopped"
     print(c("✗ pipeline failed: ", "31") + str(final.get("msg", "")))
     print(f"  logs: lobbot logs {job_id}    retry: lobbot resume {job_id}")
     return "error"
@@ -604,7 +607,13 @@ for name, body in b["files"].items():
     r.start_server()
     with r.tunnel() as base:
         api = Api(base, r.token())
-        api.post(f"/jobs/{job_id}/resume", {})  # the API launches pipeline.py on the prepared job dir
+        try:
+            api.post(f"/jobs/{job_id}/resume", {})  # the API launches pipeline.py on the prepared job dir
+        except ApiError as e:
+            if e.status != 409:
+                raise
+            raise CliError(f"{e.msg}\nJob {job_id} is set up but not started; start it once the GPU is free with: "
+                           f"lobbot resume {job_id}")
         ok(f"started job {c(job_id, '1')} · {spec['task_name']} · preset {a.preset}"
            + (f" ({describe_config(conf)})" if conf else " (default settings)"))
     if a.detach:
@@ -694,7 +703,12 @@ def cmd_resume(a) -> None:
     with r.tunnel() as base:
         api = Api(base, r.token())
         job = check_job_id(a.job)
-        api.post(f"/jobs/{job}/resume", {"from": a.start} if a.start else {})
+        try:
+            api.post(f"/jobs/{job}/resume", {"from": a.start} if a.start else {})
+        except ApiError as e:
+            if e.status == 409:
+                raise CliError(e.msg)
+            raise
         ok(f"resumed {job}" + (f" from {a.start}" if a.start else " (finished stages are skipped)"))
     if not a.detach and watch(r, job) == "error":
         sys.exit(1)
@@ -707,6 +721,19 @@ def cmd_stop(a) -> None:
     if not a.yes and sys.stdin.isatty():
         if input(f"Stop job {job}? Its current stage is lost; finished stages stay cached. [y/N] ").lower() != "y":
             return
+    try:
+        r.start_server()
+        with r.tunnel() as base:
+            Api(base, r.token()).post(f"/jobs/{job}/stop", {}, timeout=90)  # returns once the GPU is free
+        ok(f"stopped job {job}; finished stages stay cached. Continue with: lobbot resume {job}")
+        return
+    except ApiError as e:
+        if e.status == 409:
+            warn(f"no running pipeline found for job {job}")
+            return
+        if e.status not in (404, 405):
+            raise
+    # Older VM checkout without POST /stop, or a job dir the API does not know: signal it directly.
     out = r.sh(f'pkill -TERM -f "[p]ipeline.py --job [^ ]*/{job}( |$)" && echo stopped || echo none', check=False)
     if "stopped" in out:
         ok(f"sent stop to job {job}; it frees the GPU within ~30s. Restart with: lobbot resume {job}")

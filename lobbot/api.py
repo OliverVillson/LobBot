@@ -16,6 +16,7 @@ class ApiError(RuntimeError):
     def __init__(self, status: int, msg: str):
         super().__init__(f"API {status}: {msg}")
         self.status = status
+        self.msg = msg
 
 
 class Api:
@@ -48,8 +49,8 @@ class Api:
             body = r.read()
             return json.loads(body) if r.headers.get_content_type() == "application/json" else body.decode()
 
-    def post(self, path: str, body: dict | None = None):
-        with self._open(self._req("POST", path, body if body is not None else {})) as r:
+    def post(self, path: str, body: dict | None = None, timeout: float = 30):
+        with self._open(self._req("POST", path, body if body is not None else {}), timeout=timeout) as r:
             return json.loads(r.read())
 
     def health(self) -> dict:
