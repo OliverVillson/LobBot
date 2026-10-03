@@ -87,6 +87,16 @@ lobbot save <job> --chat            # keep the model: see below
 lobbot pull [--stash]               # git pull the VM checkout; --stash stashes local edits first
 ```
 
+`lobbot chat <model>` and `lobbot ask <model> "..."` talk to a saved model in
+the local Ollama. When the answer is JSON, short fields are shown as labelled
+lines and multi-line fields as real code under a heading, with a file name
+guessed from the include guard or `#include` (e.g. `observer.h`,
+`observer.c`). `--out DIR` writes those files, and C code is checked with
+`cc -std=c11 -Wall -fsyntax-only` so you see whether it compiles. Answers that
+aren't JSON are shown as they come; `--raw` turns all of this off and
+`chat --plain` runs plain `ollama run`. Each chat message is answered on its
+own, like the model was trained; `--history` sends the whole conversation.
+
 `lobbot save` (alias `install`; `run --save` chains it) copies the job's
 report, spec, Modelfile and, if the small system disk has room, the GGUF to
 `~/lobbot-saved/<task>-<job>/` on the VM. That disk survives a pause, unlike
