@@ -25,7 +25,10 @@ def server():
                 self.send_header("content-length", "0")
                 self.end_headers()
                 return
-            if self.path.endswith("/chat/completions"):
+            if self.path == "/v1/compress":
+                out = {"model": body["model"], "messages": [
+                    {"role": m["role"], "content": " ".join(m["content"].split()[::2])} for m in body["messages"]]}
+            elif self.path.endswith("/chat/completions"):
                 out = {"choices": [{"message": {"role": "assistant", "content": "8"}}]}
             else:
                 out = {"id": "m", "type": "message", "role": "assistant", "model": body["model"],
@@ -52,6 +55,7 @@ def fresh_gemini(monkeypatch):
     monkeypatch.setattr(gemini, "_condense_off", False)
     monkeypatch.delenv("CONDENSE_API_KEY", raising=False)
     monkeypatch.delenv("CONDENSE_GEMINI_URL", raising=False)
+    monkeypatch.delenv("CONDENSE_COMPRESS_URL", raising=False)
 
 
 def test_gemini_judge(server, monkeypatch):
@@ -130,3 +134,42 @@ def test_condense_failure_falls_back_to_direct_once(server, monkeypatch):
     # condense tried once, then switched off; every call answered directly
     assert [r["path"] for r in seen] == ["/broken/chat/completions"] + ["/direct/chat/completions"] * 3
     assert "x-condense-auth-token" not in seen[1]["headers"]
+
+
+def test_compress(server, monkeypatch):
+    url, seen = server
+    monkeypatch.setenv("CONDENSE_API_KEY", "ak_test")
+    monkeypatch.setenv("CONDENSE_COMPRESS_URL", url + "/v1/compress")
+    assert condense.compress(["a b c d", "e f g h"]) == ["a c", "e g"]
+    assert seen[0]["body"]["model"] == "helene-1.1" and seen[0]["headers"]["x-condense-auth-token"] == "ak_test"
+    assert len(seen[0]["body"]["messages"]) == 2
+
+
+def test_compress_falls_back_to_original(server, monkeypatch):
+    url, seen = server
+    texts = ["keep this text"]
+    assert condense.compress(texts) == texts and not seen  # condense off: no request
+    monkeypatch.setenv("CONDENSE_API_KEY", "ak_test")
+    monkeypatch.setenv("CONDENSE_COMPRESS_URL", url + "/broken/v1/compress")
+    assert condense.compress(texts) == texts  # error: originals
+
+
+def test_gemini_proxy_is_opt_in(monkeypatch):
+    monkeypatch.setenv("CONDENSE_API_KEY", "ak_test")
+    assert gemini.condense_url() is None
+
+
+def test_testgen_shows_compressed_examples(server, monkeypatch):
+    from stages import testgen
+    from stages.data import norm_key, parse_array
+
+    url, seen = server
+    monkeypatch.setenv("CONDENSE_API_KEY", "ak_test")
+    monkeypatch.setenv("CONDENSE_COMPRESS_URL", url + "/v1/compress")
+    prompts = []
+    monkeypatch.setattr(gemini, "chat", lambda model, msgs, **kw: prompts.append(msgs[0]["content"]) or "[]")
+    ex = [SimpleNamespace(input=f"one two three four example {i}") for i in range(10)]
+    spec = SimpleNamespace(description="d", input_format="email", seed_examples=ex)
+    testgen.held_out_inputs(spec, SimpleNamespace(testgen_model="gemini-3.8-flash"), 10, set(), norm_key, parse_array)
+    assert len(seen[0]["body"]["messages"]) == 8  # twice the usual 4 examples
+    assert "one three example" in prompts[0] and "one two three" not in prompts[0]

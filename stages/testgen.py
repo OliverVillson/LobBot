@@ -1,8 +1,11 @@
 """Held-out test inputs written by Gemini instead of the teacher.
 
+With CONDENSE_API_KEY set, the example inputs Gemini is shown are compressed
+by condense.chat first (stages/condense.py compress()), so it sees twice as many.
+
 With the teacher writing both the training inputs and the test inputs, the
 test set shares the teacher's blind spots and phrasing. Here Gemini writes the
-held-out inputs (through condense.chat when CONDENSE_API_KEY is set), the
+held-out inputs, the
 teacher still answers them as the references, and none of them go into
 training. The data stage calls held_out_inputs(); if it returns too few, the
 stage falls back to splitting the held-out set off the teacher's own data.
@@ -30,10 +33,13 @@ def enabled(cfg) -> bool:
 def held_out_inputs(spec, cfg, n: int, seen: set[str], norm_key, parse_array,
                     max_chars: int = 6000, seed: int = 1) -> list[str]:
     """Up to n new task inputs, deduplicated against `seen` (normalised keys)."""
-    from stages import gemini
+    from stages import condense, gemini
 
     rng = random.Random(seed)
-    shown = "\n\n".join(f"<input>\n{e.input}\n</input>" for e in spec.seed_examples[:4])
+    # With condense on, Gemini sees twice as many examples, compressed, for about the same tokens.
+    examples = [e.input for e in spec.seed_examples[:8 if condense.enabled() else 4]]
+    examples = condense.compress(examples)
+    shown = "\n\n".join(f"<input>\n{x}\n</input>" for x in examples)
 
     def ask(i: int) -> list[str]:
         prompt = (
