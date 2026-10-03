@@ -128,21 +128,35 @@ def _normalise(xs: list[float]) -> list[float]:
     return [(x if x in good else mean) / mean for x in xs]
 
 
+# The imatrix energy is an absolute output energy, and the residual stream grows
+# with depth, so it climbs steeply with depth in every model (Qwen3-30B-A3B
+# REAP-50, 2026-10-03 B200 run: ffn_down energy 0.01x the mean in early layers,
+# 340x in the last). The REAP score (||moe_out|| / ||moe_in||) already measures
+# a block's relative effect, so using the raw energy as well counts depth twice
+# and put 111 of 144 expert tensors at q2_k to fund q5/q6 in the last layer.
+# A fourth root keeps the energy's split between projections and its ordering
+# while letting REAP lead; the clip stops any single layer from soaking up
+# the budget.
+ENERGY_POWER = 0.25
+SENS_CLIP = (0.25, 4.0)
+
+
 def sensitivities(
     n_layers: int,
     layer_importance: list[float] | None = None,
     proj_energy: dict[str, list[float]] | None = None,
     reap_weight: float = 1.0,
+    energy_power: float = ENERGY_POWER,
 ) -> dict[str, list[float]]:
     """Per-layer, per-projection weight on quantization error.
 
     layer_importance: REAP-stage score per MoE block (how much the experts move
         the residual stream on task data). Shared by gate, up and down.
     proj_energy: task imatrix energy per projection, sum_j E[x_j^2] * ||W[:, j]||^2,
-        the expected output energy of the tensor on task tokens. Quantization
-        error in a tensor scales with it, so it separates layers *and*
-        projections. See quantize.imatrix_energy().
-    Both are normalised to mean 1 and multiplied; either may be missing.
+        the expected output energy of the tensor on task tokens. See
+        quantize.imatrix_energy(). Damped by `energy_power`.
+    Each signal is normalised to mean 1, they are multiplied, and the product
+    is renormalised and clipped to SENS_CLIP; either signal may be missing.
     """
     li = _normalise(layer_importance) if layer_importance else [1.0] * n_layers
     if len(li) != n_layers:
@@ -150,7 +164,9 @@ def sensitivities(
     out = {}
     for kind in ("gate", "up", "down"):
         e = _normalise(proj_energy[kind]) if proj_energy and kind in proj_energy else [1.0] * n_layers
-        out[kind] = [KIND_WEIGHT[kind] * (li[i] ** reap_weight) * e[i] for i in range(n_layers)]
+        raw = _normalise([(li[i] ** reap_weight) * (e[i] ** energy_power) for i in range(n_layers)])
+        lo, hi = SENS_CLIP
+        out[kind] = [KIND_WEIGHT[kind] * min(hi, max(lo, w)) for w in raw]
     return out
 
 

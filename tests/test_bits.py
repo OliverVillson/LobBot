@@ -76,3 +76,22 @@ def test_per_token_budget_caps_bits():
 def test_missing_or_bad_importance_is_neutral():
     s = bits.sensitivities(4, [0.0, float("nan"), 2.0, 2.0])
     assert s["gate"] == [1.0, 1.0, 1.0, 1.0]
+
+
+def test_depth_growing_energy_does_not_starve_most_layers():
+    # Shaped like the 2026-10-03 B200 run: energy grows ~1.15x per layer with a
+    # 50x spike in the last layer, REAP importance mildly rising.
+    energy = {k: [1.15 ** i for i in range(47)] + [50 * 1.15 ** 47] for k in ("gate", "up", "down")}
+    imp = [0.1 + 0.005 * i for i in range(47)] + [1.9]
+    layers = bits.allocate(shape(), imp, 6.5, proj_energy=energy)
+    types = [l.gate_up for l in layers] * 2 + [l.down for l in layers]
+    uniform = bits.allocate(shape(), None, 6.5)
+    uniform_q2 = sum(t == "q2_k" for t in [l.gate_up for l in uniform] * 2 + [l.down for l in uniform])
+    assert types.count("q2_k") <= uniform_q2 + 12
+    assert max(bits.LADDER.index(t) for t in types) <= bits.LADDER.index("q4_k")
+
+
+def test_sensitivity_is_clipped():
+    s = bits.sensitivities(4, [1, 1, 1, 1000], {"gate": [1, 1, 1, 1e6], "up": [1] * 4, "down": [1] * 4})
+    lo, hi = bits.SENS_CLIP
+    assert max(s["gate"]) <= hi * bits.KIND_WEIGHT["gate"] and min(s["gate"]) >= lo * bits.KIND_WEIGHT["gate"]
