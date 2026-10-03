@@ -256,6 +256,17 @@ def gpu_processes(r: Remote) -> list[str]:
     return [l.strip() for l in out.splitlines() if l.strip()]
 
 
+def running_pipelines(r: Remote) -> list[str]:
+    """Job ids (dir names) of pipeline.py processes on the VM, however they were started."""
+    out = r.sh('pgrep -af "[p]ipeline.py --job " || true', check=False)
+    found = []
+    for line in out.splitlines():
+        args = line.split()[1:]
+        if "--job" in args[:-1] and any(a.endswith("pipeline.py") for a in args):
+            found.append(Path(args[args.index("--job") + 1]).name)
+    return found
+
+
 def disk_state(r: Remote, ids: list[str]) -> dict[str, dict]:
     """What the job dirs say, for jobs the API has no events for (run directly with pipeline.py)."""
     if not ids:
@@ -565,6 +576,11 @@ def describe_config(conf: dict) -> str:
     return ", ".join(out)
 
 
+def busy_message(job: str) -> str:
+    return (f"job {job} is running, and the VM runs one job at a time. "
+            f"Wait for it (lobbot watch {job}) or stop it (lobbot stop {job}).")
+
+
 def cmd_run(a) -> None:
     s = settings(a)
     r = Remote(s)
@@ -587,7 +603,14 @@ def cmd_run(a) -> None:
                            + "\nWait for it (lobbot status), or add --force to start anyway.")
     job_id = check_job_id(a.name) if a.name else secrets.token_hex(5)
     bundle = {"dir": s.jobs.rstrip("/") + "/" + job_id, "files": {"taskspec.json": spec, "config.json": conf}}
-    r.sh(r.env_prelude() + """python3 -c '
+    r.start_server()
+    with r.tunnel() as base:
+        api = Api(base, r.token())
+        # The API runs one job at a time; ask before writing anything so a refused run leaves no job dir.
+        running = running_pipelines(r) or [j["job_id"] for j in api.get("/jobs") if j["state"] == "running"]
+        if running:
+            raise CliError(busy_message(running[0]))
+        r.sh(r.env_prelude() + """python3 -c '
 import json, os, sys
 from dataclasses import fields
 from stages._util import Config
@@ -604,16 +627,15 @@ for name, body in b["files"].items():
     with open(os.path.join(d, name), "w") as f:
         json.dump(body, f, indent=2, ensure_ascii=False)
 '""", input=json.dumps(bundle))
-    r.start_server()
-    with r.tunnel() as base:
-        api = Api(base, r.token())
         try:
             api.post(f"/jobs/{job_id}/resume", {})  # the API launches pipeline.py on the prepared job dir
         except ApiError as e:
             if e.status != 409:
                 raise
-            raise CliError(f"{e.msg}\nJob {job_id} is set up but not started; start it once the GPU is free with: "
-                           f"lobbot resume {job_id}")
+            # Lost a race (or a pipeline.py outside the jobs dir holds the GPU): remove the dir just written.
+            r.sh("python3 -c 'import os, shutil, sys; shutil.rmtree(os.path.expanduser(sys.argv[1]), True)' "
+                 + shlex.quote(bundle["dir"]), check=False)
+            raise CliError(e.msg + "\nNothing was started; run it again once the GPU is free.")
         ok(f"started job {c(job_id, '1')} · {spec['task_name']} · preset {a.preset}"
            + (f" ({describe_config(conf)})" if conf else " (default settings)"))
     if a.detach:

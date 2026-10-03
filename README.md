@@ -111,8 +111,8 @@ heal_max_len=8192`, so the teacher's answers aren't cut off and dropped and heal
 trains on whole examples. `lobbot new` suggests it when the drafted seed answers
 run past ~800 tokens, and `run` warns when they do and `--long` is missing.
 `--set key=value` overrides any `Config` field and wins over `--fast` and
-`--long`. `run` refuses to start while something else is on the GPU unless you
-add `--force`, and refuses config keys the VM checkout doesn't know yet.
+`--long`. `run` refuses to start while another job is running (and writes nothing
+then), or while something else is on the GPU unless you add `--force`, and refuses config keys the VM checkout doesn't know yet.
 The API token lives in `~/.lobbot-token` on the VM (`lobbot token` prints it).
 
 ## Without a GPU

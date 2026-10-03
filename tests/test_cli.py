@@ -243,6 +243,35 @@ def test_run_refuses_keys_the_vm_lacks(cli, tmp_path):
     assert not (cli.tmp / "jobs/old").exists()
 
 
+def test_run_refused_by_the_api_cleans_up(cli, tmp_path, monkeypatch, capsys):
+    """If a job starts between run's check and its POST, the API's 409 leaves no job dir behind."""
+    from lobbot import app
+
+    cli("up")
+    job = cli.tmp / "jobs/busy"
+    job.mkdir(parents=True)
+    (job / "taskspec.json").write_text((ROOT / "examples/support-tickets.taskspec.json").read_text())
+    fake = tmp_path / "pipeline.py"
+    fake.write_text("import time\ntime.sleep(120)\n")
+    proc = subprocess.Popen([sys.executable, str(fake), "--job", str(job)])
+    # The race: run's check sees nothing running.
+    monkeypatch.setattr(app, "running_pipelines", lambda r: [])
+    real_get = app.Api.get
+    monkeypatch.setattr(app.Api, "get", lambda self, path: [] if path == "/jobs" else real_get(self, path))
+    monkeypatch.setenv("HOME", str(cli.home))
+    monkeypatch.setenv("LOBBOT_CONFIG", str(cli.tmp / "config.json"))
+    try:
+        time.sleep(0.5)
+        with pytest.raises(SystemExit):
+            app.main(["run", "--example", "--name", "raced", "-d"])
+        err = capsys.readouterr().err
+        assert "job busy is running" in err and "Nothing was started" in err
+        assert not (cli.tmp / "jobs/raced").exists()
+    finally:
+        proc.kill()
+        proc.wait()
+
+
 def test_new_drafts_on_vm_with_its_key(cli, tmp_path):
     """No key on the laptop: `new` runs the drafting on the VM, where ~/.lobbot-env has the key."""
     fake = tmp_path / "fakegemini"
@@ -293,7 +322,8 @@ def test_run_refuses_while_busy_and_stop_frees_it(cli):
     try:
         time.sleep(0.5)
         p = cli("run", "--example", "--name", "second", ok=False)
-        assert p.returncode != 0 and "job busy is running" in p.stderr and "lobbot resume second" in p.stderr
+        assert p.returncode != 0 and "job busy is running" in p.stderr and "lobbot stop busy" in p.stderr
+        assert not (cli.tmp / "jobs/second").exists()  # refused before anything was written
         assert "stopped job busy" in cli("stop", "busy", "--yes").stdout
         assert proc.wait(timeout=10) != 0
         assert "no running pipeline" in cli("stop", "busy", "--yes").stderr
