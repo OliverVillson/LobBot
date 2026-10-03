@@ -10,6 +10,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -278,3 +279,23 @@ urllib.request.urlopen = _fake
     (fake / "spec.json").write_text(json.dumps(spec))
     p = cli("new", "write C code", "-o", "long.json")
     assert "up to ~1500 tokens" in p.stdout and "lobbot run long.json --fast --long" in p.stdout
+
+
+def test_run_refuses_while_busy_and_stop_frees_it(cli):
+    """A second job is refused while one runs (API 409), and lobbot stop ends the running one."""
+    cli("up")
+    job = cli.tmp / "jobs/busy"
+    job.mkdir(parents=True)
+    (job / "taskspec.json").write_text((ROOT / "examples/support-tickets.taskspec.json").read_text())
+    fake = cli.tmp / "pipeline.py"
+    fake.write_text("import time\ntime.sleep(120)\n")
+    proc = subprocess.Popen([sys.executable, str(fake), "--job", str(job)])
+    try:
+        time.sleep(0.5)
+        p = cli("run", "--example", "--name", "second", ok=False)
+        assert p.returncode != 0 and "job busy is running" in p.stderr and "lobbot resume second" in p.stderr
+        assert "stopped job busy" in cli("stop", "busy", "--yes").stdout
+        assert proc.wait(timeout=10) != 0
+        assert "no running pipeline" in cli("stop", "busy", "--yes").stderr
+    finally:
+        proc.kill()

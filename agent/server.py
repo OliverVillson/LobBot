@@ -17,6 +17,7 @@ import json
 import os
 import secrets
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -24,7 +25,7 @@ import time
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, Header, HTTPException
-from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
 
 from common.progress import parse
 from common.taskspec import TaskSpec
@@ -92,6 +93,10 @@ def disk_state(d: Path) -> tuple[str, dict, str | None]:
             if last["status"] == "error":
                 error = last.get("msg") or f"{s} failed"
     statuses = [v["status"] for v in stages.values()]
+    newest_log = max((_mtime(p) for p in (d / "logs").glob("*.log")), default=0.0)
+    if (d / "stopped").exists() and _mtime(d / "stopped") > newest_log - 60 and not _pipeline_alive(d):
+        # POST /stop, and nothing ran since (a stage may still log its exit just after)
+        return "stopped", stages, None
     if all(st == "done" for st in statuses) and (d / "out" / "model.gguf").exists():
         return "done", stages, None
     if error:
@@ -129,9 +134,10 @@ def job_state(job_id: str, d: Path) -> dict:
         if e["stage"] == "pipeline":
             if e["status"] == "running":
                 state = "running"
+            elif e["status"] in ("done", "stopped"):
+                state, error = e["status"], None
             else:
-                state = "done" if e["status"] == "done" else "error"
-                error = e.get("msg") if e["status"] == "error" else None
+                state, error = "error", e.get("msg")
             continue
         if e["stage"] in stages:
             stages[e["stage"]] = {"status": e["status"], "pct": e.get("pct", 0), "msg": e.get("msg", "")}
@@ -156,11 +162,54 @@ def _state_dict(job_id: str, d: Path, state: str, stages: dict, error: str | Non
     }
 
 
+class Busy(Exception):
+    """Another pipeline holds the GPU: one job runs at a time."""
+
+    def __init__(self, job_id: str):
+        self.job_id = job_id
+
+
+@app.exception_handler(Busy)
+def _busy(_request, e: Busy) -> JSONResponse:
+    # running_job lets a client offer "watch it" or "stop it" without parsing the message.
+    return JSONResponse(status_code=409, content={
+        "detail": f"job {e.job_id} is running; wait for it or stop it (POST /jobs/{e.job_id}/stop)",
+        "running_job": e.job_id})
+
+
+def _hand_run_pipelines() -> dict[str, list[int]]:
+    """pipeline.py processes not started by this server, by job id (dir name)."""
+    try:
+        out = subprocess.run(["pgrep", "-af", r"pipeline\.py --job "], capture_output=True, text=True).stdout
+    except FileNotFoundError:
+        return {}
+    ours = {p.pid for p in _running.values()}
+    found: dict[str, list[int]] = {}
+    for line in out.splitlines():
+        pid, _, cmd = line.partition(" ")
+        args = cmd.split()
+        if int(pid) in ours or "--job" not in args or args.index("--job") + 1 >= len(args):
+            continue
+        if not any(a.endswith("pipeline.py") for a in args):
+            continue  # e.g. a shell whose command line mentions pipeline.py
+        found.setdefault(Path(args[args.index("--job") + 1]).name, []).append(int(pid))
+    return found
+
+
+def running_job() -> str | None:
+    """The job holding the GPU, started by this server or by hand, if any."""
+    for job_id, proc in _running.items():
+        if proc.poll() is None:
+            return job_id
+    return next(iter(_hand_run_pipelines()), None)
+
+
 def launch(job_id: str, d: Path, start: str | None = None) -> None:
     with _lock:
-        proc = _running.get(job_id)
-        if proc and proc.poll() is None:
-            raise HTTPException(409, "job is already running")
+        busy = running_job()
+        if busy:
+            raise Busy(busy)
+        (d / "stopped").unlink(missing_ok=True)
         cmd = [sys.executable, str(ROOT / "pipeline.py"), "--job", str(d)]
         if start:
             cmd += ["--from", start]
@@ -183,7 +232,10 @@ def launch(job_id: str, d: Path, start: str | None = None) -> None:
             code = proc.wait()
             # Make sure every run ends with a pipeline event, even on a crash.
             last = read_events(d)[-1:] or [{}]
-            if last[0].get("stage") != "pipeline":
+            if (d / "stopped").exists():
+                ev.write(json.dumps({"stage": "pipeline", "status": "stopped", "msg": "stopped; resume to continue",
+                                     "ts": time.time()}) + "\n")
+            elif last[0].get("stage") != "pipeline":
                 ev.write(json.dumps({"stage": "pipeline", "status": "error", "msg": f"exited with {code}", "ts": time.time()}) + "\n")
         with _lock:
             _running.pop(job_id, None)
@@ -209,11 +261,18 @@ def create_job(body: dict) -> dict:
         spec = TaskSpec.from_dict(body)
     except (KeyError, TypeError, ValueError) as e:
         raise HTTPException(422, f"invalid TaskSpec: {e}")
+    busy = running_job()
+    if busy:
+        raise Busy(busy)  # before creating a job dir that would never run
     job_id = secrets.token_hex(5)
     d = JOBS / job_id
     d.mkdir(parents=True)
     spec.save(d / "taskspec.json")
-    launch(job_id, d)
+    try:
+        launch(job_id, d)
+    except Busy:
+        shutil.rmtree(d, ignore_errors=True)  # lost a race with another start
+        raise
     return {"job_id": job_id}
 
 
@@ -244,6 +303,50 @@ def resume_job(job_id: str, body: dict | None = None) -> dict:
     return {"job_id": job_id}
 
 
+@app.post("/jobs/{job_id}/stop", dependencies=[Depends(auth)])
+def stop_job(job_id: str) -> dict:
+    """SIGTERM the job's pipeline.py, which forwards it to the running stage and
+    frees the GPU. Finished stages stay cached; resume continues from there."""
+    d = job_dir(job_id)
+    proc = _running.get(job_id)
+    pids = [proc.pid] if proc and proc.poll() is None else _hand_run_pipelines().get(job_id, [])
+    if not pids:
+        raise HTTPException(409, "job is not running")
+    (d / "stopped").write_text(str(time.time()))
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    # pipeline.py gives its stage 30s to exit before killing it.
+    end = time.time() + 40
+    while time.time() < end and any(_alive(p) for p in pids):
+        time.sleep(0.2)
+    for pid in pids:
+        if _alive(pid):
+            os.kill(pid, signal.SIGKILL)
+    if proc:
+        for _ in range(50):  # let pump write the final "stopped" event
+            if job_id not in _running:
+                break
+            time.sleep(0.1)
+    return {"job_id": job_id, "state": job_state(job_id, d)["state"]}
+
+
+def _alive(pid: int) -> bool:
+    proc = next((p for p in _running.values() if p.pid == pid), None)
+    if proc:
+        return proc.poll() is None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    try:  # an exited child its parent has not reaped yet is a zombie, not running
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z"
+    except (OSError, IndexError):
+        return True
+
+
 @app.get("/jobs/{job_id}/events", dependencies=[Depends(auth)])
 async def job_events(job_id: str) -> StreamingResponse:
     d = job_dir(job_id)
@@ -269,9 +372,10 @@ async def job_events(job_id: str) -> StreamingResponse:
                 if state["state"] in ("error", "queued"):
                     yield f"data: {json.dumps({'stage': 'pipeline', 'status': 'error', 'msg': state['error'] or 'not running', 'ts': time.time()})}\n\n"
                     return
-                if state["state"] in ("done", "partial"):  # a run started by hand, read from the job dir
-                    msg = "done" if state["state"] == "done" else "partial run, no packaged model"
-                    yield f"data: {json.dumps({'stage': 'pipeline', 'status': 'done', 'msg': msg, 'ts': time.time()})}\n\n"
+                if state["state"] in ("done", "partial", "stopped"):  # a run started by hand, read from the job dir
+                    status, msg = {"done": ("done", "done"), "partial": ("done", "partial run, no packaged model"),
+                                   "stopped": ("stopped", "stopped; resume to continue")}[state["state"]]
+                    yield f"data: {json.dumps({'stage': 'pipeline', 'status': status, 'msg': msg, 'ts': time.time()})}\n\n"
                     return
 
     return StreamingResponse(stream(), media_type="text/event-stream",

@@ -62,7 +62,10 @@ ssh -L 8700:127.0.0.1:8700 <vm>                     # on the laptop
 `GET /health`, `POST /jobs` (TaskSpec body), `GET /jobs`, `GET /jobs/{id}`,
 `GET /jobs/{id}/events` (SSE progress lines, replayed from the start of the
 latest run), `POST /jobs/{id}/resume`, `GET /jobs/{id}/eval`,
-`GET /jobs/{id}/model` (GGUF, Range supported), `GET /jobs/{id}/modelfile`.
+`GET /jobs/{id}/model` (GGUF, Range supported), `GET /jobs/{id}/modelfile`,
+`POST /jobs/{id}/stop` (frees the GPU; state becomes `stopped`, resume continues).
+One job runs at a time: starting or resuming another returns 409 with
+`{"detail": ..., "running_job": "<id>"}`.
 All but `/health` need `Authorization: Bearer $LOBBOT_TOKEN`.
 
 ## Developer CLI (`lobbot`)
