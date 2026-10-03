@@ -10,7 +10,9 @@ crash there cannot take down the main path. Writes:
 Knobs: heal_* and student_epochs in <job>/config.json (Config). The
 wall-clock caps are env vars, LOBBOT_HEAL_MAX_MINUTES and
 LOBBOT_STUDENT_MAX_MINUTES (default 60 each: training stops early at the cap
-and still merges and saves; 0 means no cap).
+and still merges and saves; 0 means no cap). LOBBOT_HEAL_MAX_LEN (default
+2048) is the per-example token limit for both models; longer examples are cut
+short, so raise it for long answers such as code.
 """
 
 from __future__ import annotations
@@ -53,6 +55,7 @@ def heal_moe(job: Job, progress) -> None:
         epochs=cfg.heal_epochs, lr=cfg.heal_lr, r=cfg.heal_lora_r, alpha=2 * cfg.heal_lora_r,
         targets=cfg.heal_targets, train_experts=bool(_knob(cfg, "heal_train_experts", "LOBBOT_HEAL_EXPERTS", True)),
         train_router=True, kd_teacher=job.model_path(cfg.teacher) if kd > 0 else None, kd_weight=kd,
+        max_len=int(_knob(cfg, "heal_max_len", "LOBBOT_HEAL_MAX_LEN", 2048)),
         max_tokens=16384, max_minutes=float(_knob(cfg, "heal_max_minutes", "LOBBOT_HEAL_MAX_MINUTES", 60.0)),
         progress=progress)
 
@@ -65,6 +68,7 @@ def train_dense(job: Job, progress) -> None:
     train_sft(
         job.model_path(cfg.student), load_examples(job.path("data", "train.jsonl")), job.path("work", "dense"),
         epochs=float(_knob(cfg, "student_epochs", "LOBBOT_STUDENT_EPOCHS", 2.0)), lr=2e-4, r=32, alpha=64,
+        max_len=int(_knob(cfg, "heal_max_len", "LOBBOT_HEAL_MAX_LEN", 2048)),
         max_tokens=32768, max_minutes=float(_knob(cfg, "student_max_minutes", "LOBBOT_STUDENT_MAX_MINUTES", 60.0)),
         progress=progress)
 
