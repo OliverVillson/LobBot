@@ -6,7 +6,8 @@
     lobbot new "what it should do"   draft a TaskSpec with Gemini
     lobbot run spec.json --fast      start a job and watch its stages live
     lobbot status [job]              all jobs, or one job's stages
-    lobbot watch / logs / resume / stop / eval <job>
+    lobbot results <job>             scores vs the teacher, size, speed, examples
+    lobbot watch / logs / resume / stop <job>
     lobbot save <job> --chat         back it up on the VM, download it (resumable,
                                      sha256-checked), import into Ollama, chat
     lobbot pull                      update the VM checkout
@@ -135,12 +136,22 @@ class Board:
             out.append(f" {ICON.get(row['status'], '?')} {st:<9}{bar} {pct:5.1f}%  {t:>7}  {msg}")
         return out
 
+    def footer(self) -> str:
+        """Elapsed time and the stage being worked on."""
+        if not self.started:
+            return c("  waiting for the first stage...", "2")
+        t0 = min(self.started.values())
+        end = max(self.ended.values()) if all(r["status"] in ("done", "skipped", "error") for r in self.stages.values()) \
+            and self.ended else time.time()
+        cur = next((st for st, r in self.stages.items() if r["status"] == "running"), None)
+        return c(f"  elapsed {dur(end - t0)}" + (f" · now: {cur}" if cur else ""), "2")
+
     def draw(self) -> None:
         if not TTY:
             return
         if self.drawn:
             sys.stdout.write(f"\x1b[{self.drawn}F")
-        ls = self.lines()
+        ls = self.lines() + [self.footer()]
         for line in ls:
             sys.stdout.write("\x1b[2K" + line + "\n")
         sys.stdout.flush()
@@ -187,6 +198,9 @@ def watch(r: Remote, job_id: str) -> str:
                 with r.tunnel() as base:
                     n = 0
                     for e in Api(base, r.token()).events(job_id):
+                        if not e:
+                            board.draw()  # keepalive: refresh the elapsed clock
+                            continue
                         n += 1
                         if n <= seen:
                             continue  # the stream replays the run from its start after a reconnect
@@ -220,8 +234,9 @@ def watch(r: Remote, job_id: str) -> str:
         if "model" in final and not final["model"]:
             ok(f"pipeline run finished: {final.get('msg', '')}")
             return "done"
-        ok(f"pipeline finished. Next: lobbot eval {job_id}  then  lobbot save {job_id} --chat")
-        warn(PAUSE_WARNING)
+        ok("pipeline finished")
+        print()
+        show_results(r, job_id)
         return "done"
     print(c("✗ pipeline failed: ", "31") + str(final.get("msg", "")))
     print(f"  logs: lobbot logs {job_id}    retry: lobbot resume {job_id}")
@@ -482,6 +497,22 @@ def cmd_new(a) -> None:
     print(f"Edit it if you like, then: lobbot run {out} --fast")
 
 
+def describe_config(conf: dict) -> str:
+    """Config overrides in plain words, e.g. '400 examples, 30 tests, heal at most 20 min'."""
+    words = {"n_generate": "{} training examples", "n_heldout": "{} held-out tests",
+             "reap_calib_samples": "{} calibration samples", "heal_max_minutes": "heal at most {} min",
+             "heal_epochs": "{} heal epoch(s)", "reap_sparsity": "{:.0%} of experts pruned"}
+    out = []
+    for k, v in conf.items():
+        if k == "dense_fallback":
+            out.append("with the dense fallback" if v else "no dense fallback")
+        elif k in words:
+            out.append(words[k].format(v))
+        else:
+            out.append(f"{k}={v}")
+    return ", ".join(out)
+
+
 def cmd_run(a) -> None:
     s = settings(a)
     r = Remote(s)
@@ -509,8 +540,8 @@ for name, body in b["files"].items():
     with r.tunnel() as base:
         api = Api(base, r.token())
         api.post(f"/jobs/{job_id}/resume", {})  # the API launches pipeline.py on the prepared job dir
-        ok(f"started job {job_id}: {spec['task_name']}, preset {a.preset}"
-           + (f", overrides {json.dumps(conf)}" if conf else ""))
+        ok(f"started job {c(job_id, '1')} · {spec['task_name']} · preset {a.preset}"
+           + (f" ({describe_config(conf)})" if conf else " (default settings)"))
     if a.detach:
         print(f"Watch it with: lobbot watch {job_id}")
         return
@@ -552,6 +583,9 @@ def cmd_status(a) -> None:
             print(c("error: ", "31") + st["error"])
         if "*" in state:
             print(c(direct, "2"))
+        if state.startswith("done"):
+            print()
+            show_results(r, st["job_id"])
         return
     if not jobs:
         print("No jobs yet. Start one with: lobbot run --example --fast")
@@ -615,26 +649,35 @@ def cmd_stop(a) -> None:
         warn(f"no running pipeline found for job {job}")
 
 
-def cmd_eval(a) -> None:
-    r, s = connect(a)
-    with r.tunnel() as base:
-        rep = Api(base, r.token()).get(f"/jobs/{check_job_id(a.job)}/eval")
-    if a.json:
-        print(json.dumps(rep, indent=2))
+def show_results(r: Remote, job: str, facts: dict | None = None) -> None:
+    """Print the results report and what to do next."""
+    from lobbot.report import job_facts, render
+
+    try:
+        facts = facts or job_facts(r, job)
+    except (RemoteError, ValueError) as e:
+        warn(f"could not read the results for job {job}: {e}")
         return
-    t = rep["teacher"]
-    print(f"teacher {t['name']}: {t['size_gb']} GB, score {t['score']}   (scored by {rep['score_method']})")
-    print(f" {'candidate':<16}{'size GB':>8}{'score':>8}{'tok/s est':>11}{'tok/s VM':>10}  target")
-    for cand in rep["candidates"]:
-        win = c(" ← winner", "32") if cand["name"] == rep["winner"] else ""
-        print(f" {cand['name']:<16}{cand['size_gb']:>8}{cand['score']:>8}{cand['tok_s_est']:>11}"
-              f"{str(cand['tok_s_vm'] or '-'):>10}  {'yes' if cand['meets_target'] else 'no'}{win}")
-    for name, samples in (rep.get("samples") or {}).items():
-        if name == rep["winner"] and samples:
-            sm = samples[0]
-            print(c("\nsample input:  ", "2") + sm["input"][:300])
-            print(c("winner output: ", "2") + sm["output"][:300])
-            print(c("teacher:       ", "2") + sm["reference"][:300])
+    for line in render(job, facts, color=TTY):
+        print(line)
+    if facts.get("eval") and facts.get("gguf_bytes"):
+        print(c("  Next  ", "1") + f"lobbot save {job} --chat" + c("   download, verify, import into Ollama, chat", "2"))
+        print(c("        " + PAUSE_WARNING.split(". ")[0] + ".", "2"))
+
+
+def cmd_results(a) -> None:
+    s = settings(a)
+    r = Remote(s)
+    job = check_job_id(a.job, loose=True)
+    from lobbot.report import job_facts
+
+    facts = job_facts(r, job)
+    if a.json:
+        print(json.dumps(facts, indent=2))
+        return
+    if not facts.get("eval"):
+        raise CliError(f"job {job} has no eval report yet; see: lobbot status {job}")
+    show_results(r, job, facts)
 
 
 def model_dir(s: cfgmod.Settings, api: Api, job: str, out: str | None) -> Path:
@@ -932,9 +975,10 @@ def parser() -> argparse.ArgumentParser:
     sp.add_argument("job")
     sp.add_argument("-y", "--yes", action="store_true")
 
-    sp = add("eval", cmd_eval, "show a job's eval report")
+    sp = add("results", cmd_results, "show a finished job's results: scores, speed, size, examples",
+             aliases=["eval", "report"])
     sp.add_argument("job")
-    sp.add_argument("--json", action="store_true")
+    sp.add_argument("--json", action="store_true", help="raw eval report and job facts")
 
     sp = add("download", cmd_download, "download a job's GGUF (resumable, sha256-checked) and Modelfile")
     sp.add_argument("job")

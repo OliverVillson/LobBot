@@ -77,7 +77,8 @@ lobbot doctor                       # SSH, checkout, venvs, weights, llama.cpp, 
 lobbot secret GEMINI_API_KEY        # stored in ~/.lobbot-env on the VM (mode 600) for the eval judge
 lobbot new "turn support emails into JSON tickets"   # drafts a TaskSpec with Gemini
 lobbot run my.taskspec.json --fast  # or --example; live stage progress, Ctrl-C detaches
-lobbot status [job] | watch <job> | logs <job> [-s heal] [-f] | eval <job>
+lobbot results <job>                # judge scores vs teacher, size, tok/s, held-out examples
+lobbot status [job] | watch <job> | logs <job> [-s heal] [-f]
 lobbot resume <job> [--from quantize] | stop <job>
 lobbot save <job> --chat            # keep the model: see below
 lobbot pull [--stash]               # git pull the VM checkout; --stash stashes local edits first
@@ -92,6 +93,13 @@ against the VM's, writes `eval.json` and `lobbot.json` next to it, and runs
 `ollama create`. API keys are never pasted anywhere: `lobbot secret NAME`
 takes them from your local environment or a hidden prompt, and stores them in
 `~/.lobbot-env` on the VM.
+
+When a job finishes, `run`, `watch` and `status <job>` print the same results
+report as `lobbot results`: the winner and why it won, a scoreboard of the
+teacher and every candidate (size, estimated laptop tok/s, measured VM tok/s,
+judge score and share of the teacher's), how many held-out tests were used and
+who wrote and judged them, time per stage, the expert bit-width mix, and two
+held-out examples compared field by field with the teacher.
 
 `--fast` sets `n_generate=400, n_heldout=30, reap_calib_samples=128,
 heal_max_minutes=20, dense_fallback=false`; `--set key=value` overrides any `Config` field. `run`

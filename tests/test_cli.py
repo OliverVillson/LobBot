@@ -64,13 +64,16 @@ def test_full_flow(cli):
     conf = json.loads((cli.tmp / "jobs/demo/config.json").read_text())
     assert conf["n_generate"] == 400 and conf["dense_fallback"] is False and conf["heal_lr"] == 0.0002
     assert conf["heal_max_minutes"] == 20
-    assert "lobbot save demo" in p.stdout and "wipes /mnt/nvme" in p.stderr
+    assert "lobbot save demo --chat" in p.stdout and "wipes /mnt/nvme" in p.stdout
+    assert "LobBot results" in p.stdout and "Winner   lobbot-moe" in p.stdout
 
     assert "demo" in cli("status").stdout
     st = cli("status", "demo").stdout
     assert "done" in st and "package" in st
     assert "lobbot-moe" in cli("eval", "demo").stdout
-    assert json.loads(cli("eval", "demo", "--json").stdout)["winner"]
+    assert "Held-out" in cli("results", "demo").stdout or "Winner" in cli("results", "demo").stdout
+    assert "LobBot results" in st
+    assert json.loads(cli("results", "demo", "--json").stdout)["eval"]["winner"]
     assert '"stage": "package"' in cli("logs", "demo").stdout
     assert "healed" in cli("logs", "demo", "-s", "heal").stdout
 

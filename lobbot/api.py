@@ -57,12 +57,14 @@ class Api:
             return json.loads(r.read())
 
     def events(self, job_id: str) -> Iterator[dict]:
-        """Progress events of the job's latest run, live, until the run ends."""
+        """Progress events of the job's latest run, live, until the run ends ({} for a keepalive)."""
         with self._open(self._req("GET", f"/jobs/{job_id}/events"), timeout=120) as r:
             for raw in r:
                 line = raw.decode().strip()
                 if line.startswith("data: "):
                     yield json.loads(line[6:])
+                elif line.startswith(":"):
+                    yield {}  # keepalive: lets a live view refresh its clock
 
     def download(self, job_id: str, dest: Path, progress: Callable[[int, int], None] | None = None) -> Path:
         """Download the GGUF to dest, resuming a partial dest.part if there is one."""
