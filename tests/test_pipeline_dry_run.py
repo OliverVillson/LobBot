@@ -59,3 +59,11 @@ def test_missing_taskspec_fails(tmp_path):
     p, events = run(tmp_path)
     assert p.returncode == 2
     assert events[0]["status"] == "error"
+
+
+def test_config_accepts_time_caps(tmp_path):
+    from stages._util import Job
+
+    (tmp_path / "config.json").write_text(json.dumps({"heal_max_minutes": 20, "student_max_minutes": 15}))
+    cfg = Job(tmp_path).config
+    assert (cfg.heal_max_minutes, cfg.student_max_minutes) == (20, 15)
