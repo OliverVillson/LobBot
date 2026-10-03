@@ -2,6 +2,9 @@
 
 With CONDENSE_API_KEY set, the example inputs Gemini is shown are compressed
 by condense.chat first (stages/condense.py compress()), so it sees twice as many.
+One example stays uncompressed, and the prompt says the others are shortened,
+so Gemini still writes full, natural inputs. Jobs with a cached
+work/data_testgen.jsonl keep their inputs.
 
 With the teacher writing both the training inputs and the test inputs, the
 test set shares the teacher's blind spots and phrasing. Here Gemini writes the
@@ -37,9 +40,15 @@ def held_out_inputs(spec, cfg, n: int, seen: set[str], norm_key, parse_array,
 
     rng = random.Random(seed)
     # With condense on, Gemini sees twice as many examples, compressed, for about the same tokens.
-    examples = [e.input for e in spec.seed_examples[:8 if condense.enabled() else 4]]
-    examples = condense.compress(examples)
-    shown = "\n\n".join(f"<input>\n{x}\n</input>" for x in examples)
+    # The first stays uncompressed so Gemini still sees what a real input looks like.
+    raw = [e.input for e in spec.seed_examples[:8 if condense.enabled() else 4]]
+    packed = raw[:1] + condense.compress(raw[1:])
+    shown = "\n\n".join(f"<input>\n{x}\n</input>" for x in raw[:1] + packed[1:])
+    if packed[1:] != raw[1:]:
+        shown = (f"<input>\n{raw[0]}\n</input>\n\n"
+                 "The examples below were shortened by a compression tool and drop small words. Use them for "
+                 "content and variety only. Write your inputs in full, natural language like the first example.\n\n"
+                 + "\n\n".join(f"<input>\n{x}\n</input>" for x in packed[1:]))
 
     def ask(i: int) -> list[str]:
         prompt = (

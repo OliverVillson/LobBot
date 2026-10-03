@@ -171,5 +171,20 @@ def test_testgen_shows_compressed_examples(server, monkeypatch):
     ex = [SimpleNamespace(input=f"one two three four example {i}") for i in range(10)]
     spec = SimpleNamespace(description="d", input_format="email", seed_examples=ex)
     testgen.held_out_inputs(spec, SimpleNamespace(testgen_model="gemini-3.8-flash"), 10, set(), norm_key, parse_array)
-    assert len(seen[0]["body"]["messages"]) == 8  # twice the usual 4 examples
-    assert "one three example" in prompts[0] and "one two three" not in prompts[0]
+    assert len(seen[0]["body"]["messages"]) == 7  # 8 examples, the first sent uncompressed
+    p = prompts[0]
+    assert "one two three four example 0" in p  # the uncompressed one
+    assert "one three example" in p and "one two three four example 1" not in p
+    assert p.index("example 0") < p.index("shortened by a compression tool") < p.index("one three example")
+
+
+def test_testgen_without_condense_has_no_compression_note(monkeypatch):
+    from stages import testgen
+    from stages.data import norm_key, parse_array
+
+    prompts = []
+    monkeypatch.setattr(gemini, "chat", lambda model, msgs, **kw: prompts.append(msgs[0]["content"]) or "[]")
+    ex = [SimpleNamespace(input=f"full example {i}") for i in range(10)]
+    spec = SimpleNamespace(description="d", input_format="email", seed_examples=ex)
+    testgen.held_out_inputs(spec, SimpleNamespace(testgen_model="gemini-3.8-flash"), 10, set(), norm_key, parse_array)
+    assert "compression tool" not in prompts[0] and "full example 3" in prompts[0] and "full example 4" not in prompts[0]
