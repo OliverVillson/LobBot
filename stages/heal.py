@@ -13,6 +13,11 @@ LOBBOT_STUDENT_MAX_MINUTES (default 60 each: training stops early at the cap
 and still merges and saves; 0 means no cap). LOBBOT_HEAL_MAX_LEN (default
 2048) is the per-example token limit for both models; longer examples are cut
 short, so raise it for long answers such as code.
+
+A training step whose loss or gradient is NaN/inf is skipped; if that keeps
+happening, or the merged weights are not finite, the model is not saved. For
+the dense student that only drops the dense candidate: quantize and eval go on
+with the MoE alone.
 """
 
 from __future__ import annotations
@@ -67,7 +72,8 @@ def train_dense(job: Job, progress) -> None:
     cfg = job.config
     train_sft(
         job.model_path(cfg.student), load_examples(job.path("data", "train.jsonl")), job.path("work", "dense"),
-        epochs=float(_knob(cfg, "student_epochs", "LOBBOT_STUDENT_EPOCHS", 2.0)), lr=2e-4, r=32, alpha=64,
+        epochs=float(_knob(cfg, "student_epochs", "LOBBOT_STUDENT_EPOCHS", 2.0)),
+        lr=float(_knob(cfg, "student_lr", "LOBBOT_STUDENT_LR", 1e-4)), r=32, alpha=64,
         max_len=int(_knob(cfg, "heal_max_len", "LOBBOT_HEAL_MAX_LEN", 2048)),
         max_tokens=32768, max_minutes=float(_knob(cfg, "student_max_minutes", "LOBBOT_STUDENT_MAX_MINUTES", 60.0)),
         progress=progress)
@@ -84,6 +90,14 @@ def run_stage(job: Job) -> None:
         job.mark_done(STAGE, {"dense": cfg.dense_fallback})
         emit(STAGE, "done", 100, "healed" + (" + dense student" if cfg.dense_fallback else ""))
         return
+
+    # Outputs of an earlier heal, and GGUFs quantize made from them, must not
+    # outlive this run: quantize reuses a bf16 GGUF or imatrix if present.
+    import shutil
+    for name in ("healed", "dense"):
+        shutil.rmtree(job.path("work", name), ignore_errors=True)
+        for f in (f"{name}-bf16.gguf", f"{name}-imatrix.gguf"):
+            job.path("work", f).unlink(missing_ok=True)
 
     pct = {"moe": 0.0, "dense": 0.0 if cfg.dense_fallback else 100.0}
 
@@ -127,6 +141,7 @@ def run_stage(job: Job) -> None:
         dense_ok = child.wait() == 0 and job.path("work", "dense", "config.json").exists()
         reader.join(timeout=5)
         if not dense_ok:
+            shutil.rmtree(job.path("work", "dense"), ignore_errors=True)
             print("heal: dense student failed; continuing with the MoE only (see [dense] lines above)", flush=True)
     job.mark_done(STAGE, {"dense": dense_ok})
     emit(STAGE, "done", 100, "healed" + (" + dense student" if dense_ok else ""))

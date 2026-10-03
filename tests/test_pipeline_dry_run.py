@@ -80,3 +80,19 @@ def test_overrides_file_is_not_frozen(tmp_path):
     assert json.loads((job / "config.json").read_text()) == {"n_generate": 200}
     effective = json.loads((job / "work/config.effective.json").read_text())
     assert effective["n_generate"] == 200 and "judge_model" in effective
+
+
+def test_failed_dense_student_is_not_a_candidate(tmp_path):
+    job = tmp_path / "job"
+    job.mkdir()
+    shutil.copy(ROOT / "examples/support-tickets.taskspec.json", job / "taskspec.json")
+    p, _ = run(job)
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert "dense" in json.loads((job / "work/allocation.json").read_text())["candidates"]
+
+    # heal reports the dense student failed (e.g. NaN loss): quantize and eval go on with the MoE
+    (job / ".done/heal").write_text(json.dumps({"dense": False}))
+    p, events = run(job, "--from", "quantize")
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert list(json.loads((job / "work/allocation.json").read_text())["candidates"]) == ["lobbot-moe"]
+    assert {c["name"] for c in json.loads((job / "out/eval.json").read_text())["candidates"]} == {"lobbot-moe"}

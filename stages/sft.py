@@ -1,6 +1,6 @@
 """LoRA SFT on teacher answers (sequence-level distillation), with optional
 logit distillation from the full teacher. Used by the heal stage for both the
-REAP-pruned MoE and the dense Qwen3-4B student. The LoRA is merged before
+REAP-pruned MoE and the dense student. The LoRA is merged before
 saving so later stages see a plain HF model."""
 from __future__ import annotations
 
@@ -20,6 +20,10 @@ from stages.taskdata import tokenize_example
 
 ATTN = ["q_proj", "k_proj", "v_proj", "o_proj"]
 MLP = ["gate_proj", "up_proj", "down_proj"]
+
+
+class NonFiniteTraining(RuntimeError):
+    """Training produced NaN/inf losses or weights; nothing was saved."""
 
 
 def log(msg: str) -> None:
@@ -149,6 +153,8 @@ def train_sft(base: str, examples: list[dict], out_dir: Path, *,
 
     model.train()
     step, micro, t0, ema = 0, 0, time.time(), None
+    skipped = streak = 0
+    bad = False
     epoch = 0
     while step < total:
         batches = batches_per_epoch if epoch == 0 else _batches(data, max_tokens, max_bs, seed + epoch)
@@ -171,21 +177,36 @@ def train_sft(base: str, examples: list[dict], out_dir: Path, *,
                     t = F.log_softmax(t_logits / kd_temp, -1)
                     kl = F.kl_div(s, t, log_target=True, reduction="batchmean") * kd_temp ** 2
                     loss = (1 - kd_weight) * ce + kd_weight * kl
-            (loss / grad_accum).backward()
+            # One inf/NaN gradient is enough to turn every LoRA weight into NaN
+            # (clip_grad_norm_ scales by a NaN norm), so a bad batch skips the
+            # update instead of applying it.
+            finite = bool(torch.isfinite(loss))
+            if finite:
+                (loss / grad_accum).backward()
+            bad = bad or not finite
             micro += 1
             if micro % grad_accum:
                 continue
-            torch.nn.utils.clip_grad_norm_(params, 1.0)
-            opt.step()
+            gnorm = torch.nn.utils.clip_grad_norm_(params, 1.0)
+            if bad or not torch.isfinite(gnorm):
+                skipped += 1
+                streak += 1
+                log(f"sft: step {step + 1}: non-finite {'loss' if not finite else 'gradient'}, update skipped")
+                if streak >= 8 or skipped > max(8, total // 20):
+                    raise NonFiniteTraining(f"training diverged: {skipped} non-finite steps by step {step + 1}/{total}")
+            else:
+                opt.step()
+                streak = 0
+                ema = loss.item() if ema is None else 0.9 * ema + 0.1 * loss.item()
             sched.step()
             opt.zero_grad(set_to_none=True)
+            bad = False
             step += 1
-            ema = loss.item() if ema is None else 0.9 * ema + 0.1 * loss.item()
             if step % max(1, total // 100) == 0 or step == total:
                 el = time.time() - t0
                 eta = el / step * (total - step)
                 progress(5 + 85 * step / total,
-                         f"step {step}/{total} loss {ema:.3f} lr {sched.get_last_lr()[0]:.1e} eta {eta / 60:.0f}m")
+                         f"step {step}/{total} loss {float('nan') if ema is None else ema:.3f} lr {sched.get_last_lr()[0]:.1e} eta {eta / 60:.0f}m")
             if step >= total:
                 break
             if max_minutes and time.time() - t0 > 60 * max_minutes:
@@ -194,6 +215,14 @@ def train_sft(base: str, examples: list[dict], out_dir: Path, *,
                 break
         epoch += 1
 
+    if ema is None:
+        raise NonFiniteTraining("no finite training step")
+    # Never hand quantize NaN/inf weights. Only the trained tensors can have
+    # gone bad (some base tensors are legitimately inf, e.g. Gemma 4's audio
+    # clipping bounds).
+    bad_w = [n for n, p in model.named_parameters() if p.requires_grad and not torch.isfinite(p).all()]
+    if bad_w:
+        raise NonFiniteTraining(f"{len(bad_w)} trained tensors are not finite, e.g. {bad_w[0]}")
     progress(92, "merging LoRA and saving")
     del teacher, opt
     model = model.merge_and_unload()
@@ -208,5 +237,6 @@ def train_sft(base: str, examples: list[dict], out_dir: Path, *,
     mu.write_expert_count_alias(tmp)
     shutil.rmtree(out_dir, ignore_errors=True)
     tmp.rename(out_dir)
-    log(f"sft: saved merged model to {out_dir} (final loss {ema:.3f})")
+    log(f"sft: saved merged model to {out_dir} (final loss {ema:.3f}"
+        + (f", {skipped} non-finite steps skipped)" if skipped else ")"))
     return out_dir
