@@ -33,12 +33,26 @@ def test_dry_run_end_to_end(tmp_path):
     assert report["bit_widths"]
     assert (job / "out/model.gguf").exists()
     assert (job / "out/Modelfile").exists()
+    assert events[-1]["model"] == str((job / "out/model.gguf").resolve())
 
     # Second run is fully cached; --from reruns the tail.
     _, events = run(job)
     assert {e["status"] for e in events if e["stage"] != "pipeline"} == {"skipped"}
     _, events = run(job, "--from", "quantize")
     assert [e["stage"] for e in events if e["status"] == "skipped"] == ["data", "reap", "heal"]
+
+
+def test_only_does_not_claim_a_model(tmp_path):
+    job = tmp_path / "job"
+    job.mkdir()
+    shutil.copy(ROOT / "examples/support-tickets.taskspec.json", job / "taskspec.json")
+
+    p, events = run(job, "--only", "data")
+    assert p.returncode == 0, p.stdout + p.stderr
+    final = events[-1]
+    assert final["stage"] == "pipeline" and final["status"] == "done"
+    assert final["model"] is None
+    assert "model.gguf" not in final["msg"]
 
 
 def test_missing_taskspec_fails(tmp_path):

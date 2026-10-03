@@ -53,6 +53,7 @@ def test_gemini_judge(server, monkeypatch):
 
 
 def test_claude_judge_through_condense(server, monkeypatch):
+    pytest.importorskip("anthropic")
     url, seen = server
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
     monkeypatch.setenv("CONDENSE_API_KEY", "ak_test")
@@ -65,6 +66,7 @@ def test_claude_judge_through_condense(server, monkeypatch):
 
 
 def test_condense_off_is_plain_anthropic(monkeypatch):
+    pytest.importorskip("anthropic")
     monkeypatch.delenv("CONDENSE_API_KEY", raising=False)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
     assert condense.headers() == {}

@@ -55,7 +55,13 @@ def main() -> int:
         if rc != 0 or not job.is_done(stage):
             emit(stage, "error", msg=error_message(rc, tail))
             return 1
-    emit("pipeline", "done", 100, str(job.path("out", "model.gguf")))
+    # The final event names the model only when a packaged one exists, so a
+    # partial run (--only) does not point clients at a GGUF that is not there.
+    model = job.path("out", "model.gguf")
+    if job.is_done("package") and model.exists():
+        emit("pipeline", "done", 100, str(model), model=str(model))
+    else:
+        emit("pipeline", "done", 100, f"ran {', '.join(todo)}; no packaged model yet", model=None)
     return 0
 
 
