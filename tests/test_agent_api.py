@@ -108,4 +108,7 @@ def test_job_run_by_hand_reports_disk_state(client, tmp_path):
     run()
     s = client.get("/jobs/byhand", headers=H).json()
     assert s["state"] == "done", s
+    with client.stream("GET", "/jobs/byhand/events", headers=H) as r:  # ends instead of idling forever
+        events = [json.loads(l[6:]) for l in r.iter_lines() if l.startswith("data: ")]
+    assert events[-1]["stage"] == "pipeline" and events[-1]["status"] == "done"
     assert all(v["status"] == "done" for v in s["stages"].values())

@@ -269,6 +269,10 @@ async def job_events(job_id: str) -> StreamingResponse:
                 if state["state"] in ("error", "queued"):
                     yield f"data: {json.dumps({'stage': 'pipeline', 'status': 'error', 'msg': state['error'] or 'not running', 'ts': time.time()})}\n\n"
                     return
+                if state["state"] in ("done", "partial"):  # a run started by hand, read from the job dir
+                    msg = "done" if state["state"] == "done" else "partial run, no packaged model"
+                    yield f"data: {json.dumps({'stage': 'pipeline', 'status': 'done', 'msg': msg, 'ts': time.time()})}\n\n"
+                    return
 
     return StreamingResponse(stream(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})

@@ -32,14 +32,19 @@ def cli(tmp_path):
     (home / ".lobbot-env").write_text("export LOBBOT_DRY_RUN=1\n")  # the API inherits this, so jobs dry-run
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    (bin_dir / "ollama").write_text('#!/bin/sh\necho "ollama $*" >> "$HOME/ollama.calls"\n')
+    (bin_dir / "ollama").write_text(
+        '#!/bin/sh\n'
+        'if [ "$1" = list ]; then echo "NAME ID SIZE MODIFIED"; '
+        'grep "^ollama create" "$HOME/ollama.calls" 2>/dev/null | awk \'{print $3 ":latest x 6GB now"}\'; exit 0; fi\n'
+        'echo "ollama $*" >> "$HOME/ollama.calls"\n')
     (bin_dir / "ollama").chmod(0o755)
     conf = tmp_path / "config.json"
     conf.write_text(json.dumps({"host": "local", "repo": str(ROOT), "jobs": str(tmp_path / "jobs"),
                                 "remote_port": port, "models_dir": str(tmp_path / "models")}))
     env = {**os.environ, "HOME": str(home), "LOBBOT_CONFIG": str(conf),
            "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}", "PYTHONPATH": str(ROOT)}
-    env.pop("LOBBOT_HOST", None)
+    for k in ("LOBBOT_HOST", "GEMINI_API_KEY", "GOOGLE_API_KEY", "ANTHROPIC_API_KEY"):
+        env.pop(k, None)
 
     def run(*args, ok=True):
         p = subprocess.run([sys.executable, "-m", "lobbot.app", *args], cwd=tmp_path, env=env,
@@ -64,13 +69,16 @@ def test_full_flow(cli):
     conf = json.loads((cli.tmp / "jobs/demo/config.json").read_text())
     assert conf["n_generate"] == 400 and conf["dense_fallback"] is False and conf["heal_lr"] == 0.0002
     assert conf["heal_max_minutes"] == 20
-    assert "lobbot save demo" in p.stdout and "wipes /mnt/nvme" in p.stderr
+    assert "lobbot save demo --chat" in p.stdout and "wipes /mnt/nvme" in p.stdout
+    assert "LobBot results" in p.stdout and "Winner   lobbot-moe" in p.stdout
 
     assert "demo" in cli("status").stdout
     st = cli("status", "demo").stdout
     assert "done" in st and "package" in st
     assert "lobbot-moe" in cli("eval", "demo").stdout
-    assert json.loads(cli("eval", "demo", "--json").stdout)["winner"]
+    assert "Held-out" in cli("results", "demo").stdout or "Winner" in cli("results", "demo").stdout
+    assert "LobBot results" in st
+    assert json.loads(cli("results", "demo", "--json").stdout)["eval"]["winner"]
     assert '"stage": "package"' in cli("logs", "demo").stdout
     assert "healed" in cli("logs", "demo", "-s", "heal").stdout
 
@@ -100,6 +108,9 @@ def test_full_flow(cli):
     assert (saved / "model.gguf").read_bytes() == model
     assert {"taskspec.json", "config.json", "eval.json", "Modelfile"} <= {f.name for f in saved.iterdir()}
     cli("install", "demo", "--no-ollama")  # alias, and a second save reuses the backup and download
+    p = cli("results", "demo")
+    assert "Saved" in p.stdout and "lobbot chat lobbot-support-email-to-ticket" in p.stdout
+    assert "lobbot save demo" not in p.stdout
 
     p = cli("resume", "demo", "--from", "eval")
     assert "pipeline finished" in p.stdout
@@ -197,3 +208,35 @@ def test_job_run_directly_with_pipeline(cli):
     p = cli("save", "direct", "--no-ollama")
     assert "verified" in p.stdout
     assert (cli.tmp / "models/support-email-to-ticket-direct/model.gguf").exists()
+
+
+def test_new_drafts_on_vm_with_its_key(cli, tmp_path):
+    """No key on the laptop: `new` runs the drafting on the VM, where ~/.lobbot-env has the key."""
+    fake = tmp_path / "fakegemini"
+    fake.mkdir()
+    spec = json.loads((ROOT / "examples/support-tickets.taskspec.json").read_text())
+    (fake / "spec.json").write_text(json.dumps(spec))
+    # Stands in for Gemini on the "VM": answers only when the VM's key is sent.
+    (fake / "sitecustomize.py").write_text('''
+import io, json, os, urllib.request
+_real = urllib.request.urlopen
+def _fake(req, *a, **k):
+    url = getattr(req, "full_url", req)
+    if "generativelanguage" in str(url):
+        assert req.get_header("X-goog-api-key") == "vm-key", "wrong key"
+        text = open(os.path.join(os.path.dirname(__file__), "spec.json")).read()
+        body = json.dumps({"candidates": [{"content": {"parts": [{"text": text}]}}]}).encode()
+        class R(io.BytesIO):
+            def __enter__(self): return self
+            def __exit__(self, *e): return False
+        return R(body)
+    return _real(req, *a, **k)
+urllib.request.urlopen = _fake
+''')
+    with (cli.home / ".lobbot-env").open("a") as f:
+        f.write(f"export GEMINI_API_KEY=vm-key\nexport PYTHONPATH={fake}:{ROOT}\n")
+    p = cli("new", "turn support emails into JSON tickets", "-o", "drafted.json")
+    assert "drafting on the VM" in p.stdout
+    drafted = json.loads((cli.tmp / "drafted.json").read_text())
+    assert drafted["task_name"] == "support-email-to-ticket" and len(drafted["seed_examples"]) == 15
+    assert "vm-key" not in p.stdout + p.stderr
