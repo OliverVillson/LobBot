@@ -25,14 +25,11 @@ struct ContentView: View {
                     }
 
                     layout {
-                        MascotStage(cornerRadius: full ? 0 : pip ? 22 : 28)
+                        MascotStage(cornerRadius: full ? 0 : 22, aurora: full ? session.voice : nil)
                             .frame(width: pip ? tile : nil,
                                    height: full ? nil : tile * 1.15)
                             .frame(maxHeight: full ? .infinity : nil)
                             .ignoresSafeArea(edges: full ? .all : [])
-                            .overlay(alignment: .topLeading) {
-                                if pip, session.inCall { LiveBadge() }
-                            }
                         if !full, let line = session.line {
                             SpeechBubble(text: line, tail: pip ? .leading : .top)
                                 .lineLimit(pip ? 7 : nil)
@@ -129,26 +126,6 @@ struct ContentView: View {
         case .surgery: SurgeryPanel()
         case .done: ResultPanel()
         }
-    }
-}
-
-/// "Live" tag on the picture-in-picture tile while a call is on.
-private struct LiveBadge: View {
-    @Environment(Session.self) private var session
-
-    var body: some View {
-        let voice = session.voice
-        HStack(spacing: 5) {
-            Circle().fill(voice.micMuted ? Brand.rose : Color.green).frame(width: 7, height: 7)
-            Text(voice.micMuted ? "Muted" : voice.isSpeaking ? "Talking" : "Live")
-                .font(.caption2.weight(.bold))
-                .foregroundStyle(.white)
-        }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 4)
-        .background(Color.black.opacity(0.25), in: Capsule())
-        .padding(8)
-        .accessibilityElement(children: .combine)
     }
 }
 

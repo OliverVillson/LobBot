@@ -161,8 +161,7 @@ final class Session {
     let voice = VoiceAgent()
 
     var phase: Phase = .home { didSet { reframe() } }
-    /// A voice call with Lobbot is on (mic open). Full screen from the home page, picture-in-picture
-    /// during a consultation.
+    /// A voice call with Lobbot is on (mic open). A call always takes the whole screen.
     var inCall = false { didSet { reframe() } }
     var history: [SurgeryRecord] = []
     /// What Lobbot is saying; nil hides the speech bubble.
@@ -181,9 +180,7 @@ final class Session {
         reframe()   // the home tile wants the close-up from the start
     }
 
-    /// A consultation is on: Lobbot shrinks to a picture-in-picture tile and the panel takes the screen.
-    var diagnosing: Bool { phase != .home }
-    var fullScreenCall: Bool { inCall && !diagnosing }
+    var fullScreenCall: Bool { inCall }
 
     /// Close-up in his tile and in a full-screen call; wide in the operating room, where his props need room.
     private func reframe() {

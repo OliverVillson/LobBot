@@ -74,12 +74,17 @@ nonisolated final class VoiceAudio: @unchecked Sendable {
     private var tapped = false
     private var active = false
     private var observers: [NSObjectProtocol] = []
+    private var rebuilds = 0
+    private var lastRebuild = 0.0
+    private var lastLevel = 0.0
     private let lock = NSLock()
     private var pending = 0
 
-    /// Set before `start()`.
+    /// Set before `start()`. `onChunk` and `onLevel` are called on the audio thread.
     var onChunk: (@Sendable (Data) -> Void)?
     var onPlaybackIdle: (@Sendable () -> Void)?
+    /// Mic loudness, 0…1, about 15 times a second (drives the call's aurora).
+    var onLevel: (@Sendable (Float) -> Void)?
 
     var isIdle: Bool {
         lock.lock(); defer { lock.unlock() }
@@ -100,6 +105,7 @@ nonisolated final class VoiceAudio: @unchecked Sendable {
         if listening { try? session.overrideOutputAudioPort(.speaker) }
         self.listening = listening
         active = true
+        rebuilds = 0
         if observers.isEmpty { observeSystemChanges() }
         try buildEngine()
     }
@@ -112,16 +118,20 @@ nonisolated final class VoiceAudio: @unchecked Sendable {
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }
 
-    /// Plays 16-bit little-endian mono PCM at 24 kHz, as sent by Gemini.
-    func play(pcm16 data: Data) {
-        if active, !engine.isRunning { rebuild() }   // iOS stopped the engine behind our back: bring it back
+    /// Plays 16-bit little-endian mono PCM at 24 kHz, as sent by Gemini. Returns its loudness, 0…1.
+    @discardableResult
+    func play(pcm16 data: Data) -> Float {
         let frames = data.count / 2
-        guard frames > 0, let buffer = AVAudioPCMBuffer(pcmFormat: playFormat, frameCapacity: AVAudioFrameCount(frames)),
-              let out = buffer.floatChannelData?[0] else { return }
+        guard engine.isRunning, frames > 0,
+              let buffer = AVAudioPCMBuffer(pcmFormat: playFormat, frameCapacity: AVAudioFrameCount(frames)),
+              let out = buffer.floatChannelData?[0] else { return 0 }
         buffer.frameLength = AVAudioFrameCount(frames)
+        var energy: Float = 0
         data.withUnsafeBytes { raw in
             for i in 0..<frames {
-                out[i] = Float(Int16(littleEndian: raw.loadUnaligned(fromByteOffset: i * 2, as: Int16.self))) / 32768
+                let v = Float(Int16(littleEndian: raw.loadUnaligned(fromByteOffset: i * 2, as: Int16.self))) / 32768
+                out[i] = v
+                energy += v * v
             }
         }
         lock.lock(); pending += 1; lock.unlock()
@@ -130,6 +140,11 @@ nonisolated final class VoiceAudio: @unchecked Sendable {
             self.lock.lock(); self.pending -= 1; let idle = self.pending <= 0; self.lock.unlock()
             if idle { self.onPlaybackIdle?() }
         }
+        return Self.loudness(energy, frames)
+    }
+
+    private static func loudness(_ energy: Float, _ frames: Int) -> Float {
+        min(1, (energy / Float(max(frames, 1))).squareRoot() * 6)
     }
 
     /// The user talked over Lobbot: drop what is queued.
@@ -166,7 +181,14 @@ nonisolated final class VoiceAudio: @unchecked Sendable {
         if engine.isRunning { engine.stop() }
     }
 
+    /// Bounded: at most once a second and five times per call. Enabling echo cancellation itself posts a
+    /// configuration change, so an unbounded rebuild loops forever and freezes the app.
     private func rebuild() {
+        guard active, !engine.isRunning, rebuilds < 5 else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now - lastRebuild > 1 else { return }
+        lastRebuild = now
+        rebuilds += 1
         teardownEngine()
         try? buildEngine()
     }
@@ -178,7 +200,8 @@ nonisolated final class VoiceAudio: @unchecked Sendable {
         observers = [
             center.addObserver(forName: .AVAudioEngineConfigurationChange, object: nil, queue: .main) { [weak self] note in
                 guard let self, self.active, let changed = note.object as? AVAudioEngine, changed === self.engine else { return }
-                self.rebuild()
+                // Let the change settle; rebuild only if it really left the engine stopped.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in self?.rebuild() }
             },
             center.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: .main) { [weak self] note in
                 guard let self, self.active,
@@ -203,7 +226,34 @@ nonisolated final class VoiceAudio: @unchecked Sendable {
             return buffer
         }
         guard error == nil, out.frameLength > 0, let samples = out.int16ChannelData else { return }
-        onChunk?(Data(bytes: samples[0], count: Int(out.frameLength) * 2))
+        let frames = Int(out.frameLength)
+        onChunk?(Data(bytes: samples[0], count: frames * 2))
+        let now = ProcessInfo.processInfo.systemUptime
+        if now - lastLevel > 0.066 {
+            lastLevel = now
+            var energy: Float = 0
+            for i in 0..<frames { let v = Float(samples[0][i]) / 32768; energy += v * v }
+            onLevel?(Self.loudness(energy, frames))
+        }
+    }
+}
+
+/// Sends mic chunks to Gemini straight from the audio thread, so a call never queues ~20 tasks a second
+/// on the main thread. `VoiceAgent` keeps it in sync with the socket and the mute state.
+nonisolated final class MicUplink: @unchecked Sendable {
+    private let lock = NSLock()
+    private var socket: URLSessionWebSocketTask?
+    private var open = false
+
+    func set(socket: URLSessionWebSocketTask?, open: Bool) {
+        lock.lock(); self.socket = socket; self.open = open; lock.unlock()
+    }
+
+    func send(_ pcm: Data) {
+        lock.lock(); let target = open ? socket : nil; lock.unlock()
+        guard let target else { return }
+        let text = #"{"realtimeInput":{"audio":{"mimeType":"audio/pcm;rate=16000","data":""# + pcm.base64EncodedString() + #""}}}"#
+        target.send(.string(text)) { _ in }
     }
 }
 
@@ -212,17 +262,21 @@ nonisolated final class VoiceAudio: @unchecked Sendable {
 final class VoiceAgent {
     enum Status: Equatable { case off, connecting, live, failed(String) }
 
-    var status: Status = .off
+    var status: Status = .off { didSet { syncUplink() } }
     var isSpeaking = false
     /// The mic is open (call mode). Typed chat runs with the mic closed.
-    var isListening = false
-    var micMuted = false
+    var isListening = false { didSet { syncUplink() } }
+    var micMuted = false { didSet { syncUplink() } }
+    /// Loudness of your voice and of his, 0…1, for the call's aurora.
+    var micLevel: Float = 0
+    var voiceLevel: Float = 0
     /// What the user said or typed last, shown as a caption in the call.
     var heard = ""
 
     @ObservationIgnored weak var session: Session?
-    @ObservationIgnored private var socket: URLSessionWebSocketTask?
+    @ObservationIgnored private var socket: URLSessionWebSocketTask? { didSet { syncUplink() } }
     @ObservationIgnored private let audio = VoiceAudio()
+    @ObservationIgnored private let uplink = MicUplink()
     @ObservationIgnored private var transcript = ""
     @ObservationIgnored private var newUserTurn = true
     @ObservationIgnored private var pending: [String] = []
@@ -260,6 +314,8 @@ final class VoiceAgent {
         isSpeaking = false
         isListening = false
         micMuted = false
+        micLevel = 0
+        voiceLevel = 0
         heard = ""
         transcript = ""
         pending = []
@@ -294,8 +350,9 @@ final class VoiceAgent {
             guard let json = Self.json(first), json["setupComplete"] != nil else {
                 return fail("Gemini refused the session. Check the model id \(VoiceConfig.model).")
             }
-            audio.onChunk = { [weak self] data in
-                Task { @MainActor in self?.sendAudio(data) }
+            audio.onChunk = { [uplink] data in uplink.send(data) }
+            audio.onLevel = { [weak self] level in
+                Task { @MainActor in self?.micLevel = level }
             }
             audio.onPlaybackIdle = { [weak self] in
                 Task { @MainActor in self?.playbackDrained() }
@@ -333,7 +390,7 @@ final class VoiceAgent {
                 for part in parts {
                     guard let inline = part["inlineData"] as? [String: Any], let b64 = inline["data"] as? String,
                           let pcm = Data(base64Encoded: b64) else { continue }
-                    audio.play(pcm16: pcm)
+                    voiceLevel = audio.play(pcm16: pcm)
                     setSpeaking(true)
                 }
             }
@@ -360,10 +417,8 @@ final class VoiceAgent {
         send(["clientContent": ["turns": [["role": "user", "parts": [["text": text]]]], "turnComplete": true]])
     }
 
-    private func sendAudio(_ data: Data) {
-        guard status == .live, isListening, !micMuted, let socket else { return }
-        let text = #"{"realtimeInput":{"audio":{"mimeType":"audio/pcm;rate=16000","data":""# + data.base64EncodedString() + #""}}}"#
-        socket.send(.string(text)) { _ in }
+    private func syncUplink() {
+        uplink.set(socket: socket, open: status == .live && isListening && !micMuted)
     }
 
     private func send(_ object: [String: Any]) {
@@ -380,6 +435,7 @@ final class VoiceAgent {
     }
 
     private func setSpeaking(_ on: Bool) {
+        if !on { voiceLevel = 0 }
         guard isSpeaking != on else { return }
         isSpeaking = on
         session?.voiceChanged()

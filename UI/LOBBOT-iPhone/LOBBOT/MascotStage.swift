@@ -3,12 +3,15 @@ import SwiftUI
 /// Dr. Lobbot's bordeaux stage: the persistent WebGL mascot plus load and failure states.
 struct MascotStage: View {
     var cornerRadius: CGFloat = 28
+    /// During a call: northern lights behind him that follow your voice and his.
+    var aurora: VoiceAgent? = nil
     @EnvironmentObject private var lobbot: LobbotController
 
     var body: some View {
         ZStack {
             RadialGradient(colors: [Brand.stageLight, Brand.stage, Brand.stageDeep],
                            center: UnitPoint(x: 0.5, y: 0.45), startRadius: 0, endRadius: 360)
+            if let aurora { Aurora(voice: aurora) }
             LobbotView(controller: lobbot)
                 .accessibilityElement(children: .ignore)
                 .accessibilityLabel("Dr. Lobbot, \(lobbot.scene.title.lowercased())")
@@ -35,6 +38,46 @@ struct MascotStage: View {
             }
         }
         .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+    }
+}
+
+/// Northern lights behind Dr. Lobbot during a call. Three soft bands drift all the time; the rose ones swell
+/// with your voice and the white one with his, so you can see at a glance that the mic hears you.
+/// Gradients only, no blur, at 30 fps: the WebGL mascot keeps the GPU.
+struct Aurora: View {
+    let voice: VoiceAgent
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        let mic = CGFloat(voice.micLevel)
+        let him = CGFloat(voice.voiceLevel)
+        GeometryReader { geo in
+            TimelineView(.animation(minimumInterval: 1.0 / 30, paused: reduceMotion)) { timeline in
+                let t = timeline.date.timeIntervalSinceReferenceDate
+                ZStack {
+                    band(Brand.rose, in: geo.size, t: t, phase: 0, y: 0.30, lift: mic)
+                    band(Color(hex: 0xFF8FA6), in: geo.size, t: t, phase: 2.1, y: 0.42, lift: mic * 0.8)
+                    band(.white, in: geo.size, t: t, phase: 4.2, y: 0.24, lift: him * 0.9, strength: 0.32)
+                }
+                .animation(.easeOut(duration: 0.18), value: mic)
+                .animation(.easeOut(duration: 0.18), value: him)
+            }
+        }
+        .blendMode(.screen)
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
+
+    private func band(_ color: Color, in size: CGSize, t: Double, phase: Double, y: CGFloat,
+                      lift: CGFloat, strength: Double = 0.5) -> some View {
+        Ellipse()
+            .fill(EllipticalGradient(colors: [color.opacity(strength + Double(lift) * 0.4), color.opacity(0)],
+                                     center: .center, startRadiusFraction: 0, endRadiusFraction: 0.5))
+            .frame(width: size.width * 1.5, height: size.height * (0.22 + lift * 0.28))
+            .rotationEffect(.degrees(sin(t * 0.11 + phase) * 9 - 6))
+            .offset(x: CGFloat(sin(t * 0.17 + phase)) * size.width * 0.12,
+                    y: size.height * (y - 0.5) - lift * size.height * 0.08 + CGFloat(sin(t * 0.23 + phase)) * 14)
+            .scaleEffect(x: 1, y: 1 + lift * 0.5)
     }
 }
 

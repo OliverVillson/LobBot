@@ -45,53 +45,29 @@ struct Composer: View {
             .background(Brand.surface, in: Capsule())
             .overlay(Capsule().stroke(Brand.line))
 
-            if session.inCall {   // a call during a consultation: Lobbot is in his tile, the controls live here
-                Button {
-                    voice.micMuted.toggle()
-                    session.voiceChanged()
-                } label: {
-                    Image(systemName: voice.micMuted ? "mic.slash.fill" : "mic.fill")
+            if voice.isOn {   // a typed chat is running: let him hang up
+                Button { voice.stop() } label: {
+                    Image(systemName: "xmark")
                         .font(.headline)
                         .frame(width: 48, height: 48)
-                        .foregroundStyle(voice.micMuted ? Color.white : Brand.accent)
-                        .background(voice.micMuted ? Brand.accent : Brand.tile, in: Circle())
+                        .foregroundStyle(Brand.ink)
+                        .background(Brand.tile, in: Circle())
                 }
                 .buttonStyle(.plain)
-                .accessibilityLabel(voice.micMuted ? "Unmute" : "Mute")
-                Button { session.endCall() } label: {
-                    Image(systemName: "phone.down.fill")
-                        .font(.title3.weight(.semibold))
-                        .frame(width: 52, height: 52)
-                        .foregroundStyle(.white)
-                        .background(Brand.restored, in: Circle())
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("End call")
-            } else {
-                if voice.isOn {   // a typed chat is running: let him hang up
-                    Button { voice.stop() } label: {
-                        Image(systemName: "xmark")
-                            .font(.headline)
-                            .frame(width: 48, height: 48)
-                            .foregroundStyle(Brand.ink)
-                            .background(Brand.tile, in: Circle())
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("End conversation")
-                }
-                Button {
-                    focused = false
-                    session.startCall()
-                } label: {
-                    Image(systemName: "mic.fill")
-                        .font(.title3.weight(.semibold))
-                        .frame(width: 52, height: 52)
-                        .foregroundStyle(.white)
-                        .background(Brand.accent, in: Circle())
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Call Dr. Lobbot")
+                .accessibilityLabel("End conversation")
             }
+            Button {
+                focused = false
+                session.startCall()
+            } label: {
+                Image(systemName: "mic.fill")
+                    .font(.title3.weight(.semibold))
+                    .frame(width: 52, height: 52)
+                    .foregroundStyle(.white)
+                    .background(Brand.accent, in: Circle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Call Dr. Lobbot")
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 8)

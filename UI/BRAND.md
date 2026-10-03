@@ -68,8 +68,10 @@ One palette, **Anatomie: bordeaux and rose**, light only. No dark mode, no other
   composer docked at the bottom (text field + mic).
 - **Two layouts of the same stage** (never recreate it, the WebGL would reload): his picture-in-picture tile
   (150 pt, top left, 22 pt radius) with his bubble beside him (tail pointing at him) and the panel taking the
-  screen, on the home page and every consultation step; full screen for a call started from the home page.
-  A call during a consultation stays in the tile with a "Live" tag, and Mute and End move into the bottom bar.
+  screen, on the home page and every consultation step; full screen for every call, wherever it starts.
+- **The call's aurora:** behind him during a call, three soft gradient bands drift all the time; the rose ones
+  swell with the user's voice, the white one with his. It proves the mic hears you. Gradients only, no blur,
+  30 fps, paused under Reduce Motion.
 - **Home = the ward board** ("Ward 64"): the one-line promise, bed 1 = the real run (Discharged), this session's
   replays as the next beds, the empty bed "Admit a patient" as the call to action (it breathes), then the legend
   of how a patient moves through the ward. On arrival Lobbot does his rounds: each bed plate lights up in turn.
