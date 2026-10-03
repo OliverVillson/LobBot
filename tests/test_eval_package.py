@@ -56,3 +56,16 @@ def test_eval_generates_at_least_as_long_as_teacher_answers():
     from stages import data, eval as ev
     assert ev.MAX_TOKENS >= data.ANSWER_MAX_TOKENS
     assert ev.CTX_PER_SLOT >= ev.MAX_TOKENS + data.MAX_INPUT_CHARS // 3
+
+
+def test_eval_cap_follows_raised_data_cap():
+    import os, subprocess, sys
+    code = "from stages import data, eval as ev; print(data.ANSWER_MAX_TOKENS, ev.MAX_TOKENS, ev.CTX_PER_SLOT)"
+    env = {k: v for k, v in os.environ.items() if not k.startswith("LOBBOT_EVAL_")}
+    out = subprocess.run([sys.executable, "-c", code], env={**env, "LOBBOT_DATA_ANSWER_MAX_TOKENS": "4096"},
+                         capture_output=True, text=True, check=True).stdout.split()
+    data_cap, eval_cap, ctx = map(int, out)
+    assert data_cap == 4096 and eval_cap >= data_cap and ctx >= eval_cap + 2000
+    out = subprocess.run([sys.executable, "-c", code], env={**env, "LOBBOT_EVAL_MAX_TOKENS": "1000"},
+                         capture_output=True, text=True, check=True).stdout.split()
+    assert int(out[1]) == 1000  # explicit override wins
