@@ -32,8 +32,12 @@ from stages._util import DRY_RUN, Job, read_jsonl
 STAGE = "eval"
 PORT = int(os.environ.get("LOBBOT_EVAL_PORT", "8091"))
 SLOTS = 8
-CTX_PER_SLOT = 4096
-MAX_TOKENS = 1024
+# Must cover the longest teacher answer the data stage keeps
+# (data.ANSWER_MAX_TOKENS), or long correct answers are judged as truncated.
+MAX_TOKENS = int(os.environ.get("LOBBOT_EVAL_MAX_TOKENS", 2048))
+# Room per slot for the system prompt, an input of up to data.MAX_INPUT_CHARS
+# (~2k tokens) and the answer.
+CTX_PER_SLOT = int(os.environ.get("LOBBOT_EVAL_CTX", MAX_TOKENS + 4096))
 
 
 def serve(job: Job, gguf: str, name: str) -> subprocess.Popen:
