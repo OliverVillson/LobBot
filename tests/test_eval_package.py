@@ -34,7 +34,8 @@ def test_modelfile_chatml():
 
 def test_modelfile_gemma4():
     mf = modelfile("Be terse.", "{{ bos_token }}{{ '<|turn>' + role + '\\n' }}...{{ '<turn|>\\n' }}")
-    assert "<|turn>system\n{{ .System }}<turn|>" in mf and "<|turn>model\n" in mf
+    assert "<|turn>system\n{{ .System }}<turn|>" in mf
+    assert mf.split('TEMPLATE """')[1].split('"""')[0].endswith("<|turn>model\n<|channel>thought\n<channel|>")
     assert 'PARAMETER stop "<turn|>"' in mf and "<|im_end|>" not in mf
 
 

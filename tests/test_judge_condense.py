@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from stages import condense
+from stages import condense, gemini
 from stages import eval as ev
 
 SPEC = SimpleNamespace(description="d", output_format="json", eval_criteria="c")
@@ -20,6 +20,11 @@ def server():
         def do_POST(self):
             body = json.loads(self.rfile.read(int(self.headers["content-length"])))
             seen.append({"path": self.path, "headers": {k.lower(): v for k, v in self.headers.items()}, "body": body})
+            if self.path.startswith("/broken"):
+                self.send_response(404)
+                self.send_header("content-length", "0")
+                self.end_headers()
+                return
             if self.path.endswith("/chat/completions"):
                 out = {"choices": [{"message": {"role": "assistant", "content": "8"}}]}
             else:
@@ -42,9 +47,16 @@ def server():
     srv.shutdown()
 
 
+@pytest.fixture(autouse=True)
+def fresh_gemini(monkeypatch):
+    monkeypatch.setattr(gemini, "_condense_off", False)
+    monkeypatch.delenv("CONDENSE_API_KEY", raising=False)
+    monkeypatch.delenv("CONDENSE_GEMINI_URL", raising=False)
+
+
 def test_gemini_judge(server, monkeypatch):
     url, seen = server
-    monkeypatch.setattr(ev, "GEMINI_URL", url + "/v1beta/openai/chat/completions")
+    monkeypatch.setattr(gemini, "DIRECT_URL", url + "/v1beta/openai/chat/completions")
     monkeypatch.setenv("GEMINI_API_KEY", "g-key")
     assert ev.judge_key("gemini-3.8-flash") == "g-key"
     assert ev.judge(SPEC, "gemini-3.8-flash", ["a", "b"], ["x", "y"]) == 0.8
@@ -92,3 +104,29 @@ def test_gemini_4xx_stops_judging(monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "g-key")
     assert ev.judge(SPEC, "gemini-nope", ["a"] * 50, ["x"] * 50) is None
     assert len(calls) < 50
+
+
+def test_gemini_through_condense(server, monkeypatch):
+    url, seen = server
+    monkeypatch.setattr(gemini, "DIRECT_URL", url + "/direct/chat/completions")
+    monkeypatch.setenv("GEMINI_API_KEY", "g-key")
+    monkeypatch.setenv("CONDENSE_API_KEY", "ak_test")
+    monkeypatch.setenv("CONDENSE_GEMINI_URL", url + "/google/v1beta/openai/chat/completions")
+    assert gemini.chat("gemini-3.8-flash", [{"role": "user", "content": "hi"}]) == "8"
+    assert gemini.last_route == "condense"
+    assert seen[0]["path"].startswith("/google/") and seen[0]["headers"]["x-condense-auth-token"] == "ak_test"
+    assert seen[0]["headers"]["authorization"] == "Bearer g-key"
+
+
+def test_condense_failure_falls_back_to_direct_once(server, monkeypatch):
+    url, seen = server
+    monkeypatch.setattr(gemini, "DIRECT_URL", url + "/direct/chat/completions")
+    monkeypatch.setenv("GEMINI_API_KEY", "g-key")
+    monkeypatch.setenv("CONDENSE_API_KEY", "ak_test")
+    monkeypatch.setenv("CONDENSE_GEMINI_URL", url + "/broken/chat/completions")
+    for _ in range(3):
+        assert gemini.chat("gemini-3.8-flash", [{"role": "user", "content": "hi"}]) == "8"
+    assert gemini.last_route == "direct"
+    # condense tried once, then switched off; every call answered directly
+    assert [r["path"] for r in seen] == ["/broken/chat/completions"] + ["/direct/chat/completions"] * 3
+    assert "x-condense-auth-token" not in seen[1]["headers"]
