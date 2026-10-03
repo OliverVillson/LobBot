@@ -75,3 +75,18 @@ def test_no_key_means_no_judge(monkeypatch):
     for k in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
         monkeypatch.delenv(k, raising=False)
     assert ev.judge_key("gemini-3.8-flash") is None
+
+
+def test_gemini_4xx_stops_judging(monkeypatch):
+    import httpx
+
+    calls = []
+
+    def fake_post(url, **kw):
+        calls.append(1)
+        return httpx.Response(400, request=httpx.Request("POST", url), json={"error": "bad model"})
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    monkeypatch.setenv("GEMINI_API_KEY", "g-key")
+    assert ev.judge(SPEC, "gemini-nope", ["a"] * 50, ["x"] * 50) is None
+    assert len(calls) < 50

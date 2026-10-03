@@ -20,6 +20,7 @@ import os
 import re
 import statistics
 import subprocess
+import threading
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
@@ -174,15 +175,24 @@ def judge(spec, model: str, inputs: list[str], answers: list[str]) -> float | No
         ask = lambda prompt: client.messages.create(
             model=model, max_tokens=20, messages=[{"role": "user", "content": prompt}]).content[0].text
 
+    broken = threading.Event()  # a 4xx (bad key or model id) will not fix itself: stop calling
+
     def one(pair) -> float | None:
         text, answer = pair
+        if broken.is_set():
+            return None
         try:
             reply = ask(
                 f"Task: {spec.description}\nOutput format: {spec.output_format}\nCriteria: {spec.eval_criteria}\n\n"
                 f"<input>\n{text}\n</input>\n<answer>\n{answer}\n</answer>\n\n"
                 "Score how well the answer meets the criteria from 0 to 10. Reply with the number only.")
         except Exception as e:
-            print(f"[eval] judge call failed: {e}", flush=True)
+            status = getattr(getattr(e, "response", None), "status_code", None) or getattr(e, "status_code", None)
+            if isinstance(status, int) and 400 <= status < 500 and status != 429 and not broken.is_set():
+                broken.set()
+                print(f"[eval] judge disabled after HTTP {status}: {e}", flush=True)
+            elif not broken.is_set():
+                print(f"[eval] judge call failed: {e}", flush=True)
             return None
         m = re.search(r"\d+(\.\d+)?", reply)
         return min(10.0, float(m.group(0))) / 10 if m else None
