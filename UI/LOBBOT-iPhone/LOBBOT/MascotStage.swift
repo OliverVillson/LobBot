@@ -38,9 +38,11 @@ struct MascotStage: View {
     }
 }
 
-/// What Lobbot says, typed out letter by letter under the stage.
+/// What Lobbot says, typed out letter by letter. The tail points up (bubble under him)
+/// or down (bubble above his head, in a call).
 struct SpeechBubble: View {
     let text: String
+    var tailOnTop = true
     @State private var shown = 0
     @State private var typed = ""
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -56,8 +58,12 @@ struct SpeechBubble: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
         .background(Brand.surface, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-        .overlay(alignment: .topLeading) {
-            BubbleTail().fill(Brand.surface).frame(width: 20, height: 11).offset(x: 36, y: -10)
+        .overlay(alignment: tailOnTop ? .topLeading : .bottom) {
+            BubbleTail()
+                .fill(Brand.surface)
+                .frame(width: 20, height: 11)
+                .rotationEffect(.degrees(tailOnTop ? 0 : 180))
+                .offset(x: tailOnTop ? 36 : 0, y: tailOnTop ? -10 : 10)
         }
         .shadow(color: Brand.ink.opacity(0.14), radius: 12, y: 4)
         .accessibilityElement(children: .ignore)

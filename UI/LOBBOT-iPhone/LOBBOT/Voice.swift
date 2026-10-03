@@ -69,6 +69,9 @@ nonisolated final class VoiceAudio: @unchecked Sendable {
     private let sendFormat = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16_000, channels: 1, interleaved: true)!
     private var converter: AVAudioConverter?
     private var listening = false
+    private var tapped = false
+    private var active = false
+    private var observers: [NSObjectProtocol] = []
     private let lock = NSLock()
     private var pending = 0
 
@@ -82,11 +85,9 @@ nonisolated final class VoiceAudio: @unchecked Sendable {
     }
 
     /// `listening: false` is playback only (typed chat): no mic, no permission needed.
+    /// The session is configured and activated first, then the engine is built on top of it.
     func start(listening: Bool) throws {
-        stop()
-        engine = AVAudioEngine()          // fresh engine: voice processing can't be toggled on a running one
-        player = AVAudioPlayerNode()
-        self.listening = listening
+        teardownEngine()
         let session = AVAudioSession.sharedInstance()
         if listening {
             try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.defaultToSpeaker])
@@ -94,32 +95,24 @@ nonisolated final class VoiceAudio: @unchecked Sendable {
             try session.setCategory(.playback, mode: .spokenAudio)
         }
         try session.setActive(true)
-        if listening {
-            let input = engine.inputNode
-            try input.setVoiceProcessingEnabled(true)   // echo cancellation: Lobbot must not hear himself
-            let inFormat = input.outputFormat(forBus: 0)
-            converter = AVAudioConverter(from: inFormat, to: sendFormat)
-            input.installTap(onBus: 0, bufferSize: 2048, format: inFormat) { [weak self] buffer, _ in
-                self?.convertAndSend(buffer)
-            }
-        }
-        engine.attach(player)
-        engine.connect(player, to: engine.mainMixerNode, format: playFormat)
-        engine.prepare()
-        try engine.start()
-        player.play()
+        if listening { try? session.overrideOutputAudioPort(.speaker) }
+        self.listening = listening
+        active = true
+        if observers.isEmpty { observeSystemChanges() }
+        try buildEngine()
     }
 
     func stop() {
-        if listening { engine.inputNode.removeTap(onBus: 0) }
-        listening = false
-        if player.engine != nil { player.stop() }
-        if engine.isRunning { engine.stop() }
+        active = false
+        teardownEngine()
+        observers.forEach { NotificationCenter.default.removeObserver($0) }
+        observers = []
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }
 
     /// Plays 16-bit little-endian mono PCM at 24 kHz, as sent by Gemini.
     func play(pcm16 data: Data) {
+        if active, !engine.isRunning { rebuild() }   // iOS stopped the engine behind our back: bring it back
         let frames = data.count / 2
         guard frames > 0, let buffer = AVAudioPCMBuffer(pcmFormat: playFormat, frameCapacity: AVAudioFrameCount(frames)),
               let out = buffer.floatChannelData?[0] else { return }
@@ -139,8 +132,60 @@ nonisolated final class VoiceAudio: @unchecked Sendable {
 
     /// The user talked over Lobbot: drop what is queued.
     func interrupt() {
+        guard engine.isRunning else { return }
         player.stop()
         player.play()
+    }
+
+    private func buildEngine() throws {
+        engine = AVAudioEngine()
+        player = AVAudioPlayerNode()
+        if listening {
+            let input = engine.inputNode
+            try input.setVoiceProcessingEnabled(true)   // echo cancellation: Lobbot must not hear himself
+            let inFormat = input.outputFormat(forBus: 0)
+            converter = AVAudioConverter(from: inFormat, to: sendFormat)
+            input.installTap(onBus: 0, bufferSize: 2048, format: inFormat) { [weak self] buffer, _ in
+                self?.convertAndSend(buffer)
+            }
+            tapped = true
+        }
+        engine.attach(player)
+        engine.connect(player, to: engine.mainMixerNode, format: playFormat)
+        engine.prepare()
+        try engine.start()
+        player.play()
+    }
+
+    private func teardownEngine() {
+        if tapped { engine.inputNode.removeTap(onBus: 0) }
+        tapped = false
+        if player.engine != nil { player.stop() }
+        if engine.isRunning { engine.stop() }
+    }
+
+    private func rebuild() {
+        teardownEngine()
+        try? buildEngine()
+    }
+
+    /// iOS stops the engine without an error when the route or hardware format changes (typically right after
+    /// the session switches category) and after interruptions such as a phone call. Rebuild it each time.
+    private func observeSystemChanges() {
+        let center = NotificationCenter.default
+        observers = [
+            center.addObserver(forName: .AVAudioEngineConfigurationChange, object: nil, queue: .main) { [weak self] note in
+                guard let self, self.active, let changed = note.object as? AVAudioEngine, changed === self.engine else { return }
+                self.rebuild()
+            },
+            center.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: .main) { [weak self] note in
+                guard let self, self.active,
+                      let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+                      AVAudioSession.InterruptionType(rawValue: raw) == .ended else { return }
+                try? AVAudioSession.sharedInstance().setActive(true)
+                self.rebuild()
+            },
+        ]
     }
 
     private func convertAndSend(_ buffer: AVAudioPCMBuffer) {

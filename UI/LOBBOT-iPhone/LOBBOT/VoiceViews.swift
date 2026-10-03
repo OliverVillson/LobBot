@@ -102,18 +102,25 @@ struct CallOverlay: View {
                 .padding(.horizontal, 12)
             }
 
+            // His words float above his head so they never cover his face.
+            if let line = session.line {
+                SpeechBubble(text: line, tailOnTop: false)
+                    .lineLimit(6)
+                    .truncationMode(.head)   // a long live transcript keeps its latest words visible
+            }
+
             Spacer()
 
             if !voice.heard.isEmpty {
                 Text(voice.heard)
-                    .font(.footnote)
-                    .foregroundStyle(.white.opacity(0.85))
-                    .multilineTextAlignment(.center)
-                    .lineLimit(3)
+                    .font(.footnote.weight(.medium))
+                    .foregroundStyle(.white)
+                    .lineLimit(2)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 7)
+                    .background(Color.black.opacity(0.22), in: Capsule())
+                    .frame(maxWidth: .infinity, alignment: .trailing)
                     .accessibilityLabel("You: \(voice.heard)")
-            }
-            if let line = session.line {
-                SpeechBubble(text: line)
             }
 
             if typing {
