@@ -115,4 +115,12 @@ def test_gemini_written_heldout(job, monkeypatch):
     held, train = read(job / "data/heldout.jsonl"), read(job / "data/train.jsonl")
     assert {r["input"] for r in held} <= set(fake) and len(held) >= 15
     assert not set(fake) & {r["messages"][1]["content"] for r in train}
-    assert json.loads((job / "data/stats.json").read_text())["heldout_source"] == "gemini-3.8-flash"
+    stats = json.loads((job / "data/stats.json").read_text())
+    assert stats["heldout_source"] == "gemini-3.8-flash" and "heldout_dropped" in stats
+
+    # a rerun reuses the cached Gemini inputs instead of asking again
+    (job / ".done/data").unlink()
+    monkeypatch.setattr(testgen, "held_out_inputs", lambda *a, **k: pytest.fail("Gemini called again"))
+    data.run_stage(j)
+    assert [r["input"] for r in read(job / "work/data_testgen.jsonl")] == fake[:20]
+    assert {r["input"] for r in read(job / "data/heldout.jsonl")} <= set(fake[:20])
