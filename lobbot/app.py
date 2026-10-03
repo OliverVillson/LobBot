@@ -4,7 +4,7 @@
     lobbot doctor                    check SSH, checkout, venvs, weights, GPU, API
     lobbot up                        start the API on the VM (if needed) and check it
     lobbot new "what it should do"   draft a TaskSpec with Gemini
-    lobbot run spec.json --fast      start a job and watch its stages live
+    lobbot run spec.json --fast      start a job and watch its stages live (--long for code)
     lobbot status [job]              all jobs, or one job's stages
     lobbot results <job>             scores vs the teacher, size, speed, examples
     lobbot watch / logs / resume / stop <job>
@@ -44,6 +44,10 @@ PRESETS: dict[str, dict] = {
              "heal_max_minutes": 20, "dense_fallback": False},
     "full": {},
 }
+# --long: room for long answers (code, documents). Without it the teacher's answers
+# are cut at 1536 tokens and dropped as truncated, and heal trains on 2048 tokens.
+LONG: dict[str, int] = {"data_answer_max_tokens": 4096, "data_max_len": 16384, "heal_max_len": 8192}
+LONG_SEED_TOKENS = 800  # `new` and `run` suggest --long when a seed answer is longer (chars/4)
 
 
 GITHUB_URL = "https://github.com/OliverVillson/LobBot"
@@ -304,6 +308,8 @@ def job_config(a) -> dict:
 
     known = {f.name: f for f in fields(Config)}
     out = dict(PRESETS[a.preset])
+    if getattr(a, "long", False):
+        out.update(LONG)  # checked against the VM's Config when the job is written
     for kv in a.set or []:
         if "=" not in kv:
             raise CliError(f"--set expects key=value, got {kv!r}")
@@ -315,6 +321,11 @@ def job_config(a) -> dict:
         except json.JSONDecodeError:
             out[k] = v
     return out
+
+
+def longest_seed_tokens(spec: dict) -> int:
+    """Rough token count (chars/4) of the longest seed answer."""
+    return max((len(e.get("output", "")) // 4 for e in spec.get("seed_examples", [])), default=0)
 
 
 # ----------------------------------------------------------------- commands
@@ -525,14 +536,21 @@ def cmd_new(a) -> None:
     ok(f"wrote {out}  ({spec['task_name']}, {len(spec['seed_examples'])} seed examples)")
     first = spec["seed_examples"][0]
     print(c("  e.g. ", "2") + first["input"][:100].replace("\n", " ") + c("  →  ", "2") + first["output"][:100].replace("\n", " "))
-    print(f"Edit it if you like, then: lobbot run {out} --fast")
+    longest = longest_seed_tokens(spec)
+    if longest > LONG_SEED_TOKENS:
+        print(f"Its answers are long (up to ~{longest} tokens), so --long gives the teacher and heal room for them.")
+        print(f"Edit it if you like, then: lobbot run {out} --fast --long")
+    else:
+        print(f"Edit it if you like, then: lobbot run {out} --fast")
 
 
 def describe_config(conf: dict) -> str:
     """Config overrides in plain words, e.g. '400 examples, 30 tests, heal at most 20 min'."""
     words = {"n_generate": "{} training examples", "n_heldout": "{} held-out tests",
              "reap_calib_samples": "{} calibration samples", "heal_max_minutes": "heal at most {} min",
-             "heal_epochs": "{} heal epoch(s)", "reap_sparsity": "{:.0%} of experts pruned"}
+             "heal_epochs": "{} heal epoch(s)", "reap_sparsity": "{:.0%} of experts pruned",
+             "data_answer_max_tokens": "answers up to {} tokens", "data_max_len": "{}-token data context",
+             "heal_max_len": "heal on up to {} tokens"}
     out = []
     for k, v in conf.items():
         if k == "dense_fallback":
@@ -549,6 +567,16 @@ def cmd_run(a) -> None:
     r = Remote(s)
     spec = load_spec(a, r)
     conf = job_config(a)
+    if "data_answer_max_tokens" in conf or "data_max_len" in conf:
+        # Defaults as in stages/data.py when only one of the two is set (env vars on the VM aside).
+        cap, ctx = int(conf.get("data_answer_max_tokens") or 1536), int(conf.get("data_max_len") or 8192)
+        if ctx < cap + 2048:
+            warn(f"data_max_len={ctx} leaves under 2048 tokens of prompt room above data_answer_max_tokens={cap}; "
+                 f"use data_max_len={cap + 2048} or more")
+    longest = longest_seed_tokens(spec)
+    if longest > LONG_SEED_TOKENS and "data_answer_max_tokens" not in conf:
+        warn(f"seed answers run to ~{longest} tokens; without --long, teacher answers over 1536 tokens "
+             "are dropped as truncated")
     if not a.force:
         busy = gpu_processes(r)
         if busy:
@@ -556,9 +584,15 @@ def cmd_run(a) -> None:
                            + "\nWait for it (lobbot status), or add --force to start anyway.")
     job_id = check_job_id(a.name) if a.name else secrets.token_hex(5)
     bundle = {"dir": s.jobs.rstrip("/") + "/" + job_id, "files": {"taskspec.json": spec, "config.json": conf}}
-    r.sh("""python3 -c '
+    r.sh(r.env_prelude() + """python3 -c '
 import json, os, sys
+from dataclasses import fields
+from stages._util import Config
 b = json.load(sys.stdin)
+unknown = sorted(set(b["files"]["config.json"]) - {f.name for f in fields(Config)})
+if unknown:
+    sys.exit("the VM checkout does not know config key(s) " + ", ".join(unknown)
+             + "; update it with: lobbot pull (once no job is running)")
 d = os.path.expanduser(b["dir"])
 if os.path.exists(os.path.join(d, "taskspec.json")):
     sys.exit("job " + d + " already exists")
@@ -1015,7 +1049,10 @@ def parser() -> argparse.ArgumentParser:
     g = sp.add_mutually_exclusive_group()
     g.add_argument("--preset", choices=sorted(PRESETS), default="full")
     g.add_argument("--fast", dest="preset", action="store_const", const="fast", help="same as --preset fast")
-    sp.add_argument("--set", action="append", metavar="KEY=VALUE", help="override a stages/_util.py Config field")
+    sp.add_argument("--long", action="store_true",
+                    help="room for long answers such as code: " + ", ".join(f"{k}={v}" for k, v in LONG.items()))
+    sp.add_argument("--set", action="append", metavar="KEY=VALUE",
+                    help="override a stages/_util.py Config field (wins over --fast and --long)")
     sp.add_argument("--name", help="job id (letters and digits; default random)")
     sp.add_argument("--force", action="store_true", help="start even if the GPU is busy")
     sp.add_argument("-d", "--detach", action="store_true", help="start and return without watching")

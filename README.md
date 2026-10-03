@@ -76,7 +76,7 @@ lobbot init                         # VM host (default evroc-user@194.14.81.33),
 lobbot doctor                       # SSH, checkout, venvs, weights, llama.cpp, GPU, API
 lobbot secret GEMINI_API_KEY        # stored in ~/.lobbot-env on the VM (mode 600) for the eval judge
 lobbot new "turn support emails into JSON tickets"   # drafts a TaskSpec with Gemini (uses the VM's key if this Mac has none)
-lobbot run my.taskspec.json --fast  # or --example; live stage progress, Ctrl-C detaches
+lobbot run my.taskspec.json --fast  # or --example; --long for code; live progress, Ctrl-C detaches
 lobbot results <job>                # judge scores vs teacher, size, tok/s, held-out examples
 lobbot status [job] | watch <job> | logs <job> [-s heal] [-f]
 lobbot resume <job> [--from quantize] | stop <job>
@@ -102,8 +102,14 @@ who wrote and judged them, time per stage, the expert bit-width mix, and two
 held-out examples compared field by field with the teacher.
 
 `--fast` sets `n_generate=400, n_heldout=30, reap_calib_samples=128,
-heal_max_minutes=20, dense_fallback=false`; `--set key=value` overrides any `Config` field. `run`
-refuses to start while something else is on the GPU unless you add `--force`.
+heal_max_minutes=20, dense_fallback=false`. `--long` is for tasks with long answers
+such as code: it sets `data_answer_max_tokens=4096, data_max_len=16384,
+heal_max_len=8192`, so the teacher's answers aren't cut off and dropped and heal
+trains on whole examples. `lobbot new` suggests it when the drafted seed answers
+run past ~800 tokens, and `run` warns when they do and `--long` is missing.
+`--set key=value` overrides any `Config` field and wins over `--fast` and
+`--long`. `run` refuses to start while something else is on the GPU unless you
+add `--force`, and refuses config keys the VM checkout doesn't know yet.
 The API token lives in `~/.lobbot-token` on the VM (`lobbot token` prints it).
 
 ## Without a GPU
