@@ -293,23 +293,34 @@ def run_stage(job: Job) -> None:
 
     # 2b) optional: Gemini writes the held-out test inputs (stages/testgen.py); the teacher answers them
     ext: list[str] = []
-    if not DRY_RUN and testgen.enabled(cfg):
+    testgen_path = job.path("work", "data_testgen.jsonl")  # cached so a rerun keeps the same test set
+    if testgen_path.exists():
+        ext = [r["input"] for r in read_jsonl(testgen_path) if norm_key(r["input"]) not in seen]
+        print(f"[data] {len(ext)} held-out inputs from cache {testgen_path.name}", flush=True)
+    elif not DRY_RUN and testgen.enabled(cfg):
         emit(STAGE, pct=45, msg=f"{cfg.testgen_model} writing {n_held} held-out test inputs")
         ext = testgen.held_out_inputs(spec, cfg, n_held, seen, norm_key, parse_array, MAX_INPUT_CHARS)
+        if ext:
+            write_jsonl(testgen_path, [{"input": s} for s in ext])
+        emit(STAGE, pct=46, msg=f"{len(ext)} held-out test inputs from {cfg.testgen_model}")
 
     # 3) answers
     shots = rng.sample(spec.seed_examples, k=min(FEWSHOT, len(spec.seed_examples)))
     convs = [answer_messages(spec, shots, s) for s in inputs + ext]
     gens = chat_batched(teacher, convs, 0.3, ANSWER_MAX_TOKENS, 45, 95, "teacher answering")
     sys = system_prompt(spec)
-    rows, ext_rows, drops = [], [], {}
+    rows, ext_rows, drops, ext_drops = [], [], {}, {}
     for i, (s, g) in enumerate(zip(inputs + ext, gens)):
         ans, why = check_answer(g.text, g.finished, want_json)
+        is_ext = i >= len(inputs)
         if ans is None:
-            drops[why] = drops.get(why, 0) + 1
+            d = ext_drops if is_ext else drops
+            d[why] = d.get(why, 0) + 1
         else:
-            (ext_rows if i >= len(inputs) else rows).append(_row(sys, s, ans))
+            (ext_rows if is_ext else rows).append(_row(sys, s, ans))
     stats.update(answered=len(rows), dropped=drops)
+    if ext:
+        stats.update(heldout_answered=len(ext_rows), heldout_dropped=ext_drops)
     print(f"[data] kept {len(rows)}/{len(inputs)} answers, dropped {drops}", flush=True)
     if len(rows) < 2 * n_held:
         raise RuntimeError(f"only {len(rows)} usable answers after filtering ({drops})")
