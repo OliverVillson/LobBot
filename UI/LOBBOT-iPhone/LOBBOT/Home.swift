@@ -45,131 +45,244 @@ struct SplashView: View {
     }
 }
 
-/// The lobby: what lobbot does, the two ways in, and the surgeries done so far.
+/// The ward board: Dr. Lobbot's patients. Bed 1 is the real run, this session's replays follow, and the
+/// empty bed admits a new patient. The legend underneath explains how a patient moves through the ward.
 struct HomePanel: View {
     @Environment(Session.self) private var session
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    /// The bed Lobbot is looking at on his rounds; -1 when he's done.
+    @State private var round = -1
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            VStack(alignment: .leading, spacing: 8) {
-                Text("Cut the model.\nKeep the capability.")
-                    .font(.system(size: 30, weight: .heavy))
-                    .foregroundStyle(Brand.ink)
-                    .fixedSize(horizontal: false, vertical: true)
-                Text("Describe one job. Dr. Lobbot turns a big AI model into a small one that does just that job, on your laptop, offline.")
-                    .font(.subheadline)
-                    .foregroundStyle(Brand.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+            board
+            legend
+            Text("Bed 1 is the real run of \(QualityRun.date) on \(QualityRun.gpu) GPU, graded by Gemini on \(QualityRun.tests) new emails. Surgeries in this app replay it.")
+                .font(.caption)
+                .foregroundStyle(Brand.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.horizontal, 4)
+        }
+        .task {
+            // His rounds: each bed plate lights up in turn, ending on the empty bed.
+            guard !reduceMotion else { return }
+            try? await Task.sleep(for: .milliseconds(500))
+            for i in 0...beds.count {
+                withAnimation(.easeOut(duration: 0.2)) { round = i }
+                try? await Task.sleep(for: .milliseconds(380))
+                if Task.isCancelled { return }
             }
-            .padding(.horizontal, 4)
+            withAnimation(.easeOut(duration: 0.3)) { round = -1 }
+        }
+    }
 
-            PrimaryButton(title: "New surgery", symbol: "scissors") { session.startIntake() }
-            Button { session.startCall() } label: {
-                Label("Talk to Dr. Lobbot", systemImage: "mic.fill")
-                    .font(.headline)
-                    .frame(maxWidth: .infinity, minHeight: 54)
-                    .foregroundStyle(Brand.accent)
-                    .background(Brand.surface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-                    .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(Brand.line))
+    private var beds: [Bed] {
+        var list = [Bed(id: "real", number: 1, job: "Support emails → JSON tickets",
+                        detail: "\(QualityRun.teacherGB) → \(QualityRun.modelGB) · \(QualityRun.score) vs \(QualityRun.teacherScore)",
+                        note: "About 50 tokens/s on a 16 GB MacBook, offline", real: true)]
+        for (i, record) in session.history.enumerated() {
+            list.append(Bed(id: record.id.uuidString, number: i + 2, job: record.job,
+                            detail: "Replayed at \(record.date.formatted(date: .omitted, time: .shortened))",
+                            note: nil, real: false))
+        }
+        return list
+    }
+
+    private var board: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(alignment: .firstTextBaseline) {
+                Text("Ward 64")
+                    .font(.title2.weight(.heavy))
+                    .foregroundStyle(.white)
+                    .accessibilityAddTraits(.isHeader)
+                Spacer()
+                Text("Dr. Lobbot's patients")
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(.white.opacity(0.88))
             }
-            .buttonStyle(.plain)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
+            .background(Brand.stage)
 
-            VStack(alignment: .leading, spacing: 14) {
-                Field(label: "How it works") {
-                    VStack(alignment: .leading, spacing: 12) {
-                        HowStep(number: 1, title: "The chart", text: "One sentence. Gemini drafts what goes in, what comes out and how to grade it.")
-                        HowStep(number: 2, title: "The surgery", text: "The big model practises your job, Dr. Lobbot removes the experts it never uses, then heals and packs the patient.")
-                        HowStep(number: 3, title: "Check-up and discharge", text: "Gemini grades it on new cases, then it goes home to your laptop and runs offline.")
+            Text("One job in, a small model out. It runs on your laptop, offline.")
+                .font(.headline)
+                .foregroundStyle(Brand.ink)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(16)
+
+            ForEach(Array(beds.enumerated()), id: \.element.id) { index, bed in
+                Divider()
+                BedRow(bed: bed, onRound: round == index) { session.openBed(real: bed.real) }
+            }
+            Divider()
+            EmptyBedRow(number: beds.count + 1, onRound: round == beds.count) { session.startIntake() }
+        }
+        .background(Color.white)
+        .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 22, style: .continuous).stroke(Brand.line))
+    }
+
+    private var legend: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("How a patient moves through the ward")
+                .font(.headline)
+                .foregroundStyle(Brand.ink)
+                .accessibilityAddTraits(.isHeader)
+            LegendRow(symbol: "list.clipboard", title: "Admission", code: nil, text: "You describe one job; Gemini drafts the chart.")
+            ForEach(Stage.allCases) { stage in
+                LegendRow(symbol: stage.symbol, title: stage.title, code: stage.rawValue, text: stage.fact)
+            }
+            LegendRow(symbol: "laptopcomputer", title: "Home", code: nil, text: "It runs offline on a 16 GB laptop.")
+        }
+        .card()
+    }
+}
+
+private struct Bed: Identifiable {
+    let id: String
+    let number: Int
+    let job: String
+    let detail: String
+    let note: String?
+    let real: Bool
+}
+
+/// A bed plate: white digits on ink, lit in accent while Lobbot looks at it.
+private struct BedPlate: View {
+    let number: Int
+    let lit: Bool
+
+    var body: some View {
+        Text("\(number)")
+            .font(.headline.monospacedDigit())
+            .foregroundStyle(.white)
+            .frame(width: 36, height: 36)
+            .background(lit ? Brand.accent : Brand.ink, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+            .scaleEffect(lit ? 1.08 : 1)
+    }
+}
+
+private struct BedRow: View {
+    let bed: Bed
+    let onRound: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(alignment: .top, spacing: 12) {
+                BedPlate(number: bed.number, lit: onRound)
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Text(bed.job)
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(Brand.ink)
+                            .lineLimit(2)
+                        Spacer(minLength: 4)
+                        Text(bed.real ? "Discharged" : "Replay")
+                            .font(.caption2.weight(.bold))
+                            .foregroundStyle(bed.real ? Brand.kept : Brand.accent)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3)
+                            .background((bed.real ? Brand.kept : Brand.accent).opacity(0.12), in: Capsule())
+                    }
+                    Text(bed.detail)
+                        .font(.footnote.monospacedDigit())
+                        .foregroundStyle(Brand.ink)
+                    if let note = bed.note {
+                        Text(note)
+                            .font(.caption)
+                            .foregroundStyle(Brand.secondary)
                     }
                 }
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(Brand.secondary)
+                    .padding(.top, 10)
             }
-            .card()
+            .padding(.horizontal, 16)
+            .padding(.vertical, 14)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Bed \(bed.number), \(bed.job), \(bed.real ? "discharged" : "replay"). \(bed.detail)")
+        .accessibilityHint("Opens the discharge report")
+        .accessibilityAddTraits(.isButton)
+    }
+}
 
-            Field(label: "A real patient") {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Support emails → JSON tickets")
+/// The free bed: the home page's call to action. It breathes softly until you admit someone.
+private struct EmptyBedRow: View {
+    let number: Int
+    let onRound: Bool
+    let action: () -> Void
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var breathe = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 12) {
+                Text("\(number)")
+                    .font(.headline.monospacedDigit())
+                    .foregroundStyle(Brand.accent)
+                    .frame(width: 36, height: 36)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 9, style: .continuous)
+                            .strokeBorder(Brand.accent, style: StrokeStyle(lineWidth: 1.5, dash: [4, 3]))
+                    )
+                    .scaleEffect(onRound ? 1.08 : 1)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Admit a patient")
                         .font(.headline)
-                        .foregroundStyle(Brand.ink)
-                    Text("\(QualityRun.teacherGB) → \(QualityRun.modelGB) · \(QualityRun.score) vs \(QualityRun.teacherScore) for the big model · \(QualityRun.speed)")
-                        .font(.subheadline)
-                        .foregroundStyle(Brand.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                    Text("Run of \(QualityRun.date) on \(QualityRun.gpu) GPU, graded by Gemini on \(QualityRun.tests) new emails.")
+                        .foregroundStyle(Brand.accent)
+                    Text("Describe one job. Dr. Lobbot does the rest.")
                         .font(.caption)
                         .foregroundStyle(Brand.secondary)
                 }
+                Spacer(minLength: 8)
+                Image(systemName: "plus.circle.fill")
+                    .font(.title2)
+                    .foregroundStyle(Brand.accent)
             }
-            .card()
-
-            Field(label: "Recent surgeries") {
-                if session.history.isEmpty {
-                    Text("No patients yet. Your first surgery will show up here.")
-                        .font(.subheadline)
-                        .foregroundStyle(Brand.secondary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                } else {
-                    VStack(spacing: 0) {
-                        ForEach(session.history) { record in
-                            RecordRow(record: record)
-                            if record.id != session.history.last?.id { Divider() }
-                        }
-                    }
-                }
-            }
-            .card()
-
-            Text("In this app the surgery replays that real run.")
-                .font(.caption)
-                .foregroundStyle(Brand.secondary)
-                .padding(.horizontal, 4)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 16)
+            .background(Brand.rose.opacity(breathe ? 0.32 : 0.16))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Bed \(number), empty. Admit a patient")
+        .onAppear {
+            guard !reduceMotion else { return }
+            withAnimation(.easeInOut(duration: 1.8).repeatForever(autoreverses: true)) { breathe = true }
         }
     }
 }
 
-private struct HowStep: View {
-    let number: Int
+private struct LegendRow: View {
+    let symbol: String
     let title: String
+    let code: String?
     let text: String
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
-            Text("\(number)")
-                .font(.subheadline.weight(.bold))
-                .foregroundStyle(.white)
-                .frame(width: 26, height: 26)
-                .background(Brand.accent, in: Circle())
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title).font(.subheadline.weight(.semibold)).foregroundStyle(Brand.ink)
-                Text(text).font(.footnote).foregroundStyle(Brand.secondary).fixedSize(horizontal: false, vertical: true)
-            }
-        }
-        .accessibilityElement(children: .combine)
-    }
-}
-
-private struct RecordRow: View {
-    let record: SurgeryRecord
-
-    var body: some View {
-        HStack(spacing: 12) {
-            Image(systemName: "cross.case.fill")
+            Image(systemName: symbol)
+                .font(.body)
                 .foregroundStyle(Brand.accent)
-                .frame(width: 24)
+                .frame(width: 26)
             VStack(alignment: .leading, spacing: 2) {
-                Text(record.job)
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(Brand.ink)
-                    .lineLimit(1)
-                Text("\(QualityRun.teacherGB) → \(QualityRun.modelGB) · \(QualityRun.score) · replay")
-                    .font(.caption)
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text(title).font(.subheadline.weight(.semibold)).foregroundStyle(Brand.ink)
+                    if let code {
+                        Text(code).font(.caption.monospaced()).foregroundStyle(Brand.secondary)
+                    }
+                }
+                Text(text)
+                    .font(.footnote)
                     .foregroundStyle(Brand.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
-            Spacer(minLength: 0)
-            Text(record.date, style: .time)
-                .font(.caption)
-                .foregroundStyle(Brand.secondary)
         }
-        .padding(.vertical, 10)
         .accessibilityElement(children: .combine)
     }
 }

@@ -66,10 +66,14 @@ One palette, **Anatomie: bordeaux and rose**, light only. No dark mode, no other
   speech bubble under it, the panel for the current phase (home → the job → the chart → the target → the
   surgery board → discharge), and the
   composer docked at the bottom (text field + mic).
-- **Three layouts of the same stage** (never recreate it, the WebGL would reload): big on the home page; a
-  picture-in-picture tile (150 pt, top left, 22 pt radius) during a consultation, with his bubble beside him
-  (tail pointing at him) and the panel taking the screen; full screen for a call started from the home page.
+- **Two layouts of the same stage** (never recreate it, the WebGL would reload): his picture-in-picture tile
+  (150 pt, top left, 22 pt radius) with his bubble beside him (tail pointing at him) and the panel taking the
+  screen, on the home page and every consultation step; full screen for a call started from the home page.
   A call during a consultation stays in the tile with a "Live" tag, and Mute and End move into the bottom bar.
+- **Home = the ward board** ("Ward 64"): the one-line promise, bed 1 = the real run (Discharged), this session's
+  replays as the next beds, the empty bed "Admit a patient" as the call to action (it breathes), then the legend
+  of how a patient moves through the ward. On arrival Lobbot does his rounds: each bed plate lights up in turn.
+  Tapping a bed makes him comment on it before its discharge report opens.
 - Components to reuse: `PrimaryButton`, `OptionTile`, `Field`, `.card()` (`Brand.swift`), `SpeechBubble`,
   `MascotStage` (`MascotStage.swift`).
 

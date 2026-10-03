@@ -1,10 +1,9 @@
 import SwiftUI
 
-/// One screen, built around Dr. Lobbot. Three layouts of the same stage:
-/// - home: he's big on top, his bubble under him;
-/// - consultation (job, chart, target, surgery, discharge): he shrinks to a picture-in-picture tile at the
-///   top left, his bubble beside him, and the panel takes the screen;
-/// - call from the home page: he fills the screen.
+/// One screen, built around Dr. Lobbot. Two layouts of the same stage:
+/// - his tile at the top left, his bubble beside him, the panel under them (the home ward board and every
+///   consultation step);
+/// - a call started from the home page: he fills the screen.
 /// The stage is always the same view (AnyLayout keeps its identity), so the WebGL mascot never reloads.
 struct ContentView: View {
     @Environment(Session.self) private var session
@@ -13,7 +12,7 @@ struct ContentView: View {
     var body: some View {
         GeometryReader { geo in
             let full = session.fullScreenCall
-            let pip = session.diagnosing
+            let pip = !full
             let tile = min(150, geo.size.width * 0.38)
             let layout = pip ? AnyLayout(HStackLayout(alignment: .top, spacing: 14)) : AnyLayout(VStackLayout(spacing: -14))
             ZStack {
@@ -28,7 +27,7 @@ struct ContentView: View {
                     layout {
                         MascotStage(cornerRadius: full ? 0 : pip ? 22 : 28)
                             .frame(width: pip ? tile : nil,
-                                   height: full ? nil : pip ? tile * 1.15 : min(geo.size.width - 32, geo.size.height * 0.42))
+                                   height: full ? nil : tile * 1.15)
                             .frame(maxHeight: full ? .infinity : nil)
                             .ignoresSafeArea(edges: full ? .all : [])
                             .overlay(alignment: .topLeading) {
@@ -80,7 +79,6 @@ struct ContentView: View {
             if !session.fullScreenCall { Composer() }
         }
         .animation(.snappy(duration: 0.45), value: session.fullScreenCall)
-        .animation(.snappy(duration: 0.45), value: session.diagnosing)
         .overlay {
             if splash {
                 SplashView().transition(.opacity.combined(with: .scale(scale: 1.08)))

@@ -29,6 +29,17 @@ enum Stage: String, CaseIterable, Identifiable {
         case .package: "Writing the model file…"
         }
     }
+    /// One real fact per stage, for the home page legend (from the motion-ad brief's fact sheet).
+    var fact: String {
+        switch self {
+        case .data: "The big model writes 2,030 examples of your job."
+        case .reap: "Removes 64 of 128 experts per layer, the ones your job uses least."
+        case .heal: "Relearns from the big model's answers."
+        case .quantize: "2 to 6 bits per layer, about 3 on average."
+        case .eval: "Gemini grades it against the big model on 100 new emails."
+        case .package: "One 6.52 GB file, ready for Ollama."
+        }
+    }
     var symbol: String {
         switch self {
         case .data: "doc.on.doc"
@@ -167,16 +178,16 @@ final class Session {
 
     init() {
         voice.session = self
+        reframe()   // the home tile wants the close-up from the start
     }
 
     /// A consultation is on: Lobbot shrinks to a picture-in-picture tile and the panel takes the screen.
     var diagnosing: Bool { phase != .home }
     var fullScreenCall: Bool { inCall && !diagnosing }
 
-    /// Close-up whenever he's in a small tile or a full-screen call; wide when his props need room
-    /// (the home stage, and the operating room during surgery).
+    /// Close-up in his tile and in a full-screen call; wide in the operating room, where his props need room.
     private func reframe() {
-        let close = phase != .surgery && (diagnosing || inCall)
+        let close = phase != .surgery
         guard close != framedClose else { return }
         framedClose = close
         lobbot.setFraming(close: close)
@@ -198,6 +209,17 @@ final class Session {
         job = ""
         phase = .intake(.job)
         say("Wonderful! What's the one job your model should do? One sentence is plenty.")
+    }
+
+    /// Tapping a bed on the ward board: Lobbot comments on it, then opens its discharge report.
+    func openBed(real: Bool) {
+        say(real
+            ? "Bed one, my star patient: support emails into JSON tickets. Went home at 6.52 GB with 9.7 out of 10."
+            : "A replay of that same surgery. Same patient, same numbers.", then: .idle)
+        Task {
+            try? await Task.sleep(for: .seconds(1.2))
+            if phase == .home { phase = .done }
+        }
     }
 
     func goHome() {
