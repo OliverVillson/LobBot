@@ -102,6 +102,13 @@ DEFAULT_SHAPES: dict[str, int] = _default_shapes()  # approximate, ~2.2B params
 # gr00t/model/gr00t_n1d7/gr00t_n1d7.py: Gr00tN1d7.backbone (Qwen3Backbone,
 # .model = Qwen3VLForConditionalGeneration) and Gr00tN1d7.action_head
 # (.model = AlternateVLDiT with .transformer_blocks).
+# Real names (checked on a tiny random Gr00tN1d7 by tests/test_gr00t_compat.py):
+#   backbone.model.model.language_model.layers.{i}.self_attn.{q,k,v,o}_proj.weight
+#   backbone.model.model.language_model.layers.{i}.mlp.{gate,up,down}_proj.weight
+#   backbone.model.model.language_model.embed_tokens.weight, backbone.model.model.visual.*
+#   backbone.model.lm_head.weight (unused: GR00T reads hidden states, never logits)
+#   action_head.model.transformer_blocks.{j}.attn1.*  /  .norm1.*, .ff.*
+#   action_head.{state_encoder,action_encoder,action_decoder}.*.W (CategorySpecificLinear)
 # ---------------------------------------------------------------------------
 _LLM_RE = re.compile(r"language_model\.layers\.(\d+)\.(self_attn|mlp)\.(\w+)_proj\.")
 _DIT_RE = re.compile(r"^action_head\.model\.transformer_blocks\.(\d+)\.(attn1\.)?")
