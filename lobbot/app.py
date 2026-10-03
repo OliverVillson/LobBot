@@ -660,9 +660,43 @@ def show_results(r: Remote, job: str, facts: dict | None = None) -> None:
         return
     for line in render(job, facts, color=TTY):
         print(line)
-    if facts.get("eval") and facts.get("gguf_bytes"):
-        print(c("  Next  ", "1") + f"lobbot save {job} --chat" + c("   download, verify, import into Ollama, chat", "2"))
-        print(c("        " + PAUSE_WARNING.split(". ")[0] + ".", "2"))
+    if not (facts.get("eval") and facts.get("gguf_bytes")):
+        return
+    saved = local_copy(r.s, job, facts)
+    if saved:
+        d, name, in_ollama = saved
+        print(c("  Saved ", "1") + f"{d}" + c("  (sha256 matches the VM)", "2"))
+        if in_ollama:
+            print(c("  Next  ", "1") + f"lobbot chat {name}" + c(f"   already in Ollama as {name}", "2"))
+        else:
+            print(c("  Next  ", "1") + f"lobbot save {job} --chat" + c("   imports the saved copy into Ollama", "2"))
+        return
+    print(c("  Next  ", "1") + f"lobbot save {job} --chat" + c("   download, verify, import into Ollama, chat", "2"))
+    print(c("        " + PAUSE_WARNING.split(". ")[0] + ".", "2"))
+
+
+def local_copy(s: cfgmod.Settings, job: str, facts: dict) -> tuple[Path, str, bool] | None:
+    """(dir, Ollama name, already in Ollama) if this Mac has a verified copy of the job's model."""
+    task = (facts.get("taskspec") or {}).get("task_name") or "model"
+    d = Path(s.models_dir).expanduser() / f"{task}-{job}"
+    try:
+        meta = json.loads((d / "lobbot.json").read_text())
+        local_sha = (d / "model.gguf.sha256").read_text().split()[0]
+    except (OSError, ValueError, IndexError):
+        return None
+    if not (d / "model.gguf").exists() or local_sha != meta.get("sha256"):
+        return None
+    if facts.get("gguf_sha256") and facts["gguf_sha256"] != local_sha:
+        return None  # the VM has a newer model (e.g. a rerun) than the saved one
+    name = meta.get("ollama_name") or f"lobbot-{task}"
+    in_ollama = False
+    if shutil.which("ollama"):
+        try:
+            listed = subprocess.run(["ollama", "list"], capture_output=True, text=True, timeout=5).stdout
+            in_ollama = any(l.split()[0].split(":")[0] == name for l in listed.splitlines()[1:] if l.strip())
+        except (subprocess.SubprocessError, OSError, IndexError):
+            pass
+    return d, name, in_ollama
 
 
 def cmd_results(a) -> None:

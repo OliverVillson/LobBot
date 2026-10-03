@@ -38,11 +38,17 @@ for s in ["data", "reap", "heal", "quantize", "eval", "package"]:
     end = os.path.getmtime(done) if os.path.exists(done) else None
     times[s] = [start, end]
 gguf = os.path.join(d, "out", "model.gguf")
+sha = None
+try:
+    if os.path.getmtime(gguf + ".sha256") >= os.path.getmtime(gguf):
+        sha = open(gguf + ".sha256").read().split()[0]
+except Exception:
+    pass
 print(json.dumps({
     "eval": rj("out/eval.json"), "taskspec": rj("taskspec.json"), "stats": rj("data/stats.json"),
     "config": rj("config.json") or {}, "effective": rj("work/config.effective.json") or {},
     "heldout": lines("data/heldout.jsonl"), "train": lines("data/train.jsonl"),
-    "gguf_bytes": os.path.getsize(gguf) if os.path.exists(gguf) else None, "times": times,
+    "gguf_bytes": os.path.getsize(gguf) if os.path.exists(gguf) else None, "gguf_sha256": sha, "times": times,
 }))
 '''
 
