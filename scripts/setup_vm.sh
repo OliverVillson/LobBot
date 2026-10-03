@@ -36,11 +36,11 @@ uv venv -q --python 3.12 "$NVME/venv-vllm"
 uv pip install -q --python "$NVME/venv-vllm/bin/python" vllm pyyaml
 uv pip install -q --python "$NVME/venv-vllm/bin/python" -e "$REPO" --no-deps
 
-say "Training venv (reap, heal, quantize, eval, package, agent)"
+say "Training venv (reap, heal, quantize, eval, package, API)"
 uv venv -q --python 3.12 "$NVME/venv-train"
 uv pip install -q --python "$NVME/venv-train/bin/python" \
-  "llmcompressor @ git+https://github.com/vllm-project/llm-compressor" \
-  trl peft datasets accelerate anthropic httpx fastapi uvicorn sentencepiece gguf
+  "torch>=2.7" "transformers>=4.57" "peft>=0.17" accelerate safetensors \
+  anthropic httpx fastapi uvicorn sentencepiece gguf
 uv pip install -q --python "$NVME/venv-train/bin/python" -e "$REPO" --no-deps
 
 # Written before the llama.cpp build so the data stage works even if that step fails.
