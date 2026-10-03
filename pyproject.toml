@@ -8,7 +8,7 @@ dependencies = []
 [project.optional-dependencies]
 # VM side ML deps are installed by scripts/setup_vm.sh into their own venvs.
 api = ["fastapi", "uvicorn", "httpx"]
-dev = ["pytest", "fastapi", "uvicorn", "httpx"]
+dev = ["pytest", "fastapi", "uvicorn", "httpx", "anthropic"]
 
 [project.scripts]
 lobbot = "lobbot.app:main"
