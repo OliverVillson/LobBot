@@ -1,0 +1,12 @@
+{
+  "id": "soufre",
+  "name": "Soufre",
+  "note": "Jaune acide sur graphite · recherche et énergie",
+  "canvas": "#20261F",
+  "surface": "#2B3228",
+  "ink": "#F1F2DB",
+  "secondary": "#BBC2AD",
+  "line": "#555E4E",
+  "accent": "#DDDE72",
+  "onaccent": "#20261F"
+}

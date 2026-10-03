@@ -1,0 +1,59 @@
+[data-palette="incision"] {
+  --canvas: #F6F0E7;
+  --surface: #FFFAF3;
+  --ink: #2B231F;
+  --secondary: #685A51;
+  --line: #CDC0B3;
+  --accent: #EE6047;
+  --onaccent: #2B231F;
+}
+
+[data-palette="sauge"] {
+  --canvas: #EEF2E8;
+  --surface: #F8FAF2;
+  --ink: #233C30;
+  --secondary: #526453;
+  --line: #BCC7B6;
+  --accent: #B9CFA6;
+  --onaccent: #233C30;
+}
+
+[data-palette="anatomie"] {
+  --canvas: #F3E7E6;
+  --surface: #FCF4F2;
+  --ink: #592C3B;
+  --secondary: #805764;
+  --line: #D4B5BB;
+  --accent: #A13D58;
+  --onaccent: #FFFFFF;
+}
+
+[data-palette="cobalt"] {
+  --canvas: #EDF1F2;
+  --surface: #F8FBFB;
+  --ink: #173446;
+  --secondary: #526773;
+  --line: #C0D0D7;
+  --accent: #305AC5;
+  --onaccent: #FFFFFF;
+}
+
+[data-palette="soufre"] {
+  --canvas: #20261F;
+  --surface: #2B3228;
+  --ink: #F1F2DB;
+  --secondary: #BBC2AD;
+  --line: #555E4E;
+  --accent: #DDDE72;
+  --onaccent: #20261F;
+}
+
+[data-palette="archive"] {
+  --canvas: #ECEDE7;
+  --surface: #F8F8F0;
+  --ink: #292D26;
+  --secondary: #626858;
+  --line: #C4C8BB;
+  --accent: #292D26;
+  --onaccent: #F8F8F0;
+}

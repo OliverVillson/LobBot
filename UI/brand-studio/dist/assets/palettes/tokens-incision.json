@@ -1,0 +1,12 @@
+{
+  "id": "incision",
+  "name": "Incision",
+  "note": "Corail chirurgical · précis et provocant",
+  "canvas": "#F6F0E7",
+  "surface": "#FFFAF3",
+  "ink": "#2B231F",
+  "secondary": "#685A51",
+  "line": "#CDC0B3",
+  "accent": "#EE6047",
+  "onaccent": "#2B231F"
+}

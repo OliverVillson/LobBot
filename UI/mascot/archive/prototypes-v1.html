@@ -1,0 +1,606 @@
+<title>LOBBOT</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Unbounded:wght@500;800&family=Figtree:wght@400;500;600&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one 3D stage (the agent) above a bedside-monitor strip (ECG + vitals + state controls). Dark by choice. */
+:root {
+  --ink: #0a0f1f;
+  --panel: #10172e;
+  --line: #222d52;
+  --text: #e8eeff;
+  --muted: #a3aed6;
+  --scrub: #39e0c8;
+  --pulse: #ff5a7a;
+  --amber: #ffc94a;
+  --f-display: "Unbounded", "Arial Black", system-ui, sans-serif;
+  --f-body: "Figtree", system-ui, -apple-system, sans-serif;
+  --f-mono: "JetBrains Mono", ui-monospace, Menlo, monospace;
+  color-scheme: dark;
+}
+html, body { height: 100%; }
+body { background: var(--ink); color: var(--text); font-family: var(--f-body); font-size: 15px; }
+.app { max-width: 1180px; margin: 0 auto; padding-inline: 20px; padding-block: 18px 28px; display: flex; flex-direction: column; gap: 14px; }
+
+.top { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 14px; }
+.brand { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
+.word { font-family: var(--f-display); font-weight: 800; font-size: 26px; letter-spacing: 0.02em; }
+.word i { font-style: normal; color: var(--scrub); }
+.sub { font-family: var(--f-mono); font-size: 12px; color: var(--muted); letter-spacing: 0.04em; }
+
+.variants { display: flex; gap: 6px; flex-wrap: wrap; }
+.variants button, .states button, .auto {
+  font: 500 13px var(--f-body); color: var(--text); background: var(--panel);
+  border: 1px solid var(--line); border-radius: 999px; padding: 8px 14px; cursor: pointer;
+  display: inline-flex; align-items: center; gap: 8px; transition: border-color .15s, background .15s, transform .1s;
+}
+.variants button b { font-family: var(--f-mono); color: var(--muted); font-weight: 600; }
+.variants button[aria-pressed="true"] { border-color: var(--scrub); background: #12304a; }
+.variants button[aria-pressed="true"] b { color: var(--scrub); }
+button:hover { border-color: #3a4a80; }
+button:active { transform: scale(0.97); }
+button:focus-visible { outline: 2px solid var(--scrub); outline-offset: 2px; }
+
+.stage {
+  position: relative; height: clamp(380px, 60vh, 680px); border-radius: 22px; overflow: hidden;
+  background: radial-gradient(circle at 50% 46%, #1a2a5c 0%, #0f1735 38%, var(--ink) 72%);
+  border: 1px solid var(--line);
+}
+.stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; cursor: pointer; touch-action: none; }
+.note { position: absolute; left: 18px; bottom: 16px; max-width: min(360px, calc(100% - 36px)); pointer-events: none; }
+.note .k { font-family: var(--f-mono); font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--scrub); }
+.note h2 { font-family: var(--f-display); font-weight: 500; font-size: 20px; margin: 4px 0 6px; text-wrap: balance; }
+.note p { margin: 0; color: var(--muted); line-height: 1.45; font-size: 14px; }
+.hint { position: absolute; right: 16px; top: 14px; font-family: var(--f-mono); font-size: 11px; color: var(--muted); letter-spacing: 0.04em; pointer-events: none; }
+
+.monitor { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 14px; align-items: stretch; }
+.ecg { position: relative; background: var(--panel); border: 1px solid var(--line); border-radius: 16px; overflow: hidden; min-height: 112px; display: grid; grid-template-columns: minmax(0,1fr) auto; }
+.ecg canvas { width: 100%; height: 100%; display: block; min-height: 112px; }
+.vitals { display: flex; flex-direction: column; justify-content: center; gap: 6px; padding: 12px 16px; border-left: 1px solid var(--line); min-width: 150px; }
+.vitals div { display: flex; justify-content: space-between; gap: 14px; align-items: baseline; }
+.vitals span { font-family: var(--f-mono); font-size: 10.5px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); }
+.vitals b { font-family: var(--f-mono); font-weight: 600; font-size: 15px; font-variant-numeric: tabular-nums; }
+#vBpm { color: var(--pulse); }
+#vParams { color: var(--scrub); }
+
+.controls { display: flex; flex-direction: column; gap: 8px; justify-content: center; }
+.states { display: grid; grid-template-columns: repeat(3, auto); gap: 6px; }
+.states button kbd { font-family: var(--f-mono); font-size: 10.5px; color: var(--muted); }
+.states button[aria-pressed="true"] { border-color: var(--pulse); background: #3a1830; }
+.auto[aria-pressed="true"] { border-color: var(--amber); color: var(--amber); }
+.auto { justify-content: center; }
+
+@media (max-width: 760px) {
+  .monitor { grid-template-columns: minmax(0, 1fr); }
+  .states { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .states button { justify-content: center; }
+  .hint { display: none; }
+  .note p { display: none; }
+  .stage { height: clamp(340px, 55vh, 520px); }
+}
+</style>
+
+<div class="app">
+  <header class="top">
+    <div class="brand">
+      <span class="word">L<i>O</i>BB<i>O</i>T</span>
+      <span class="sub">Dr. Lobbot · chirurgien des modèles · LLM → SLM</span>
+    </div>
+    <nav class="variants" aria-label="Pistes de design">
+      <button data-v="0" aria-pressed="true"><b>A</b> Dr. Cerveau</button>
+      <button data-v="1" aria-pressed="false"><b>B</b> La Gélule</button>
+      <button data-v="2" aria-pressed="false"><b>C</b> Le Nuage</button>
+    </nav>
+  </header>
+
+  <main class="stage" id="stage">
+    <canvas id="gl" aria-label="Lobbot, l'agent en 3D. Clique pour le chatouiller."></canvas>
+    <div class="note">
+      <div class="k" id="vKey">Piste A</div>
+      <h2 id="vName">Dr. Cerveau</h2>
+      <p id="vDesc"></p>
+    </div>
+    <div class="hint">clique sur Lobbot · touches 1 à 6</div>
+  </main>
+
+  <section class="monitor">
+    <div class="ecg">
+      <canvas id="ecg"></canvas>
+      <div class="vitals">
+        <div><span>État</span><b id="vState">Repos</b></div>
+        <div><span>BPM</span><b id="vBpm">72</b></div>
+        <div><span>Modèle</span><b id="vParams">70B</b></div>
+      </div>
+    </div>
+    <div class="controls">
+      <div class="states">
+        <button data-s="idle"><kbd>1</kbd> Repos</button>
+        <button data-s="listen"><kbd>2</kbd> Écoute</button>
+        <button data-s="think"><kbd>3</kbd> Réflexion</button>
+        <button data-s="talk"><kbd>4</kbd> Réponse</button>
+        <button data-s="distill"><kbd>5</kbd> Distillation</button>
+        <button data-s="bug"><kbd>6</kbd> Bug</button>
+      </div>
+      <button class="auto" id="auto" aria-pressed="true">Démo auto</button>
+    </div>
+  </section>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/three@0.149.0/build/three.min.js"></script>
+<script>
+(() => {
+THREE.ColorManagement.legacyMode = false;
+const RM = matchMedia('(prefers-reduced-motion: reduce)').matches;
+const MOTION = RM ? 0.3 : 1;
+const COL = { scrub: 0x39e0c8, pulse: 0xff5a7a, white: 0xf4f7ff, ink: 0x0a0f1f, amber: 0xffc94a };
+const clamp = (x, a, b) => Math.min(b, Math.max(a, x));
+const damp = (c, t, k, dt) => c + (t - c) * (1 - Math.exp(-k * dt));
+const ease = x => x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2;
+const easeOutBack = x => 1 + 2.2 * Math.pow(x - 1, 3) + 1.2 * Math.pow(x - 1, 2);
+
+/* ---------- renderer ---------- */
+const stage = document.getElementById('stage');
+const canvas = document.getElementById('gl');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.outputEncoding = THREE.sRGBEncoding;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.05;
+renderer.setClearColor(0x000000, 0);
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(30, 1, 0.1, 50);
+camera.position.set(0, 0.15, 6.4);
+
+// tiny studio environment so clearcoat and metal have something to reflect
+const pmrem = new THREE.PMREMGenerator(renderer);
+const env = new THREE.Scene();
+env.add(new THREE.Mesh(new THREE.BoxGeometry(10, 10, 10), new THREE.MeshBasicMaterial({ color: 0x0b1226, side: THREE.BackSide })));
+const panel = (c, i, p, s) => {
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(s[0], s[1]),
+    new THREE.MeshBasicMaterial({ color: new THREE.Color(c).multiplyScalar(i), side: THREE.DoubleSide }));
+  m.position.set(...p); m.lookAt(0, 0, 0); env.add(m);
+};
+panel(0xffffff, 3, [0, 4, 2], [5, 2]);
+panel(COL.scrub, 2.2, [-4.5, 0.5, -1], [2, 5]);
+panel(COL.pulse, 2, [4.5, -0.5, -1], [2, 5]);
+panel(0xffffff, 1.2, [0, 0, 4.8], [4, 3]);
+scene.environment = pmrem.fromScene(env, 0.03).texture;
+
+scene.add(new THREE.HemisphereLight(0xcfe0ff, 0x1a1030, 0.6));
+const key = new THREE.DirectionalLight(0xffffff, 1.3); key.position.set(2.5, 3.5, 4); scene.add(key);
+const rimA = new THREE.DirectionalLight(COL.scrub, 1.6); rimA.position.set(-4, 1.5, -3); scene.add(rimA);
+const rimB = new THREE.DirectionalLight(COL.pulse, 1.1); rimB.position.set(4, -1, -3); scene.add(rimB);
+
+/* ---------- the face: shared by every variant, it is the brand constant ---------- */
+function makeFace(w, style) {
+  const cv = document.createElement('canvas'); cv.width = 512; cv.height = 320;
+  const tex = new THREE.CanvasTexture(cv); tex.encoding = THREE.sRGBEncoding; tex.anisotropy = 4;
+  const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthWrite: false, depthTest: false, toneMapped: false });
+  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(w, w * 320 / 512), mat);
+  mesh.renderOrder = 10;
+  return { mesh, ctx: cv.getContext('2d'), tex, style };
+}
+function drawFace(face, f) {
+  const { ctx, style: s } = face;
+  ctx.clearRect(0, 0, 512, 320);
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  const L = [176, 128], R = [336, 128], r = 68;
+  // nerd glasses
+  ctx.fillStyle = s.lens;
+  for (const [x, y] of [L, R]) { ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill(); }
+  ctx.strokeStyle = s.frame; ctx.lineWidth = 11;
+  for (const [x, y] of [L, R]) { ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.stroke(); }
+  ctx.beginPath(); ctx.moveTo(L[0] + r - 2, 120); ctx.quadraticCurveTo(256, 100, R[0] - r + 2, 120); ctx.stroke();
+  // eyes
+  ctx.fillStyle = s.eye; ctx.strokeStyle = s.eye; ctx.lineWidth = 12;
+  [L, R].forEach(([x, y], i) => {
+    const ex = x + f.gx * 22, ey = y - f.gy * 18;
+    ctx.beginPath();
+    if (f.mode === 'happy') {
+      ctx.moveTo(ex - 24, ey + 10); ctx.quadraticCurveTo(ex, ey - 28, ex + 24, ey + 10); ctx.stroke();
+    } else if (f.mode === 'distill') {
+      const d = i ? -1 : 1;
+      ctx.moveTo(ex - 16 * d, ey - 20); ctx.lineTo(ex + 14 * d, ey); ctx.lineTo(ex - 16 * d, ey + 20); ctx.stroke();
+    } else if (f.mode === 'bug') {
+      ctx.moveTo(ex - 18, ey - 18); ctx.lineTo(ex + 18, ey + 18); ctx.moveTo(ex + 18, ey - 18); ctx.lineTo(ex - 18, ey + 18); ctx.stroke();
+    } else {
+      const w = 30 * f.eyeScale, h = Math.max(6, 52 * f.eyeScale * f.open);
+      ctx.roundRect(ex - w / 2, ey - h / 2, w, h, w / 2); ctx.fill();
+      if (f.open > 0.5) {
+        ctx.fillStyle = s.glint; ctx.beginPath(); ctx.arc(ex + 5, ey - h * 0.22, 5.5, 0, Math.PI * 2); ctx.fill(); ctx.fillStyle = s.eye;
+      }
+    }
+  });
+  // mouth
+  const mx = 256, my = 262;
+  ctx.beginPath();
+  if (f.mode === 'talk') {
+    ctx.ellipse(mx, my, 20 + 8 * f.mouth, 4 + 17 * f.mouth, 0, 0, Math.PI * 2); ctx.fill();
+  } else if (f.mode === 'happy') {
+    ctx.moveTo(mx - 42, my - 14); ctx.quadraticCurveTo(mx, my + 42, mx + 42, my - 14); ctx.closePath(); ctx.fill();
+  } else if (f.mode === 'think' || f.mode === 'bug') {
+    ctx.lineWidth = 9; ctx.moveTo(mx - 28, my);
+    for (let k = 1; k <= 4; k++) ctx.lineTo(mx - 28 + k * 14, my + (k % 2 ? 7 : -7));
+    ctx.stroke();
+  } else if (f.mode === 'distill') {
+    ctx.lineWidth = 9; ctx.roundRect(mx - 30, my - 10, 60, 20, 8); ctx.stroke();
+    ctx.moveTo(mx - 10, my - 10); ctx.lineTo(mx - 10, my + 10); ctx.moveTo(mx + 10, my - 10); ctx.lineTo(mx + 10, my + 10); ctx.stroke();
+  } else {
+    ctx.lineWidth = 10; ctx.arc(mx, my - 22, 30, 0.22 * Math.PI, 0.78 * Math.PI); ctx.stroke();
+  }
+  face.tex.needsUpdate = true;
+}
+
+function headMirror() {
+  const m = new THREE.Group();
+  const disc = new THREE.Mesh(new THREE.CylinderGeometry(0.27, 0.27, 0.035, 48),
+    new THREE.MeshStandardMaterial({ color: 0xe9eef8, metalness: 1, roughness: 0.12 }));
+  disc.rotation.x = Math.PI / 2; m.add(disc);
+  m.add(new THREE.Mesh(new THREE.TorusGeometry(0.27, 0.03, 12, 48), new THREE.MeshStandardMaterial({ color: 0x2a3557, metalness: 0.4, roughness: 0.4 })));
+  const hole = new THREE.Mesh(new THREE.CircleGeometry(0.05, 24), new THREE.MeshBasicMaterial({ color: COL.ink }));
+  hole.position.z = 0.02; m.add(hole);
+  return m;
+}
+const strapMat = new THREE.MeshStandardMaterial({ color: 0xf4f7ff, roughness: 0.55 });
+
+// SphereGeometry duplicates seam vertices; average their normals so no crease shows
+function smoothNormals(geo) {
+  geo.computeVertexNormals();
+  const p = geo.attributes.position.array, n = geo.attributes.normal.array, groups = new Map();
+  for (let i = 0; i < p.length / 3; i++) {
+    const k = p[3 * i].toFixed(4) + ',' + p[3 * i + 1].toFixed(4) + ',' + p[3 * i + 2].toFixed(4);
+    (groups.get(k) || groups.set(k, []).get(k)).push(i);
+  }
+  for (const ids of groups.values()) {
+    if (ids.length < 2) continue;
+    let x = 0, y = 0, z = 0;
+    for (const i of ids) { x += n[3 * i]; y += n[3 * i + 1]; z += n[3 * i + 2]; }
+    const l = Math.hypot(x, y, z) || 1;
+    for (const i of ids) { n[3 * i] = x / l; n[3 * i + 1] = y / l; n[3 * i + 2] = z / l; }
+  }
+}
+
+/* ---------- A · Dr. Cerveau ---------- */
+function buildBrain() {
+  const group = new THREE.Group();
+  const geo = new THREE.SphereGeometry(1, 180, 130);
+  const a = geo.attributes.position.array, n = a.length / 3;
+  const base = Float32Array.from(a), fold = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const x = a[3 * i], y = a[3 * i + 1], z = a[3 * i + 2];
+    const s = Math.sin(x * 7 + Math.sin(y * 6) * 1.4) + Math.sin(y * 8 + Math.sin(z * 5) * 1.6) + Math.sin(z * 7 + Math.sin(x * 6) * 1.3);
+    let d = -0.07 * Math.exp(-s * s * 5);                                  // sulci
+    d -= 0.2 * Math.exp(-x * x / 0.003) * clamp((y + 0.15) / 0.4, 0, 1);   // the two hemispheres
+    if (y < -0.55) d -= (-0.55 - y) * 0.35;
+    fold[i] = d;
+    a[3 * i] = x * (1 + d); a[3 * i + 1] = y * (1 + d); a[3 * i + 2] = z * (1 + d);
+  }
+  smoothNormals(geo);
+  const mat = new THREE.MeshPhysicalMaterial({
+    color: 0xff8a9c, roughness: 0.42, clearcoat: 0.6, clearcoatRoughness: 0.3,
+    sheen: 0.6, sheenRoughness: 0.5, sheenColor: new THREE.Color(0xffc2cf), emissive: COL.pulse, emissiveIntensity: 0.05
+  });
+  const brain = new THREE.Mesh(geo, mat);
+  brain.scale.set(1.12, 0.92, 1);
+  group.add(brain);
+
+  const band = new THREE.Mesh(new THREE.TorusGeometry(0.93, 0.035, 12, 96), strapMat);
+  band.scale.set(1.12, 1, 1); band.rotation.x = Math.PI / 2 - 0.18; band.position.y = 0.36;
+  group.add(band);
+  const mirror = headMirror(); mirror.position.set(-0.52, 0.66, 0.8); mirror.rotation.set(-0.45, -0.3, 0.15);
+  group.add(mirror);
+
+  const face = makeFace(1.3, { frame: '#f4f7ff', eye: '#0a0f1f', glint: '#ffffff', lens: 'rgba(255,255,255,0.22)' });
+  face.mesh.position.set(0, -0.1, 1.05);
+  group.add(face.mesh);
+
+  return {
+    group, face, scalesWithModel: true,
+    update(t, P) {
+      const w = P.wobble * 0.05, sp = P.speed;
+      for (let i = 0; i < n; i++) {
+        const x = base[3 * i], y = base[3 * i + 1], z = base[3 * i + 2];
+        const k = 1 + fold[i] + w * (Math.sin(x * 3 + t * sp * 1.7) + Math.sin(y * 4 + t * sp * 1.3) + Math.sin(z * 3.5 + t * sp * 2.1)) / 3;
+        a[3 * i] = x * k; a[3 * i + 1] = y * k; a[3 * i + 2] = z * k;
+      }
+      geo.attributes.position.needsUpdate = true;
+      mat.emissiveIntensity = 0.05 + P.glow * 0.35 + P.beat * 0.08;
+    }
+  };
+}
+
+/* ---------- B · La Gélule ---------- */
+function buildPill() {
+  const group = new THREE.Group();
+  const r = 0.66, h = 0.5, pts = [];
+  for (let i = 0; i <= 20; i++) { const q = -Math.PI / 2 + i / 20 * Math.PI / 2; pts.push(new THREE.Vector2(Math.max(1e-4, r * Math.cos(q)), -h + r * Math.sin(q))); }
+  for (const y of [-0.35, -0.2, -0.08, -0.03, -0.018, 0.018, 0.03, 0.08, 0.2, 0.35]) pts.push(new THREE.Vector2(r, y));
+  for (let i = 0; i <= 20; i++) { const q = i / 20 * Math.PI / 2; pts.push(new THREE.Vector2(Math.max(1e-4, r * Math.cos(q)), h + r * Math.sin(q))); }
+  const geo = new THREE.LatheGeometry(pts, 72);
+  const p = geo.attributes.position.array, cols = new Float32Array(p.length);
+  const cTop = new THREE.Color(COL.white), cBot = new THREE.Color(COL.pulse), cSeam = new THREE.Color(0x1a2240);
+  for (let i = 0; i < p.length / 3; i++) {
+    const y = p[3 * i + 1], c = y > 0.025 ? cTop : y < -0.025 ? cBot : cSeam;
+    cols[3 * i] = c.r; cols[3 * i + 1] = c.g; cols[3 * i + 2] = c.b;
+  }
+  geo.setAttribute('color', new THREE.BufferAttribute(cols, 3));
+  const mat = new THREE.MeshPhysicalMaterial({ vertexColors: true, roughness: 0.25, clearcoat: 1, clearcoatRoughness: 0.08, emissive: COL.scrub, emissiveIntensity: 0 });
+  group.add(new THREE.Mesh(geo, mat));
+
+  const crossMat = new THREE.MeshStandardMaterial({ color: COL.white, roughness: 0.3 });
+  const c1 = new THREE.Mesh(new THREE.BoxGeometry(0.24, 0.075, 0.05), crossMat);
+  const c2 = new THREE.Mesh(new THREE.BoxGeometry(0.075, 0.24, 0.05), crossMat);
+  c1.position.set(0, -0.42, 0.65); c2.position.copy(c1.position); group.add(c1, c2);
+
+  const band = new THREE.Mesh(new THREE.TorusGeometry(0.63, 0.03, 12, 96), strapMat);
+  band.rotation.x = Math.PI / 2; band.position.y = 0.76; group.add(band);
+  const mirror = headMirror(); mirror.scale.setScalar(0.75); mirror.position.set(-0.32, 0.98, 0.46); mirror.rotation.set(-0.6, -0.25, 0.2);
+  group.add(mirror);
+
+  const face = makeFace(1.0, { frame: '#0a0f1f', eye: '#0a0f1f', glint: '#ffffff', lens: 'rgba(57,224,200,0.28)' });
+  face.mesh.position.set(0, 0.3, 0.69);
+  group.add(face.mesh);
+  group.rotation.z = -0.06;
+
+  return {
+    group, face, scalesWithModel: true,
+    update(t, P) { mat.emissiveIntensity = P.glow * 0.25 + P.beat * 0.04; }
+  };
+}
+
+/* ---------- C · Le Nuage ---------- */
+function dotTexture() {
+  const cv = document.createElement('canvas'); cv.width = cv.height = 64;
+  const g = cv.getContext('2d'), gr = g.createRadialGradient(32, 32, 0, 32, 32, 32);
+  gr.addColorStop(0, 'rgba(255,255,255,1)'); gr.addColorStop(0.35, 'rgba(255,255,255,0.55)'); gr.addColorStop(1, 'rgba(255,255,255,0)');
+  g.fillStyle = gr; g.fillRect(0, 0, 64, 64);
+  const t = new THREE.CanvasTexture(cv); t.encoding = THREE.sRGBEncoding; return t;
+}
+function buildCloud() {
+  const group = new THREE.Group(), N = 7000;
+  const dir = new Float32Array(N * 3), rad = new Float32Array(N), seed = new Float32Array(N);
+  const pos = new Float32Array(N * 3), col = new Float32Array(N * 3);
+  const cA = new THREE.Color(COL.scrub), cB = new THREE.Color(COL.pulse), cW = new THREE.Color(COL.white), tmp = new THREE.Color();
+  for (let i = 0; i < N; i++) {
+    let x, y, z, l;
+    do { x = Math.random() * 2 - 1; y = Math.random() * 2 - 1; z = Math.random() * 2 - 1; l = x * x + y * y + z * z; } while (l > 1 || l < 1e-4);
+    l = Math.sqrt(l); dir[3 * i] = x / l; dir[3 * i + 1] = y / l; dir[3 * i + 2] = z / l;
+    rad[i] = Math.pow(Math.random(), 0.5); seed[i] = Math.random() * Math.PI * 2;
+    tmp.copy(cA).lerp(cB, clamp(rad[i] * Math.random() * 1.6, 0, 1));
+    if (Math.random() < 0.08) tmp.copy(cW);
+    col[3 * i] = tmp.r; col[3 * i + 1] = tmp.g; col[3 * i + 2] = tmp.b;
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  const dot = dotTexture();
+  const mat = new THREE.PointsMaterial({ size: 0.05, map: dot, vertexColors: true, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, toneMapped: false });
+  group.add(new THREE.Points(geo, mat));
+
+  const core = new THREE.Mesh(new THREE.SphereGeometry(1, 48, 32), new THREE.MeshBasicMaterial({ color: 0xe8fffb, toneMapped: false }));
+  const halo = new THREE.Sprite(new THREE.SpriteMaterial({ map: dot, color: COL.scrub, blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false }));
+  group.add(core, halo);
+
+  const face = makeFace(1.15, { frame: '#39e0c8', eye: '#f4f7ff', glint: '#0a0f1f', lens: 'rgba(10,15,31,0.6)' });
+  face.mesh.position.set(0, 0.05, 0.3);
+  group.add(face.mesh);
+
+  return {
+    group, face, scalesWithModel: false,
+    update(t, P) {
+      const spread = P.spread * (0.28 + 0.72 * P.sizeK) * (1 + P.beat * 0.03);
+      for (let i = 0; i < N; i++) {
+        const q = seed[i] + t * P.speed * (0.25 + 0.6 * (1 - rad[i])), c = Math.cos(q), s = Math.sin(q);
+        const dx = dir[3 * i], dy = dir[3 * i + 1], dz = dir[3 * i + 2];
+        const rr = rad[i] * spread * (1 + 0.07 * P.wobble * Math.sin(t * 2.3 + seed[i] * 3));
+        pos[3 * i] = (dx * c - dz * s) * rr; pos[3 * i + 1] = dy * rr; pos[3 * i + 2] = (dx * s + dz * c) * rr;
+      }
+      geo.attributes.position.needsUpdate = true;
+      const k = 1 - P.sizeK;
+      core.scale.setScalar(0.05 + k * 0.24 + P.beat * 0.02);
+      halo.scale.setScalar(0.6 + k * 1.6 + P.glow * 0.5);
+      halo.material.opacity = 0.35 + k * 0.4;
+      mat.size = 0.045 + k * 0.02;
+      face.mesh.scale.setScalar(0.62 + 0.38 * P.sizeK);
+    }
+  };
+}
+
+const VARIANTS = [
+  { key: 'Piste A', name: 'Dr. Cerveau', desc: "Un cerveau à lunettes avec un miroir frontal de médecin. Le jeu de mots Lobbot / lobotomie se comprend en une seconde. C'est la piste la plus drôle.", v: buildBrain() },
+  { key: 'Piste B', name: 'La Gélule', desc: "Une capsule moitié blanche, moitié corail, avec une croix médicale. Le SLM, c'est la petite dose qui suffit. La plus simple à décliner en icône d'app.", v: buildPill() },
+  { key: 'Piste C', name: 'Le Nuage', desc: "Des milliers de particules forment le gros modèle. À la distillation, elles se condensent en un noyau brillant. La plus tech.", v: buildCloud() },
+];
+VARIANTS.forEach(({ v }) => scene.add(v.group));
+
+/* ---------- state ---------- */
+const TARGET = {
+  idle:    { wobble: 0.35, speed: 0.8, spread: 1.45, eyeScale: 1,    glow: 0 },
+  listen:  { wobble: 0.25, speed: 0.9, spread: 1.35, eyeScale: 1.18, glow: 0.15 },
+  think:   { wobble: 1,    speed: 3.2, spread: 1.6,  eyeScale: 0.85, glow: 0.35 },
+  talk:    { wobble: 0.5,  speed: 1.6, spread: 1.45, eyeScale: 1,    glow: 0.25 },
+  distill: { wobble: 0.9,  speed: 4,   spread: 1.45, eyeScale: 1,    glow: 1 },
+  happy:   { wobble: 0.45, speed: 1.8, spread: 1.4,  eyeScale: 1,    glow: 0.4 },
+  bug:     { wobble: 0.2,  speed: 0.5, spread: 1.55, eyeScale: 1,    glow: 0 },
+};
+const BPM = { idle: 72, listen: 86, think: 124, talk: 98, distill: 168, happy: 112, bug: 54 };
+const LABEL = { idle: 'Repos', listen: 'Écoute', think: 'Réflexion', talk: 'Réponse', distill: 'Distillation', happy: 'Content', bug: 'Bug' };
+const AUTO = [['idle', 3.2], ['listen', 2.6], ['think', 3.2], ['talk', 3.6], ['distill', 0], ['happy', 2.4]];
+const DISTILL_TIME = 4.2;
+
+const P = { ...TARGET.idle, sizeK: 1, beat: 0, kick: 0 };
+let current = 0, switchT = -10, state = 'idle', stateT = 0, auto = true, autoIdx = 0, distilled = false, distillP = 0, pokeT = 0;
+const gaze = { x: 0, y: 0 }, pointer = { x: 0, y: 0, last: -10 };
+let blinkStart = -1, nextBlink = 1.5, mouth = 0, t = 0;
+
+const stateBtns = [...document.querySelectorAll('[data-s]')];
+const autoBtn = document.getElementById('auto');
+function setState(s, manual) {
+  if (manual && auto) { auto = false; autoBtn.setAttribute('aria-pressed', 'false'); }
+  if (s === 'distill') { distilled = false; P.sizeK = 1; distillP = 0; }
+  state = s; stateT = 0;
+  stateBtns.forEach(b => b.setAttribute('aria-pressed', String(b.dataset.s === s)));
+}
+function setVariant(i) {
+  current = i; switchT = t;
+  VARIANTS.forEach((o, j) => o.v.group.visible = j === i);
+  document.querySelectorAll('[data-v]').forEach(b => b.setAttribute('aria-pressed', String(+b.dataset.v === i)));
+  document.getElementById('vKey').textContent = VARIANTS[i].key;
+  document.getElementById('vName').textContent = VARIANTS[i].name;
+  document.getElementById('vDesc').textContent = VARIANTS[i].desc;
+}
+document.querySelectorAll('[data-v]').forEach(b => b.addEventListener('click', () => setVariant(+b.dataset.v)));
+stateBtns.forEach(b => b.addEventListener('click', () => setState(b.dataset.s, true)));
+autoBtn.addEventListener('click', () => {
+  auto = !auto; autoBtn.setAttribute('aria-pressed', String(auto));
+  if (auto) { autoIdx = 0; distilled = false; setState('idle'); }
+});
+addEventListener('keydown', e => {
+  const i = +e.key;
+  if (i >= 1 && i <= 6) setState(stateBtns[i - 1].dataset.s, true);
+  if (e.key === 'ArrowRight') setVariant((current + 1) % 3);
+  if (e.key === 'ArrowLeft') setVariant((current + 2) % 3);
+});
+addEventListener('pointermove', e => {
+  const r = stage.getBoundingClientRect();
+  pointer.x = clamp(((e.clientX - r.left) / r.width) * 2 - 1, -1.2, 1.2);
+  pointer.y = clamp(-(((e.clientY - r.top) / r.height) * 2 - 1), -1.2, 1.2);
+  pointer.last = t;
+});
+canvas.addEventListener('pointerdown', () => { pokeT = 1.1; P.kick = 1; });
+
+/* ---------- ECG monitor ---------- */
+const ecgCv = document.getElementById('ecg'), ecg = ecgCv.getContext('2d');
+let trace = new Float32Array(1), head = 0, phase = 0, pxAcc = 0, bpm = 72, dpr = 1;
+const gauss = (x, m, s, a) => a * Math.exp(-(((x - m) / s) ** 2));
+const wave = f => gauss(f, 0.1, 0.025, 0.12) + gauss(f, 0.22, 0.008, -0.12) + gauss(f, 0.25, 0.01, 1) + gauss(f, 0.28, 0.01, -0.28) + gauss(f, 0.46, 0.04, 0.25);
+function ecgStep(dt, mode) {
+  bpm = damp(bpm, BPM[mode], 2.5, dt);
+  const pps = 130 * dpr;
+  pxAcc += dt * pps;
+  const n = Math.floor(pxAcc); pxAcc -= n;
+  for (let k = 0; k < n; k++) {
+    let rate = bpm / 60;
+    if (mode === 'bug') rate *= Math.sin(phase * 3.1) > 0.3 ? 1.7 : 0.6;
+    phase += rate / pps;
+    let v = wave(phase % 1);
+    if (mode === 'bug') v += (Math.random() - 0.5) * 0.09;
+    trace[head] = v; head = (head + 1) % trace.length;
+  }
+  P.beat = Math.exp(-((((phase % 1) - 0.27) / 0.06) ** 2));
+  const W = ecgCv.width, H = ecgCv.height;
+  ecg.clearRect(0, 0, W, H);
+  ecg.strokeStyle = 'rgba(139,151,196,0.09)'; ecg.lineWidth = 1;
+  ecg.beginPath();
+  for (let x = 0; x < W; x += 18 * dpr) { ecg.moveTo(x, 0); ecg.lineTo(x, H); }
+  for (let y = 0; y < H; y += 18 * dpr) { ecg.moveTo(0, y); ecg.lineTo(W, y); }
+  ecg.stroke();
+  const color = mode === 'bug' ? '#ff5a7a' : mode === 'distill' ? '#ffc94a' : '#39e0c8';
+  ecg.strokeStyle = color; ecg.lineWidth = 2 * dpr; ecg.shadowColor = color; ecg.shadowBlur = 8 * dpr;
+  ecg.beginPath();
+  const L = trace.length, mid = H * 0.62, amp = H * 0.48;
+  for (let x = 0; x < L; x++) { const y = mid - trace[(head + x) % L] * amp; x ? ecg.lineTo(x, y) : ecg.moveTo(x, y); }
+  ecg.stroke();
+  const ly = mid - trace[(head + L - 1) % L] * amp;
+  ecg.fillStyle = '#ffffff'; ecg.beginPath(); ecg.arc(L - 3 * dpr, ly, 3 * dpr, 0, Math.PI * 2); ecg.fill();
+  ecg.shadowBlur = 0;
+}
+
+/* ---------- sizing ---------- */
+function resize() {
+  const w = stage.clientWidth, h = stage.clientHeight;
+  renderer.setSize(w, h, false);
+  camera.aspect = w / h;
+  camera.position.z = w / h < 0.9 ? 8.2 : 6.4;
+  camera.updateProjectionMatrix();
+  dpr = Math.min(devicePixelRatio, 2);
+  const ew = Math.max(1, Math.round(ecgCv.clientWidth * dpr)), eh = Math.max(1, Math.round(ecgCv.clientHeight * dpr));
+  if (ew !== ecgCv.width || eh !== ecgCv.height) {
+    ecgCv.width = ew; ecgCv.height = eh;
+    trace = new Float32Array(ew); head = 0;
+  }
+}
+new ResizeObserver(resize).observe(stage);
+new ResizeObserver(resize).observe(ecgCv);
+resize();
+
+/* ---------- loop ---------- */
+const vState = document.getElementById('vState'), vBpm = document.getElementById('vBpm'), vParams = document.getElementById('vParams');
+let uiT = 0, last = performance.now();
+setVariant(0); setState('idle');
+
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000); last = now; t += dt; stateT += dt;
+
+  // state machine
+  if (state === 'distill') {
+    distillP = Math.min(1, stateT / DISTILL_TIME);
+    P.sizeK = 1 - ease(distillP);
+    if (distillP >= 1) { distilled = true; setState('happy'); if (auto) autoIdx = AUTO.findIndex(s => s[0] === 'happy'); }
+  } else {
+    P.sizeK = damp(P.sizeK, distilled ? 0 : 1, 2.2, dt);
+  }
+  if (auto && state !== 'distill' && stateT > AUTO[autoIdx][1]) {
+    autoIdx = (autoIdx + 1) % AUTO.length;
+    if (AUTO[autoIdx][0] === 'idle') distilled = false;
+    setState(AUTO[autoIdx][0]);
+  }
+  if (!auto && state === 'happy' && stateT > 2.4) setState('idle');
+  pokeT = Math.max(0, pokeT - dt);
+  const mode = pokeT > 0 && state !== 'distill' ? 'happy' : state;
+
+  // smoothed params
+  const T = TARGET[mode];
+  for (const k in T) P[k] = damp(P[k], T[k], 3, dt);
+  P.kick = damp(P.kick, 0, 7, dt);
+
+  // gaze: pointer if recent, else wander; thinking looks up and away
+  let gx, gy;
+  if (mode === 'think') { gx = 0.65; gy = 0.75; }
+  else if (t - pointer.last < 2.5) { gx = pointer.x; gy = pointer.y; }
+  else { gx = Math.sin(t * 0.37) * 0.55; gy = Math.sin(t * 0.53) * 0.3; }
+  gaze.x = damp(gaze.x, clamp(gx, -1, 1), 6, dt); gaze.y = damp(gaze.y, clamp(gy, -1, 1), 6, dt);
+
+  if (t > nextBlink) { blinkStart = t; nextBlink = t + 2 + Math.random() * 3.5; }
+  const open = t - blinkStart < 0.16 ? 1 - Math.sin(Math.PI * (t - blinkStart) / 0.16) : 1;
+  const talkRaw = (Math.sin(t * 13) + Math.sin(t * 7.3 + 1) * 0.6 + Math.sin(t * 21) * 0.3) * 0.45 + 0.45;
+  mouth = damp(mouth, mode === 'talk' && Math.sin(t * 1.7) > -0.6 ? clamp(talkRaw, 0, 1) : 0, 18, dt);
+
+  ecgStep(dt, mode);
+
+  // body motion shared by all variants
+  const o = VARIANTS[current].v, g = o.group;
+  const pop = easeOutBack(clamp((t - switchT) / 0.55, 0, 1));
+  let hop = 0, sq = Math.sin(t * 1.6) * 0.015 + P.beat * 0.02 - P.kick * 0.18, shake = 0, tilt = 0;
+  if (mode === 'happy') { const b = Math.abs(Math.sin(t * 6.5)); hop = b * 0.22; sq += b < 0.3 ? -(0.3 - b) * 0.3 : 0.03; }
+  if (mode === 'talk') sq += mouth * 0.04;
+  if (mode === 'think') tilt = Math.sin(t * 2.6) * 0.1;
+  if (mode === 'listen') tilt = 0.12;
+  if (mode === 'bug') shake = Math.sin(t * 55) * 0.025;
+  if (mode === 'distill') { shake = Math.sin(t * 40) * 0.012; sq -= 0.05 * Math.sin(t * 9); }
+  sq *= MOTION;
+  const size = (o.scalesWithModel ? 0.66 + 0.34 * P.sizeK : 1) * pop;
+  const side = 1 / Math.sqrt(1 + sq);
+  g.scale.set(side * size, (1 + sq) * size, side * size);
+  g.position.set(shake * MOTION, (hop + Math.sin(t * 1.1) * 0.04) * MOTION - 0.05, 0);
+  g.rotation.y = damp(g.rotation.y, gaze.x * 0.35, 5, dt);
+  g.rotation.x = damp(g.rotation.x, -gaze.y * 0.2, 5, dt);
+  g.rotation.z = damp(g.rotation.z, tilt * MOTION + (current === 1 ? -0.06 : 0), 5, dt);
+
+  o.update(t, P);
+  drawFace(o.face, { mode, gx: gaze.x, gy: gaze.y, open, mouth, eyeScale: P.eyeScale });
+  renderer.render(scene, camera);
+
+  uiT -= dt;
+  if (uiT <= 0) {
+    uiT = 0.1;
+    vState.textContent = LABEL[mode];
+    vBpm.textContent = Math.round(bpm);
+    const b = state === 'distill' ? 70 * Math.pow(3 / 70, ease(distillP)) : distilled ? 3 : 70;
+    vParams.textContent = (b >= 10 ? b.toFixed(0) : b.toFixed(1)) + 'B';
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+})();
+</script>

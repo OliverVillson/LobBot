@@ -1,0 +1,44 @@
+{
+  "incision": {
+    "text/canvas": 13.6,
+    "secondary/canvas": 5.85,
+    "text/surface": 14.84,
+    "secondary/surface": 6.38,
+    "action/accent": 4.7
+  },
+  "sauge": {
+    "text/canvas": 10.51,
+    "secondary/canvas": 5.6,
+    "text/surface": 11.33,
+    "secondary/surface": 6.03,
+    "action/accent": 7.12
+  },
+  "anatomie": {
+    "text/canvas": 9.41,
+    "secondary/canvas": 5.02,
+    "text/surface": 10.48,
+    "secondary/surface": 5.59,
+    "action/accent": 6.32
+  },
+  "cobalt": {
+    "text/canvas": 11.43,
+    "secondary/canvas": 5.21,
+    "text/surface": 12.49,
+    "secondary/surface": 5.69,
+    "action/accent": 6.19
+  },
+  "soufre": {
+    "text/canvas": 13.59,
+    "secondary/canvas": 8.42,
+    "text/surface": 11.62,
+    "secondary/surface": 7.19,
+    "action/accent": 10.87
+  },
+  "archive": {
+    "text/canvas": 11.91,
+    "secondary/canvas": 4.9,
+    "text/surface": 13.14,
+    "secondary/surface": 5.41,
+    "action/accent": 13.14
+  }
+}

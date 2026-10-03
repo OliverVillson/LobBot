@@ -1,0 +1,300 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		095385EB2CABC16E181F0A7F /* Voice.swift in Sources */ = {isa = PBXBuildFile; fileRef = AF5B965B3A2F5D341B3E15DE /* Voice.swift */; };
+		2E7FB86E0707FE515A61464B /* Session.swift in Sources */ = {isa = PBXBuildFile; fileRef = 94583473ED68E2065C55C880 /* Session.swift */; };
+		337CB4D465B37C77EC3183FC /* Home.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1E100043DDC93A430E47E4C /* Home.swift */; };
+		649DFD0E07FC9678E5EFB5C4 /* Resources/Lobbot in Resources */ = {isa = PBXBuildFile; fileRef = 52135B2EE38173F46DBE27A9 /* Resources/Lobbot */; };
+		6FD829034C9963A3897DAC2F /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9727B9EED8ACD2EE46E136A0 /* ContentView.swift */; };
+		7CD17DE1709CC0BA36C6CA8B /* Brand.swift in Sources */ = {isa = PBXBuildFile; fileRef = 752897D9A13A58E5E2FA0546 /* Brand.swift */; };
+		A7437BD9A973D91C2113CE93 /* VoiceViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9C3904711B84790B82ADE1C0 /* VoiceViews.swift */; };
+		B1202C7A8238826DC782F5A0 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 28AAD1477D5182D66D4B03B3 /* Assets.xcassets */; };
+		B5A634C5C860894B2F4ADB2D /* Panels.swift in Sources */ = {isa = PBXBuildFile; fileRef = EF76CC90B6C0B5DF7D62A1F8 /* Panels.swift */; };
+		D6D13A5C48924901077700F5 /* LOBBOTApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 99EFABBA8C2106647C9A3585 /* LOBBOTApp.swift */; };
+		E7B9F3AD66B2B9E212C3A986 /* MascotStage.swift in Sources */ = {isa = PBXBuildFile; fileRef = F4F84BDE12D5CAF6BEB1A793 /* MascotStage.swift */; };
+		F1A71070C063F1AE4C710DF9 /* LobbotController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 27BEE40685FA498B37F04FF3 /* LobbotController.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		27BEE40685FA498B37F04FF3 /* LobbotController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LobbotController.swift; sourceTree = "<group>"; };
+		28AAD1477D5182D66D4B03B3 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		52135B2EE38173F46DBE27A9 /* Resources/Lobbot */ = {isa = PBXFileReference; lastKnownFileType = folder; path = Resources/Lobbot; sourceTree = "<group>"; };
+		752897D9A13A58E5E2FA0546 /* Brand.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Brand.swift; sourceTree = "<group>"; };
+		8BFC49CBA8E4154C74BCD2F1 /* Secrets.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Secrets.xcconfig; sourceTree = "<group>"; };
+		94583473ED68E2065C55C880 /* Session.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Session.swift; sourceTree = "<group>"; };
+		9727B9EED8ACD2EE46E136A0 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		99EFABBA8C2106647C9A3585 /* LOBBOTApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LOBBOTApp.swift; sourceTree = "<group>"; };
+		9C3904711B84790B82ADE1C0 /* VoiceViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceViews.swift; sourceTree = "<group>"; };
+		AF5B965B3A2F5D341B3E15DE /* Voice.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Voice.swift; sourceTree = "<group>"; };
+		BAAD4785144D177D1D31B892 /* LOBBOT.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = LOBBOT.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		EF76CC90B6C0B5DF7D62A1F8 /* Panels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Panels.swift; sourceTree = "<group>"; };
+		F1E100043DDC93A430E47E4C /* Home.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Home.swift; sourceTree = "<group>"; };
+		F4F84BDE12D5CAF6BEB1A793 /* MascotStage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MascotStage.swift; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		AF39DD055C3EF8226FBE929D /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		179F2225059AAC9EC2BB31FD = {
+			isa = PBXGroup;
+			children = (
+				8BFC49CBA8E4154C74BCD2F1 /* Secrets.xcconfig */,
+				C1ACA8F1F63B9C297AB16C13 /* LOBBOT */,
+				FE0A091FDBFB3E9C31B7A1BD /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		C1ACA8F1F63B9C297AB16C13 /* LOBBOT */ = {
+			isa = PBXGroup;
+			children = (
+				752897D9A13A58E5E2FA0546 /* Brand.swift */,
+				9727B9EED8ACD2EE46E136A0 /* ContentView.swift */,
+				F1E100043DDC93A430E47E4C /* Home.swift */,
+				99EFABBA8C2106647C9A3585 /* LOBBOTApp.swift */,
+				27BEE40685FA498B37F04FF3 /* LobbotController.swift */,
+				F4F84BDE12D5CAF6BEB1A793 /* MascotStage.swift */,
+				EF76CC90B6C0B5DF7D62A1F8 /* Panels.swift */,
+				94583473ED68E2065C55C880 /* Session.swift */,
+				AF5B965B3A2F5D341B3E15DE /* Voice.swift */,
+				9C3904711B84790B82ADE1C0 /* VoiceViews.swift */,
+				28AAD1477D5182D66D4B03B3 /* Assets.xcassets */,
+				52135B2EE38173F46DBE27A9 /* Resources/Lobbot */,
+			);
+			path = LOBBOT;
+			sourceTree = "<group>";
+		};
+		FE0A091FDBFB3E9C31B7A1BD /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				BAAD4785144D177D1D31B892 /* LOBBOT.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		410B3CBA881130867F723A55 /* LOBBOT */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 3E8A7042EBD75B68F004994B /* Build configuration list for PBXNativeTarget "LOBBOT" */;
+			buildPhases = (
+				2EB56BE3C2D93CDAB0C52E67 /* Sources */,
+				AF39DD055C3EF8226FBE929D /* Frameworks */,
+				87DF60DE337FB58864343E39 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = LOBBOT;
+			productName = LOBBOT;
+			productReference = BAAD4785144D177D1D31B892 /* LOBBOT.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		A2C37EF125A7E9061C28E18E /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 2600;
+				LastUpgradeCheck = 2600;
+				TargetAttributes = {
+					410B3CBA881130867F723A55 = {
+						CreatedOnToolsVersion = 26.0;
+						ProvisioningStyle = Automatic;
+					};
+				};
+			};
+			buildConfigurationList = 92F4B9123774855BF9717117 /* Build configuration list for PBXProject "LOBBOT" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = fr;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				fr,
+				en,
+				Base,
+			);
+			mainGroup = 179F2225059AAC9EC2BB31FD;
+			productRefGroup = FE0A091FDBFB3E9C31B7A1BD /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				410B3CBA881130867F723A55 /* LOBBOT */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		87DF60DE337FB58864343E39 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				B1202C7A8238826DC782F5A0 /* Assets.xcassets in Resources */,
+				649DFD0E07FC9678E5EFB5C4 /* Resources/Lobbot in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		2EB56BE3C2D93CDAB0C52E67 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				7CD17DE1709CC0BA36C6CA8B /* Brand.swift in Sources */,
+				6FD829034C9963A3897DAC2F /* ContentView.swift in Sources */,
+				337CB4D465B37C77EC3183FC /* Home.swift in Sources */,
+				D6D13A5C48924901077700F5 /* LOBBOTApp.swift in Sources */,
+				F1A71070C063F1AE4C710DF9 /* LobbotController.swift in Sources */,
+				E7B9F3AD66B2B9E212C3A986 /* MascotStage.swift in Sources */,
+				B5A634C5C860894B2F4ADB2D /* Panels.swift in Sources */,
+				2E7FB86E0707FE515A61464B /* Session.swift in Sources */,
+				095385EB2CABC16E181F0A7F /* Voice.swift in Sources */,
+				A7437BD9A973D91C2113CE93 /* VoiceViews.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		0EBCCE7E849217E0F38EE944 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = 8BFC49CBA8E4154C74BCD2F1 /* Secrets.xcconfig */;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 5UGGKCK7FS;
+				ENABLE_PREVIEWS = YES;
+				EXECUTABLE_NAME = LobbotApp;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = LOBBOT/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = LOBBOT;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Dr. Lobbot listens when you talk to him.";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations = UIInterfaceOrientationPortrait;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = dev.lobbot.prototype;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Debug;
+		};
+		24B7DFA423B1C8A2130AE03E /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				SDKROOT = iphoneos;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_STRICT_CONCURRENCY = complete;
+				SWIFT_VERSION = 6.0;
+			};
+			name = Release;
+		};
+		40609A412964FFB79DAE9C3A /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_STRICT_CONCURRENCY = complete;
+				SWIFT_VERSION = 6.0;
+			};
+			name = Debug;
+		};
+		7991A9F77295B3B6F9BF6599 /* Release */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = 8BFC49CBA8E4154C74BCD2F1 /* Secrets.xcconfig */;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 5UGGKCK7FS;
+				ENABLE_PREVIEWS = YES;
+				EXECUTABLE_NAME = LobbotApp;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = LOBBOT/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = LOBBOT;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Dr. Lobbot listens when you talk to him.";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations = UIInterfaceOrientationPortrait;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = dev.lobbot.prototype;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		3E8A7042EBD75B68F004994B /* Build configuration list for PBXNativeTarget "LOBBOT" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				0EBCCE7E849217E0F38EE944 /* Debug */,
+				7991A9F77295B3B6F9BF6599 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		92F4B9123774855BF9717117 /* Build configuration list for PBXProject "LOBBOT" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				40609A412964FFB79DAE9C3A /* Debug */,
+				24B7DFA423B1C8A2130AE03E /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = A2C37EF125A7E9061C28E18E /* Project object */;
+}

@@ -1,0 +1,12 @@
+{
+  "id": "cobalt",
+  "name": "Cobalt",
+  "note": "Bleu franc · instrumentation et rigueur",
+  "canvas": "#EDF1F2",
+  "surface": "#F8FBFB",
+  "ink": "#173446",
+  "secondary": "#526773",
+  "line": "#C0D0D7",
+  "accent": "#305AC5",
+  "onaccent": "#FFFFFF"
+}
