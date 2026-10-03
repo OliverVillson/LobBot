@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LobBot Site Picker</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+  :root { --bg: #f6f7f4; --fg: #1d2318; --muted: #5f6858; --line: #d5d9cf; --accent: #3d7a2a; --card: #fff; --err: #a3271d; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #161a14; --fg: #e5e9df; --muted: #9aa392; --line: #333a2e; --accent: #7cc25f; --card: #1f241c; --err: #ff8a7a; }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg);
+    font: 15px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  #app { display: flex; flex-direction: column; height: 100%; }
+  #map { flex: 1 1 55%; min-height: 280px; }
+  #panel { flex: 1 1 45%; overflow-y: auto; padding: 12px 16px 24px; border-top: 1px solid var(--line); }
+  @media (min-width: 900px) {
+    #app { flex-direction: row; }
+    #map { flex: 1 1 auto; }
+    #panel { flex: 0 0 380px; border-top: 0; border-left: 1px solid var(--line); }
+  }
+  h1 { font-size: 18px; margin: 0 0 8px; }
+  h2 { font-size: 15px; margin: 18px 0 6px; }
+  label { display: block; margin: 8px 0 2px; color: var(--muted); font-size: 13px; }
+  input, select, button { font: inherit; width: 100%; padding: 8px 10px; border-radius: 6px;
+    border: 1px solid var(--line); background: var(--card); color: var(--fg); }
+  input[type=range] { padding: 0; }
+  button { background: var(--accent); color: #fff; border: 0; margin-top: 12px; cursor: pointer; font-weight: 600; }
+  button:disabled { opacity: .5; cursor: default; }
+  .row { display: flex; gap: 8px; } .row > * { flex: 1; }
+  .muted { color: var(--muted); font-size: 13px; }
+  .err { color: var(--err); white-space: pre-wrap; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 6px; }
+  td { padding: 3px 0; border-bottom: 1px solid var(--line); }
+  td:last-child { text-align: right; font-variant-numeric: tabular-nums; }
+  #preview { width: 100%; border-radius: 6px; margin-top: 8px; display: none; }
+  ul { list-style: none; padding: 0; margin: 0; }
+  li { padding: 6px 0; border-bottom: 1px solid var(--line); cursor: pointer; }
+  li:hover { color: var(--accent); }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="map"></div>
+  <div id="panel">
+    <h1>Pick a field</h1>
+    <div class="muted">Tap the map to place the site square.</div>
+    <label for="token">API token</label>
+    <input id="token" type="password" autocomplete="off" placeholder="Bearer token">
+    <label for="size">Square side: <span id="sizeLabel">300</span> m</label>
+    <input id="size" type="range" min="100" max="1000" step="50" value="300">
+    <label for="name">Name</label>
+    <input id="name" placeholder="optional">
+    <div class="row">
+      <div><label>Lat</label><input id="lat" readonly></div>
+      <div><label>Lon</label><input id="lon" readonly></div>
+    </div>
+    <button id="build" disabled>Build site</button>
+    <div id="status" class="muted"></div>
+
+    <div id="result"></div>
+    <img id="preview" alt="Site preview: orthophoto with hillshade">
+
+    <h2>Sites</h2>
+    <button id="refresh" style="background:transparent;color:var(--accent);border:1px solid var(--line);margin-top:0">Refresh list</button>
+    <ul id="sites"></ul>
+  </div>
+</div>
+<script>
+(function () {
+  const $ = (id) => document.getElementById(id);
+  const store = {
+    get(k) { try { return localStorage.getItem(k) || ""; } catch (e) { return ""; } },
+    set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} },
+  };
+
+  const map = L.map("map").setView([62.0, 16.0], 5);
+  L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    maxZoom: 19, attribution: "&copy; OpenStreetMap contributors",
+  }).addTo(map);
+
+  let point = null, square = null, marker = null;
+  const siteLayer = L.layerGroup().addTo(map);
+
+  $("token").value = store.get("lobbot_token");
+  $("token").addEventListener("change", () => store.set("lobbot_token", $("token").value.trim()));
+  $("size").addEventListener("input", () => { $("sizeLabel").textContent = $("size").value; draw(); });
+
+  function bounds(lat, lon, size) {
+    const dLat = size / 2 / 111320, dLon = size / 2 / (111320 * Math.cos(lat * Math.PI / 180));
+    return [[lat - dLat, lon - dLon], [lat + dLat, lon + dLon]];
+  }
+
+  function draw() {
+    if (!point) return;
+    const b = bounds(point.lat, point.lng, +$("size").value);
+    if (square) square.setBounds(b);
+    else square = L.rectangle(b, { color: "#e0a020", weight: 2, fillOpacity: 0.12 }).addTo(map);
+    if (marker) marker.setLatLng(point);
+    else marker = L.circleMarker(point, { radius: 4, color: "#e0a020" }).addTo(map);
+  }
+
+  map.on("click", (e) => {
+    point = e.latlng;
+    $("lat").value = point.lat.toFixed(5);
+    $("lon").value = point.lng.toFixed(5);
+    $("build").disabled = false;
+    draw();
+  });
+
+  function headers(json) {
+    const h = { Authorization: "Bearer " + $("token").value.trim() };
+    if (json) h["Content-Type"] = "application/json";
+    return h;
+  }
+
+  async function api(path, opts) {
+    const r = await fetch(path, opts);
+    if (!r.ok) {
+      let msg = r.status + " " + r.statusText;
+      try { const j = await r.json(); msg += ": " + (j.detail || JSON.stringify(j)); } catch (e) {}
+      throw new Error(msg);
+    }
+    return r;
+  }
+
+  function esc(s) {
+    return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  }
+
+  const LABELS = {
+    source: "Source", res_m: "Resolution (m/cell)", area_ha: "Area (ha)",
+    elev_min_m: "Elevation min (m)", elev_max_m: "Elevation max (m)", elev_mean_m: "Elevation mean (m)",
+    relief_m: "Relief (m)", slope_mean_deg: "Slope mean (deg)", slope_max_deg: "Slope max (deg)",
+    sun_noon_elev_jun21_deg: "Noon sun, 21 June (deg)", sun_noon_elev_today_deg: "Noon sun, today (deg)",
+  };
+
+  async function show(site) {
+    const s = site.summary || {};
+    let rows = "";
+    for (const k of Object.keys(LABELS)) if (k in s) rows += `<tr><td>${LABELS[k]}</td><td>${esc(s[k])}</td></tr>`;
+    let errs = "";
+    const se = site.source_errors || {};
+    for (const k of Object.keys(se)) errs += `<div class="muted">${esc(k)}: ${esc(se[k])}</div>`;
+    $("result").innerHTML = `<h2>${esc(site.name || site.id)}</h2>
+      <div class="muted">${esc(site.id)} &middot; ${(+site.lat).toFixed(5)}, ${(+site.lon).toFixed(5)} &middot; ${esc(site.size_m)} m</div>
+      <table>${rows}</table>${errs}`;
+    siteLayer.clearLayers();
+    L.rectangle(bounds(site.lat, site.lon, site.size_m), { color: "#3d7a2a", weight: 2, fillOpacity: 0.05 }).addTo(siteLayer);
+    try {
+      const r = await api("./sites/" + encodeURIComponent(site.id) + "/preview", { headers: headers(false) });
+      const url = URL.createObjectURL(await r.blob());
+      const img = $("preview");
+      if (img.dataset.url) URL.revokeObjectURL(img.dataset.url);
+      img.dataset.url = url; img.src = url; img.style.display = "block";
+    } catch (e) {
+      $("preview").style.display = "none";
+      $("result").insertAdjacentHTML("beforeend", `<div class="err">preview: ${esc(e.message)}</div>`);
+    }
+  }
+
+  $("build").addEventListener("click", async () => {
+    if (!point) return;
+    store.set("lobbot_token", $("token").value.trim());
+    $("build").disabled = true;
+    $("status").className = "muted";
+    $("status").textContent = "Building site, this can take a minute...";
+    try {
+      const body = { lat: point.lat, lon: point.lng, size_m: +$("size").value, name: $("name").value.trim() };
+      const r = await api("./sites", { method: "POST", headers: headers(true), body: JSON.stringify(body) });
+      const site = await r.json();
+      $("status").textContent = "Built from " + (site.source || "?") + ".";
+      await show(site);
+      listSites();
+    } catch (e) {
+      $("status").className = "err";
+      $("status").textContent = e.message;
+    } finally {
+      $("build").disabled = false;
+    }
+  });
+
+  async function listSites() {
+    const ul = $("sites");
+    try {
+      const r = await api("./sites", { headers: headers(false) });
+      const sites = await r.json();
+      ul.innerHTML = "";
+      if (!sites.length) ul.innerHTML = '<li class="muted">No sites yet.</li>';
+      for (const s of sites) {
+        const li = document.createElement("li");
+        li.innerHTML = `${esc(s.name || s.id)} <span class="muted">&middot; ${esc(s.size_m)} m &middot; ${esc(s.source)}</span>`;
+        li.addEventListener("click", () => { map.setView([s.lat, s.lon], 15); show(s); });
+        ul.appendChild(li);
+      }
+    } catch (e) {
+      ul.innerHTML = `<li class="err">${esc(e.message)}</li>`;
+    }
+  }
+
+  $("refresh").addEventListener("click", listSites);
+  if ($("token").value) listSites();
+})();
+</script>
+</body>
+</html>

@@ -13,6 +13,8 @@
     lobbot pull                      update the VM checkout
     lobbot chat / ask <model>        talk to a saved model; JSON answers shown as fields
                                      and code, --out DIR writes the files, C is compiled
+    lobbot map                       tunnel to the map picker; lobbot robot run / results
+                                     drive the robot pipeline (docs/robot-mvp.md)
 
 Everything talks to agent/server.py on the VM through an SSH tunnel the CLI
 opens itself; logs and job files are read over the same SSH connection.
@@ -1188,6 +1190,96 @@ def cmd_chat(a) -> None:
         print()
 
 
+# ----------------------------------------------------------------- robot MVP (docs/robot-mvp.md)
+
+ROBOT_FAST = {"n_demos": 10, "finetune_steps": 300, "eval_episodes": 5}
+
+
+def robot_watch(api: Api, job_id: str) -> str:
+    """Print a robot job's progress lines until its run ends; returns the final status."""
+    print(c(f"robot job {job_id}", "1") + c("  (Ctrl-C stops watching; the job keeps running)", "2"))
+    with api._open(api._req("GET", f"/robot-jobs/{job_id}/events"), timeout=600) as r:
+        for raw in r:
+            line = raw.decode().strip()
+            if not line.startswith("data: "):
+                continue
+            e = json.loads(line[6:])
+            pct = f" {e['pct']:>5.1f}%" if "pct" in e else ""
+            print(f"[{time.strftime('%H:%M:%S')}] {e['stage']:<8} {e['status']:<7}{pct} {e.get('msg', '')}", flush=True)
+            if e["stage"] == "pipeline" and e["status"] != "running":
+                return e["status"]
+    return "detached"
+
+
+def cmd_robot_run(a) -> None:
+    from common.robotspec import RobotSpec
+
+    spec = json.loads(Path(a.spec).expanduser().read_text())
+    if a.fast:
+        spec.update(ROBOT_FAST)
+    RobotSpec.from_dict(spec)  # validate before the upload
+    r, _ = connect(a)
+    with r.tunnel() as base:
+        api = Api(base, r.token())
+        try:
+            job_id = api.post("/robot-jobs", spec)["job_id"]
+        except ApiError as e:
+            raise CliError(e.msg) from None
+        ok(f"started robot job {c(job_id, '1')} · {spec['task_name']}" + (" · fast" if a.fast else ""))
+        if a.detach:
+            print(f"Results later with: lobbot robot results {job_id}")
+            return
+        try:
+            status = robot_watch(api, job_id)
+        except KeyboardInterrupt:
+            print(f"\nStopped watching. Results later with: lobbot robot results {job_id}")
+            return
+    if status != "done":
+        sys.exit(1)
+    cmd_robot_results(argparse.Namespace(host=a.host, job=job_id, out=None))
+
+
+def cmd_robot_results(a) -> None:
+    job = check_job_id(a.job)
+    r, _ = connect(a)
+    with r.tunnel() as base:
+        api = Api(base, r.token())
+        ev = api.get(f"/robot-jobs/{job}/eval")
+        if ev.get("dry_run"):
+            warn("DRY RUN: candidates are the scripted expert with noise and lag, not model results")
+        print(c(f"site {ev['site']} · {ev['episodes']} paired episodes", "1"))
+        exp = ev.get("expert") or {}
+        print(f"  {'expert':<10} {'':>8} {exp.get('success_rate', 0):>6.0%}  CTE {exp.get('cte_mean_m', 0):.2f} m")
+        for cand in ev["candidates"]:
+            lat = f"{cand['latency_ms']:.0f} ms" if cand.get("latency_ms") else ""
+            print(f"  {cand['name']:<10} {cand['size_gb']:>6.2f}GB {cand['success_rate']:>6.0%}  "
+                  f"CTE {cand.get('cte_mean_m', 0):.2f} m  {lat:>7}" + ("" if cand.get("fits") else c("  over budget", "33")))
+        out = Path(a.out or f"lobbot-robot-{job}").expanduser()
+        out.mkdir(parents=True, exist_ok=True)
+        for route, name in (("graph", "footprint_vs_performance.png"), ("video", "training.mp4")):
+            try:
+                with api._open(api._req("GET", f"/robot-jobs/{job}/{route}"), timeout=300) as resp, \
+                        (out / name).open("wb") as f:
+                    shutil.copyfileobj(resp, f)
+            except ApiError as e:
+                warn(f"{name}: {e.msg}")
+                continue
+            ok(f"saved {out / name}")
+
+
+def cmd_map(a) -> None:
+    r, s = connect(a)
+    with r.tunnel(port=s.local_port) as base:
+        ok(f"map at {base}/map")
+        print(f"  paste the API token into the page: {r.token()}")
+        print("Leave this running; Ctrl-C closes the tunnel.")
+        try:
+            while True:
+                time.sleep(3600)
+        except KeyboardInterrupt:
+            pass
+
+
 # ----------------------------------------------------------------- argument parsing
 
 def parser() -> argparse.ArgumentParser:
@@ -1311,6 +1403,20 @@ def parser() -> argparse.ArgumentParser:
     sp.add_argument("prompt", nargs="*", help="the question (or - / a pipe to read it from stdin)")
     sp.add_argument("-f", "--file", help="read the question from a file")
     answer_opts(sp)
+
+    sp = add("robot", None, "robot MVP: map pick to farm sim to compressed GR00T (docs/robot-mvp.md)")
+    rsub = sp.add_subparsers(dest="robot_cmd", required=True, metavar="robot-command")
+    rp = rsub.add_parser("run", help="start a robot job from a RobotSpec and watch it")
+    rp.set_defaults(fn=cmd_robot_run)
+    rp.add_argument("spec", help="RobotSpec JSON file (e.g. examples/farm-uppsala.robotspec.json)")
+    rp.add_argument("--fast", action="store_true", help=", ".join(f"{k}={v}" for k, v in ROBOT_FAST.items()))
+    rp.add_argument("-d", "--detach", action="store_true")
+    rp = rsub.add_parser("results", help="show a robot job's eval and save its graph and video")
+    rp.set_defaults(fn=cmd_robot_results)
+    rp.add_argument("job")
+    rp.add_argument("-o", "--out", help="directory for the graph and video (default ./lobbot-robot-<job>)")
+
+    add("map", cmd_map, "open a tunnel and print the URL of the map picker (/map)")
     return p
 
 

@@ -125,6 +125,30 @@ run past ~800 tokens, and `run` warns when they do and `--long` is missing.
 then), or while something else is on the GPU unless you add `--force`, and refuses config keys the VM checkout doesn't know yet.
 The API token lives in `~/.lobbot-token` on the VM (`lobbot token` prints it).
 
+## Robot MVP
+
+A second, separate pipeline for farm automation: pick a field in Sweden on a
+map, build a driving sim from its elevation and orthophoto, record scripted
+demos, fine-tune GR00T N1.7, compress it, and score every candidate in the
+sim. Outputs are `out/training.mp4` and `out/footprint_vs_performance.png`.
+The contract (modules, interfaces, `out/eval.json`) is in
+[docs/robot-mvp.md](docs/robot-mvp.md).
+
+```bash
+mkdir -p /tmp/rjob && cp examples/farm-uppsala.robotspec.json /tmp/rjob/robotspec.json
+LOBBOT_DRY_RUN=1 MUJOCO_GL=osmesa python robot_pipeline.py --job /tmp/rjob   # stages: site demos finetune compress simeval report
+lobbot map                                  # tunnel + URL of the map picker (GET /map)
+lobbot robot run examples/farm-uppsala.robotspec.json --fast
+lobbot robot results <job>                  # eval table; saves the graph and the video
+```
+
+API: `GET /map` (static page, no token), `POST /sites`, `GET /sites`,
+`GET /sites/{id}`, `GET /sites/{id}/preview`, `POST /robot-jobs` (RobotSpec,
+`common/robotspec.py`), `GET /robot-jobs/{id}` plus `/events`, `/eval`,
+`/graph` and `/video` (MP4, Range supported). Robot jobs share the
+one-job-at-a-time lock with LLM jobs. In a dry run the candidates are the
+scripted expert with noise and lag, and everything is labelled DRY RUN.
+
 ## Without a GPU
 
 `LOBBOT_DRY_RUN=1` walks every stage with placeholder outputs, so the TUI and

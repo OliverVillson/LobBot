@@ -35,6 +35,13 @@ JOBS = Path(os.environ.get("LOBBOT_JOBS", "/mnt/nvme/jobs"))
 TOKEN = os.environ.get("LOBBOT_TOKEN", "")
 DRY_RUN = os.environ.get("LOBBOT_DRY_RUN") == "1"
 STAGES = ["data", "reap", "heal", "quantize", "eval", "package"]
+# Robot jobs (robot_pipeline.py, docs/robot-mvp.md) share JOBS and the one-job lock;
+# robotspec.json marks them, so the /jobs routes (taskspec.json) never see them.
+SITES = Path(os.environ.get("LOBBOT_SITES", "/mnt/nvme/sites"))
+ROBOT_STAGES = ["site", "demos", "finetune", "compress", "simeval", "report"]
+# kind -> (stages, spec file, final output, pipeline script)
+KINDS = {"llm": (STAGES, "taskspec.json", "out/model.gguf", "pipeline.py"),
+         "robot": (ROBOT_STAGES, "robotspec.json", "out/training.mp4", "robot_pipeline.py")}
 
 app = FastAPI(title="LobBot")
 _running: dict[str, subprocess.Popen] = {}
@@ -69,14 +76,15 @@ def _mtime(p: Path) -> float:
     return p.stat().st_mtime if p.exists() else 0.0
 
 
-def disk_state(d: Path) -> tuple[str, dict, str | None]:
+def disk_state(d: Path, kind: str = "llm") -> tuple[str, dict, str | None]:
     """State of a job run with pipeline.py directly (no events.jsonl from this
     server): .done markers, plus the last progress line of each stage's log.
     Besides the usual states this can be "partial": some stages ran cleanly
     (--only/--from by hand) and there is no packaged model."""
-    stages = {s: {"status": "pending", "pct": 0, "msg": ""} for s in STAGES}
+    names, _, final, _ = KINDS[kind]
+    stages = {s: {"status": "pending", "pct": 0, "msg": ""} for s in names}
     error = None
-    for s in STAGES:
+    for s in names:
         if (d / ".done" / s).exists():
             stages[s] = {"status": "done", "pct": 100, "msg": ""}
             continue
@@ -97,7 +105,7 @@ def disk_state(d: Path) -> tuple[str, dict, str | None]:
     if (d / "stopped").exists() and _mtime(d / "stopped") > newest_log - 60 and not _pipeline_alive(d):
         # POST /stop, and nothing ran since (a stage may still log its exit just after)
         return "stopped", stages, None
-    if all(st == "done" for st in statuses) and (d / "out" / "model.gguf").exists():
+    if all(st == "done" for st in statuses) and (d / final).exists():
         return "done", stages, None
     if error:
         return "error", stages, error
@@ -121,15 +129,15 @@ def _pipeline_alive(d: Path) -> bool:
         return time.time() - newest < 300
 
 
-def job_state(job_id: str, d: Path) -> dict:
-    stages = {s: {"status": "pending", "pct": 0, "msg": ""} for s in STAGES}
+def job_state(job_id: str, d: Path, kind: str = "llm") -> dict:
+    stages = {s: {"status": "pending", "pct": 0, "msg": ""} for s in KINDS[kind][0]}
     state, error = "queued", None
     newest_log = max((_mtime(p) for p in (d / "logs").glob("*.log")), default=0.0)
     events = d / "events.jsonl"
     if job_id not in _running and (not events.exists() or newest_log > _mtime(events)):
         # Last run was pipeline.py started by hand (CLI over SSH), not by this server.
-        state, stages, error = disk_state(d)
-        return _state_dict(job_id, d, state, stages, error)
+        state, stages, error = disk_state(d, kind)
+        return _state_dict(job_id, d, state, stages, error, kind)
     for e in read_events(d):
         if e["stage"] == "pipeline":
             if e["status"] == "running":
@@ -147,16 +155,17 @@ def job_state(job_id: str, d: Path) -> dict:
     if state == "running" and job_id not in _running:
         # The pipeline process is gone without a final event (server restart or crash).
         state, error = "error", error or "pipeline stopped unexpectedly; resume to continue"
-    return _state_dict(job_id, d, state, stages, error)
+    return _state_dict(job_id, d, state, stages, error, kind)
 
 
-def _state_dict(job_id: str, d: Path, state: str, stages: dict, error: str | None) -> dict:
-    spec = json.loads((d / "taskspec.json").read_text())
+def _state_dict(job_id: str, d: Path, state: str, stages: dict, error: str | None, kind: str = "llm") -> dict:
+    spec_file = d / KINDS[kind][1]
+    spec = json.loads(spec_file.read_text())
     return {
         "job_id": job_id,
         "task_name": spec.get("task_name"),
         "state": state,
-        "created": (d / "taskspec.json").stat().st_mtime,
+        "created": spec_file.stat().st_mtime,
         "stages": stages,
         "error": error,
     }
@@ -204,19 +213,21 @@ def running_job() -> str | None:
     return next(iter(_hand_run_pipelines()), None)
 
 
-def launch(job_id: str, d: Path, start: str | None = None) -> None:
+def launch(job_id: str, d: Path, start: str | None = None, kind: str = "llm") -> None:
     with _lock:
         busy = running_job()
         if busy:
             raise Busy(busy)
         (d / "stopped").unlink(missing_ok=True)
-        cmd = [sys.executable, str(ROOT / "pipeline.py"), "--job", str(d)]
+        cmd = [sys.executable, str(ROOT / KINDS[kind][3]), "--job", str(d)]
         if start:
             cmd += ["--from", start]
         # Marks the start of a run: state and the event stream begin here.
         with (d / "events.jsonl").open("a") as ev:
             ev.write(json.dumps({"stage": "pipeline", "status": "running", "msg": "started", "ts": time.time()}) + "\n")
-        proc = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        env = {**os.environ, "LOBBOT_SITES": str(SITES)} if kind == "robot" else None
+        proc = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+                                env=env)
         _running[job_id] = proc
 
     def pump() -> None:
@@ -307,7 +318,10 @@ def resume_job(job_id: str, body: dict | None = None) -> dict:
 def stop_job(job_id: str) -> dict:
     """SIGTERM the job's pipeline.py, which forwards it to the running stage and
     frees the GPU. Finished stages stay cached; resume continues from there."""
-    d = job_dir(job_id)
+    return _stop_job(job_id, job_dir(job_id))
+
+
+def _stop_job(job_id: str, d: Path, kind: str = "llm") -> dict:
     proc = _running.get(job_id)
     pids = [proc.pid] if proc and proc.poll() is None else _hand_run_pipelines().get(job_id, [])
     if not pids:
@@ -330,7 +344,7 @@ def stop_job(job_id: str) -> dict:
             if job_id not in _running:
                 break
             time.sleep(0.1)
-    return {"job_id": job_id, "state": job_state(job_id, d)["state"]}
+    return {"job_id": job_id, "state": job_state(job_id, d, kind)["state"]}
 
 
 def _alive(pid: int) -> bool:
@@ -349,8 +363,10 @@ def _alive(pid: int) -> bool:
 
 @app.get("/jobs/{job_id}/events", dependencies=[Depends(auth)])
 async def job_events(job_id: str) -> StreamingResponse:
-    d = job_dir(job_id)
+    return _event_stream(job_id, job_dir(job_id))
 
+
+def _event_stream(job_id: str, d: Path, kind: str = "llm") -> StreamingResponse:
     async def stream():
         sent = 0
         idle = 0.0
@@ -368,7 +384,7 @@ async def job_events(job_id: str) -> StreamingResponse:
                 yield ": keepalive\n\n"
             if job_id not in _running and sent == len(read_events(d)):
                 # Nothing running and nothing new: report the stored state and stop.
-                state = job_state(job_id, d)
+                state = job_state(job_id, d, kind)
                 if state["state"] in ("error", "queued"):
                     yield f"data: {json.dumps({'stage': 'pipeline', 'status': 'error', 'msg': state['error'] or 'not running', 'ts': time.time()})}\n\n"
                     return
@@ -406,3 +422,181 @@ def job_modelfile(job_id: str) -> PlainTextResponse:
     if not f.exists():
         raise HTTPException(404, "model not ready")
     return PlainTextResponse(f.read_text())
+
+
+# ----------------------------------------------------------------- robot MVP (docs/robot-mvp.md)
+
+
+@app.get("/map", include_in_schema=False)
+def map_page() -> FileResponse:
+    """The map picker. A static page: its API calls carry the bearer token."""
+    f = ROOT / "farmsim" / "static" / "map.html"
+    if not f.exists():
+        raise HTTPException(404, "map page not installed")
+    return FileResponse(f, media_type="text/html")
+
+
+def _site_meta(site) -> dict:
+    from farmsim.site import read_meta
+
+    return read_meta(site)
+
+
+def _load_site(site_id: str):
+    from farmsim.site import load_site
+
+    if not site_id.isalnum():
+        raise HTTPException(404, "no such site")
+    try:
+        return load_site(site_id, sites_dir=SITES)
+    except (FileNotFoundError, ValueError, TypeError):
+        raise HTTPException(404, "no such site")
+
+
+@app.post("/sites", dependencies=[Depends(auth)])
+async def create_site(body: dict) -> dict:
+    """Build a site from a map pick: {lat, lon, size_m, name, source}. Fetching tiles
+    can take a while, so it runs in a worker thread."""
+    from common.robotspec import SitePick
+    from farmsim.site import build_site
+
+    try:
+        p = SitePick(**body)
+        lat, lon, size = float(p.lat), float(p.lon), float(p.size_m)
+    except (TypeError, ValueError) as e:
+        raise HTTPException(422, f"invalid site: {e}")
+    try:
+        site = await asyncio.to_thread(build_site, lat, lon, size, name=p.name, source=p.source, sites_dir=SITES)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    except Exception as e:  # every source failed (network, credentials)
+        raise HTTPException(502, f"could not build the site: {e}")
+    return _site_meta(site)
+
+
+@app.get("/sites", dependencies=[Depends(auth)])
+def list_sites_route() -> list[dict]:
+    from farmsim.site import list_sites
+
+    return [_site_meta(s) for s in list_sites(SITES)]
+
+
+@app.get("/sites/{site_id}", dependencies=[Depends(auth)])
+def get_site(site_id: str) -> dict:
+    return _site_meta(_load_site(site_id))
+
+
+@app.get("/sites/{site_id}/preview", dependencies=[Depends(auth)])
+def site_preview(site_id: str) -> FileResponse:
+    f = _load_site(site_id).preview_path
+    if not f.exists():
+        raise HTTPException(404, "no preview")
+    return FileResponse(f, media_type="image/png")
+
+
+def robot_job_dir(job_id: str) -> Path:
+    d = JOBS / job_id
+    if not job_id.isalnum() or not (d / "robotspec.json").exists():
+        raise HTTPException(404, "no such robot job")
+    return d
+
+
+ROBOT_CONFIG_KEYS = {"img_size", "row_length_m", "clip_width", "clip_height", "fps", "demo_seed", "eval_seed", "candidates",
+                     "video_seconds", "base_model"}
+
+
+@app.post("/robot-jobs", dependencies=[Depends(auth)])
+def create_robot_job(body: dict) -> dict:
+    """RobotSpec body (site {lat, lon, ...} or site_id); an optional "config" key holds
+    robot/stages.py:RobotConfig overrides."""
+    from common.robotspec import RobotSpec
+
+    body = dict(body)
+    config = body.pop("config", None) or {}
+    if not isinstance(config, dict) or set(config) - ROBOT_CONFIG_KEYS:
+        raise HTTPException(422, f"config keys must be among {sorted(ROBOT_CONFIG_KEYS)}")
+    try:
+        spec = RobotSpec.from_dict(body)
+    except (KeyError, TypeError, ValueError) as e:
+        raise HTTPException(422, f"invalid RobotSpec: {e}")
+    if spec.site_id:
+        _load_site(spec.site_id)  # 404 before making a job that cannot run
+    busy = running_job()
+    if busy:
+        raise Busy(busy)
+    job_id = secrets.token_hex(5)
+    d = JOBS / job_id
+    d.mkdir(parents=True)
+    spec.save(d / "robotspec.json")
+    if config:
+        (d / "config.json").write_text(json.dumps(config, indent=2))
+    try:
+        launch(job_id, d, kind="robot")
+    except Busy:
+        shutil.rmtree(d, ignore_errors=True)
+        raise
+    return {"job_id": job_id}
+
+
+@app.get("/robot-jobs", dependencies=[Depends(auth)])
+def list_robot_jobs() -> list[dict]:
+    if not JOBS.exists():
+        return []
+    rows = []
+    for d in JOBS.iterdir():
+        if (d / "robotspec.json").exists():
+            s = job_state(d.name, d, "robot")
+            rows.append({k: s[k] for k in ("job_id", "task_name", "state", "created")})
+    return sorted(rows, key=lambda r: r["created"], reverse=True)
+
+
+@app.get("/robot-jobs/{job_id}", dependencies=[Depends(auth)])
+def get_robot_job(job_id: str) -> dict:
+    return job_state(job_id, robot_job_dir(job_id), "robot")
+
+
+@app.post("/robot-jobs/{job_id}/resume", dependencies=[Depends(auth)])
+def resume_robot_job(job_id: str, body: dict | None = None) -> dict:
+    d = robot_job_dir(job_id)
+    start = (body or {}).get("from")
+    if start is not None and start not in ROBOT_STAGES:
+        raise HTTPException(422, f"from must be one of {ROBOT_STAGES}")
+    launch(job_id, d, start, kind="robot")
+    return {"job_id": job_id}
+
+
+@app.post("/robot-jobs/{job_id}/stop", dependencies=[Depends(auth)])
+def stop_robot_job(job_id: str) -> dict:
+    return _stop_job(job_id, robot_job_dir(job_id), "robot")
+
+
+@app.get("/robot-jobs/{job_id}/events", dependencies=[Depends(auth)])
+async def robot_job_events(job_id: str) -> StreamingResponse:
+    return _event_stream(job_id, robot_job_dir(job_id), "robot")
+
+
+@app.get("/robot-jobs/{job_id}/eval", dependencies=[Depends(auth)])
+def robot_job_eval(job_id: str) -> dict:
+    f = robot_job_dir(job_id) / "out" / "eval.json"
+    if not f.exists():
+        raise HTTPException(404, "eval not ready")
+    return json.loads(f.read_text())
+
+
+@app.get("/robot-jobs/{job_id}/graph", dependencies=[Depends(auth)])
+def robot_job_graph(job_id: str) -> FileResponse:
+    f = robot_job_dir(job_id) / "out" / "footprint_vs_performance.png"
+    if not f.exists():
+        raise HTTPException(404, "graph not ready")
+    return FileResponse(f, media_type="image/png")
+
+
+@app.get("/robot-jobs/{job_id}/video", dependencies=[Depends(auth)])
+def robot_job_video(job_id: str) -> FileResponse:
+    """out/training.mp4 (Range supported, so a browser can seek)."""
+    d = robot_job_dir(job_id)
+    f = d / "out" / "training.mp4"
+    if not f.exists():
+        raise HTTPException(404, "video not ready")
+    return FileResponse(f, media_type="video/mp4", filename=f"lobbot-robot-{job_id}.mp4",
+                        content_disposition_type="inline")

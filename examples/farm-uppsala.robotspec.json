@@ -1,0 +1,20 @@
+{
+  "task_name": "uppsala-row-follow",
+  "description": "Drive a tractor along the crop rows of an Ultuna (SLU) field south of Uppsala, staying within half a metre of the row.",
+  "site": {
+    "lat": 59.8100,
+    "lon": 17.6600,
+    "size_m": 300,
+    "name": "Ultuna fields, Uppsala",
+    "source": "auto"
+  },
+  "n_demos": 50,
+  "finetune_steps": 2000,
+  "eval_episodes": 20,
+  "max_steps": 600,
+  "target": {
+    "max_size_gb": 4.0,
+    "min_hz": 10.0
+  },
+  "version": 1
+}
