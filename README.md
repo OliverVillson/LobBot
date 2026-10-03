@@ -63,6 +63,28 @@ latest run), `POST /jobs/{id}/resume`, `GET /jobs/{id}/eval`,
 `GET /jobs/{id}/model` (GGUF, Range supported), `GET /jobs/{id}/modelfile`.
 All but `/health` need `Authorization: Bearer $LOBBOT_TOKEN`.
 
+## Developer CLI (`lobbot`)
+
+Drives the pipeline on the VM from a laptop. Standard library only; it opens
+its own SSH tunnel to the API and starts the API on the VM when needed.
+
+```bash
+uv tool install --editable .        # or: pipx install -e .
+lobbot init                         # VM host (default evroc-user@194.14.81.33), key, checkout path
+lobbot doctor                       # SSH, checkout, venvs, weights, llama.cpp, GPU, API
+lobbot secret GEMINI_API_KEY        # stored in ~/.lobbot-env on the VM (mode 600) for the eval judge
+lobbot new "turn support emails into JSON tickets"   # drafts a TaskSpec with Gemini
+lobbot run my.taskspec.json --fast  # or --example; live stage progress, Ctrl-C detaches
+lobbot status [job] | watch <job> | logs <job> [-s heal] [-f] | eval <job>
+lobbot resume <job> [--from quantize] | stop <job>
+lobbot install <job> --chat         # resumable download, ollama create, ollama run
+```
+
+`--fast` sets `n_generate=400, n_heldout=30, reap_calib_samples=128,
+dense_fallback=false`; `--set key=value` overrides any `Config` field. `run`
+refuses to start while something else is on the GPU unless you add `--force`.
+The API token lives in `~/.lobbot-token` on the VM (`lobbot token` prints it).
+
 ## Without a GPU
 
 `LOBBOT_DRY_RUN=1` walks every stage with placeholder outputs, so the TUI and
