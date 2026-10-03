@@ -50,3 +50,29 @@ def test_quantize_args_cover_every_layer():
 def test_moe_is_faster_than_dense_at_same_size():
     layers = bits.allocate(shape(), [1.0] * 48, 6.5)
     assert bits.estimate_tok_s(shape(), layers) > 40
+
+
+def test_transformers5_config_key():
+    cfg = {**QWEN3_30B_REAP50}
+    cfg["num_local_experts"] = cfg.pop("num_experts")
+    assert bits.MoEShape.from_hf_config(cfg).n_experts == 64
+
+
+def test_imatrix_energy_steers_bits_per_projection():
+    energy = {"gate": [1.0] * 48, "up": [1.0] * 48, "down": [1.0] * 48}
+    energy["down"][5] = 50.0
+    layers = bits.allocate(shape(), None, 6.5, proj_energy=energy)
+    assert bits.LADDER.index(layers[5].down) == max(bits.LADDER.index(l.down) for l in layers)
+    assert bits.LADDER.index(layers[5].down) > bits.LADDER.index(layers[5].gate_up)
+
+
+def test_per_token_budget_caps_bits():
+    free = bits.allocate(shape(), [1.0] * 48, 7.0)
+    cap = bits.bytes_per_token_gb(shape(), free) - 0.1
+    capped = bits.allocate(shape(), [1.0] * 48, 7.0, max_gb_per_token=cap)
+    assert bits.bytes_per_token_gb(shape(), capped) <= cap + 1e-9
+
+
+def test_missing_or_bad_importance_is_neutral():
+    s = bits.sensitivities(4, [0.0, float("nan"), 2.0, 2.0])
+    assert s["gate"] == [1.0, 1.0, 1.0, 1.0]
