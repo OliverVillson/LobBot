@@ -1,0 +1,1059 @@
+{
+ "eval": {
+  "teacher": {
+   "name": "Qwen3-30B-A3B-Instruct-2507",
+   "size_gb": 61.1,
+   "score": 0.981
+  },
+  "candidates": [
+   {
+    "name": "lobbot-moe",
+    "size_gb": 6.52,
+    "score": 0.974,
+    "agreement": 0.783,
+    "judge_score": 0.974,
+    "tok_s_est": 49.2,
+    "tok_s_vm": 54.4,
+    "meets_target": true
+   },
+   {
+    "name": "dense",
+    "size_gb": 5.3,
+    "score": 0.982,
+    "agreement": 0.785,
+    "judge_score": 0.982,
+    "tok_s_est": 26.2,
+    "tok_s_vm": 53.3,
+    "meets_target": false
+   }
+  ],
+  "winner": "lobbot-moe",
+  "score_method": "judge",
+  "samples": {
+   "lobbot-moe": [
+    {
+     "input": "I am trying to run an automated penetration test against our custom domain endpoints (`api.clientdomain.com/v1/sync`) starting tonight at 02:00 UTC. Do we need explicit written whitelist approval from your infrastructure/SecOps team first so AWS Shield doesn't blackhole our IP range?",
+     "output": "{\"category\": \"account\", \"priority\": \"medium\", \"summary\": \"Customer asks if they need explicit approval to run a penetration test on custom domain endpoints without being blocked by AWS Shield.\", \"customer_sentiment\": \"neutral\"}",
+     "reference": "{\"category\": \"other\", \"priority\": \"low\", \"summary\": \"Customer requests guidance on whether written approval is needed before running a penetration test on their custom domain.\", \"customer_sentiment\": \"neutral\"}"
+    },
+    {
+     "input": "Hello, I'm reaching out because we're running into a bizarre permission inheritance bug after upgrading to the Enterprise workspace tier yesterday. Here is our setup: we have an 'Engineering' top-level folder with permissions set to 'View Only' for the group `contractors_external`. Within that, we have a subfolder called 'Public Docs' set to explicitly inherit parent permissions. However, when users belonging to `contractors_external` log in via Okta SAML SSO, they can not only edit and delete documents in 'Public Docs', but one contractor accidentally purged an entire sprint retro document earlier this morning! Strangely, if we create a direct-invite user with the exact same group role rather than syncing via SAML, the permissions enforce correctly as read-only. So it appears the SCIM group mapping is injecting admin claims into session tokens somewhere. Can someone look into our SAML attribute statements for tenant `acme-corp.cloud`? We've had to freeze all contractor access until this is sorted out.",
+     "output": "{\"category\": \"bug\", \"priority\": \"urgent\", \"summary\": \"Enterprise upgrade caused SAML group mapping to incorrectly grant edit/delete permissions to external contractors, despite read-only settings.\", \"customer_sentiment\": \"negative\"}",
+     "reference": "{\n  \"category\": \"bug\",\n  \"priority\": \"urgent\",\n  \"summary\": \"SAML SSO users from contractors_external group can bypass read-only permissions and edit/delete in 'Public Docs' despite correct inheritance, suggesting incorrect claim mapping.\",\n  \"customer_sentiment\": \"negative\"\n}"
+    },
+    {
+     "input": "helo... cancel subscritpion immediately!! do not charge me again! also why was i billed $49 instead of $29 last month?? wait actually keep my acount active until the 15th becos my accountant needs the reciepts then delete everything thx -Sent from my iPhone",
+     "output": "{\"category\": \"billing\", \"priority\": \"urgent\", \"summary\": \"Customer requests immediate subscription cancellation, questions a $49 charge instead of $29, and asks to keep account active until the 15th for invoice purposes.\", \"customer_sentiment\": \"negative\"}",
+     "reference": "{\"category\": \"billing\", \"priority\": \"high\", \"summary\": \"Customer requests immediate cancellation, disputes a $49 charge, and asks to keep account active until the 15th for receipts.\", \"customer_sentiment\": \"negative\"}"
+    }
+   ],
+   "dense": [
+    {
+     "input": "I am trying to run an automated penetration test against our custom domain endpoints (`api.clientdomain.com/v1/sync`) starting tonight at 02:00 UTC. Do we need explicit written whitelist approval from your infrastructure/SecOps team first so AWS Shield doesn't blackhole our IP range?",
+     "output": "{\"category\": \"account\", \"priority\": \"medium\", \"summary\": \"Customer requests guidance on whitelisting their IP range for an automated penetration test to prevent AWS Shield blocking.\", \"customer_sentiment\": \"neutral\"}",
+     "reference": "{\"category\": \"other\", \"priority\": \"low\", \"summary\": \"Customer requests guidance on whether written approval is needed before running a penetration test on their custom domain.\", \"customer_sentiment\": \"neutral\"}"
+    },
+    {
+     "input": "Hello, I'm reaching out because we're running into a bizarre permission inheritance bug after upgrading to the Enterprise workspace tier yesterday. Here is our setup: we have an 'Engineering' top-level folder with permissions set to 'View Only' for the group `contractors_external`. Within that, we have a subfolder called 'Public Docs' set to explicitly inherit parent permissions. However, when users belonging to `contractors_external` log in via Okta SAML SSO, they can not only edit and delete documents in 'Public Docs', but one contractor accidentally purged an entire sprint retro document earlier this morning! Strangely, if we create a direct-invite user with the exact same group role rather than syncing via SAML, the permissions enforce correctly as read-only. So it appears the SCIM group mapping is injecting admin claims into session tokens somewhere. Can someone look into our SAML attribute statements for tenant `acme-corp.cloud`? We've had to freeze all contractor access until this is sorted out.",
+     "output": "{\"category\": \"bug\", \"priority\": \"urgent\", \"summary\": \"Permission inheritance bug in Enterprise tier: SAML SSO for contractors grants edit/delete access despite 'View Only' settings.\", \"customer_sentiment\": \"negative\"}",
+     "reference": "{\n  \"category\": \"bug\",\n  \"priority\": \"urgent\",\n  \"summary\": \"SAML SSO users from contractors_external group can bypass read-only permissions and edit/delete in 'Public Docs' despite correct inheritance, suggesting incorrect claim mapping.\",\n  \"customer_sentiment\": \"negative\"\n}"
+    },
+    {
+     "input": "helo... cancel subscritpion immediately!! do not charge me again! also why was i billed $49 instead of $29 last month?? wait actually keep my acount active until the 15th becos my accountant needs the reciepts then delete everything thx -Sent from my iPhone",
+     "output": "{\"category\": \"billing\", \"priority\": \"urgent\", \"summary\": \"Customer demands immediate subscription cancellation, questions a $49 charge instead of $29, and requests account retention until the 15th for accounting.\", \"customer_sentiment\": \"negative\"}",
+     "reference": "{\"category\": \"billing\", \"priority\": \"high\", \"summary\": \"Customer requests immediate cancellation, disputes a $49 charge, and asks to keep account active until the 15th for receipts.\", \"customer_sentiment\": \"negative\"}"
+    }
+   ]
+  },
+  "bit_widths": [
+   {
+    "layer": 0,
+    "tensor": "ffn_down_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 1,
+    "tensor": "ffn_down_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 2,
+    "tensor": "ffn_down_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 3,
+    "tensor": "ffn_down_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 4,
+    "tensor": "ffn_down_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 5,
+    "tensor": "ffn_down_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 6,
+    "tensor": "ffn_down_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 7,
+    "tensor": "ffn_down_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 8,
+    "tensor": "ffn_down_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 9,
+    "tensor": "ffn_down_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 10,
+    "tensor": "ffn_down_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 11,
+    "tensor": "ffn_down_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 12,
+    "tensor": "ffn_down_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 13,
+    "tensor": "ffn_down_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 14,
+    "tensor": "ffn_down_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 15,
+    "tensor": "ffn_down_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 16,
+    "tensor": "ffn_down_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 17,
+    "tensor": "ffn_down_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 18,
+    "tensor": "ffn_down_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 19,
+    "tensor": "ffn_down_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 20,
+    "tensor": "ffn_down_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 21,
+    "tensor": "ffn_down_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 22,
+    "tensor": "ffn_down_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 23,
+    "tensor": "ffn_down_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 24,
+    "tensor": "ffn_down_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 25,
+    "tensor": "ffn_down_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 26,
+    "tensor": "ffn_down_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 27,
+    "tensor": "ffn_down_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 28,
+    "tensor": "ffn_down_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 29,
+    "tensor": "ffn_down_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 30,
+    "tensor": "ffn_down_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 31,
+    "tensor": "ffn_down_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 32,
+    "tensor": "ffn_down_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 33,
+    "tensor": "ffn_down_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 34,
+    "tensor": "ffn_down_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 35,
+    "tensor": "ffn_down_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 36,
+    "tensor": "ffn_down_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 0,
+    "tensor": "ffn_gate_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 1,
+    "tensor": "ffn_gate_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 2,
+    "tensor": "ffn_gate_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 3,
+    "tensor": "ffn_gate_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 4,
+    "tensor": "ffn_gate_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 5,
+    "tensor": "ffn_gate_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 6,
+    "tensor": "ffn_gate_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 7,
+    "tensor": "ffn_gate_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 8,
+    "tensor": "ffn_gate_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 9,
+    "tensor": "ffn_gate_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 10,
+    "tensor": "ffn_gate_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 11,
+    "tensor": "ffn_gate_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 12,
+    "tensor": "ffn_gate_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 13,
+    "tensor": "ffn_gate_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 14,
+    "tensor": "ffn_gate_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 15,
+    "tensor": "ffn_gate_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 16,
+    "tensor": "ffn_gate_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 17,
+    "tensor": "ffn_gate_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 18,
+    "tensor": "ffn_gate_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 19,
+    "tensor": "ffn_gate_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 20,
+    "tensor": "ffn_gate_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 21,
+    "tensor": "ffn_gate_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 22,
+    "tensor": "ffn_gate_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 23,
+    "tensor": "ffn_gate_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 24,
+    "tensor": "ffn_gate_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 25,
+    "tensor": "ffn_gate_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 26,
+    "tensor": "ffn_gate_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 27,
+    "tensor": "ffn_gate_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 28,
+    "tensor": "ffn_gate_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 29,
+    "tensor": "ffn_gate_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 30,
+    "tensor": "ffn_gate_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 31,
+    "tensor": "ffn_gate_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 32,
+    "tensor": "ffn_gate_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 33,
+    "tensor": "ffn_gate_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 34,
+    "tensor": "ffn_gate_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 35,
+    "tensor": "ffn_gate_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 36,
+    "tensor": "ffn_gate_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 0,
+    "tensor": "ffn_up_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 1,
+    "tensor": "ffn_up_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 2,
+    "tensor": "ffn_up_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 3,
+    "tensor": "ffn_up_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 4,
+    "tensor": "ffn_up_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 5,
+    "tensor": "ffn_up_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 6,
+    "tensor": "ffn_up_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 7,
+    "tensor": "ffn_up_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 8,
+    "tensor": "ffn_up_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 9,
+    "tensor": "ffn_up_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 10,
+    "tensor": "ffn_up_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 11,
+    "tensor": "ffn_up_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 12,
+    "tensor": "ffn_up_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 13,
+    "tensor": "ffn_up_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 14,
+    "tensor": "ffn_up_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 15,
+    "tensor": "ffn_up_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 16,
+    "tensor": "ffn_up_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 17,
+    "tensor": "ffn_up_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 18,
+    "tensor": "ffn_up_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 19,
+    "tensor": "ffn_up_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 20,
+    "tensor": "ffn_up_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 21,
+    "tensor": "ffn_up_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 22,
+    "tensor": "ffn_up_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 23,
+    "tensor": "ffn_up_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 24,
+    "tensor": "ffn_up_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 25,
+    "tensor": "ffn_up_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 26,
+    "tensor": "ffn_up_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 27,
+    "tensor": "ffn_up_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 28,
+    "tensor": "ffn_up_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 29,
+    "tensor": "ffn_up_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 30,
+    "tensor": "ffn_up_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 31,
+    "tensor": "ffn_up_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 32,
+    "tensor": "ffn_up_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 33,
+    "tensor": "ffn_up_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 34,
+    "tensor": "ffn_up_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 35,
+    "tensor": "ffn_up_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 36,
+    "tensor": "ffn_up_exps",
+    "type": "q2_k",
+    "bits": 2.625
+   },
+   {
+    "layer": 0,
+    "tensor": "ffn_down_exps",
+    "type": "q3_k",
+    "bits": 3.4375
+   },
+   {
+    "layer": 1,
+    "tensor": "ffn_down_exps",
+    "type": "q3_k",
+    "bits": 3.4375
+   },
+   {
+    "layer": 2,
+    "tensor": "ffn_down_exps",
+    "type": "q3_k",
+    "bits": 3.4375
+   },
+   {
+    "layer": 3,
+    "tensor": "ffn_down_exps",
+    "type": "q3_k",
+    "bits": 3.4375
+   },
+   {
+    "layer": 0,
+    "tensor": "ffn_gate_exps",
+    "type": "q3_k",
+    "bits": 3.4375
+   },
+   {
+    "layer": 1,
+    "tensor": "ffn_gate_exps",
+    "type": "q3_k",
+    "bits": 3.4375
+   },
+   {
+    "layer": 2,
+    "tensor": "ffn_gate_exps",
+    "type": "q3_k",
+    "bits": 3.4375
+   },
+   {
+    "layer": 3,
+    "tensor": "ffn_gate_exps",
+    "type": "q3_k",
+    "bits": 3.4375
+   },
+   {
+    "layer": 0,
+    "tensor": "ffn_up_exps",
+    "type": "q3_k",
+    "bits": 3.4375
+   },
+   {
+    "layer": 1,
+    "tensor": "ffn_up_exps",
+    "type": "q3_k",
+    "bits": 3.4375
+   },
+   {
+    "layer": 2,
+    "tensor": "ffn_up_exps",
+    "type": "q3_k",
+    "bits": 3.4375
+   },
+   {
+    "layer": 3,
+    "tensor": "ffn_up_exps",
+    "type": "q3_k",
+    "bits": 3.4375
+   },
+   {
+    "layer": 0,
+    "tensor": "ffn_down_exps",
+    "type": "q4_k",
+    "bits": 4.5
+   },
+   {
+    "layer": 1,
+    "tensor": "ffn_down_exps",
+    "type": "q4_k",
+    "bits": 4.5
+   },
+   {
+    "layer": 2,
+    "tensor": "ffn_down_exps",
+    "type": "q4_k",
+    "bits": 4.5
+   },
+   {
+    "layer": 3,
+    "tensor": "ffn_down_exps",
+    "type": "q4_k",
+    "bits": 4.5
+   },
+   {
+    "layer": 4,
+    "tensor": "ffn_down_exps",
+    "type": "q4_k",
+    "bits": 4.5
+   },
+   {
+    "layer": 0,
+    "tensor": "ffn_gate_exps",
+    "type": "q4_k",
+    "bits": 4.5
+   },
+   {
+    "layer": 1,
+    "tensor": "ffn_gate_exps",
+    "type": "q4_k",
+    "bits": 4.5
+   },
+   {
+    "layer": 2,
+    "tensor": "ffn_gate_exps",
+    "type": "q4_k",
+    "bits": 4.5
+   },
+   {
+    "layer": 3,
+    "tensor": "ffn_gate_exps",
+    "type": "q4_k",
+    "bits": 4.5
+   },
+   {
+    "layer": 4,
+    "tensor": "ffn_gate_exps",
+    "type": "q4_k",
+    "bits": 4.5
+   },
+   {
+    "layer": 5,
+    "tensor": "ffn_gate_exps",
+    "type": "q4_k",
+    "bits": 4.5
+   },
+   {
+    "layer": 0,
+    "tensor": "ffn_up_exps",
+    "type": "q4_k",
+    "bits": 4.5
+   },
+   {
+    "layer": 1,
+    "tensor": "ffn_up_exps",
+    "type": "q4_k",
+    "bits": 4.5
+   },
+   {
+    "layer": 2,
+    "tensor": "ffn_up_exps",
+    "type": "q4_k",
+    "bits": 4.5
+   },
+   {
+    "layer": 3,
+    "tensor": "ffn_up_exps",
+    "type": "q4_k",
+    "bits": 4.5
+   },
+   {
+    "layer": 4,
+    "tensor": "ffn_up_exps",
+    "type": "q4_k",
+    "bits": 4.5
+   },
+   {
+    "layer": 5,
+    "tensor": "ffn_up_exps",
+    "type": "q4_k",
+    "bits": 4.5
+   },
+   {
+    "layer": 0,
+    "tensor": "ffn_down_exps",
+    "type": "q5_k",
+    "bits": 5.5
+   },
+   {
+    "layer": 0,
+    "tensor": "ffn_down_exps",
+    "type": "q6_k",
+    "bits": 6.5625
+   },
+   {
+    "layer": 0,
+    "tensor": "ffn_gate_exps",
+    "type": "q5_k",
+    "bits": 5.5
+   },
+   {
+    "layer": 0,
+    "tensor": "ffn_up_exps",
+    "type": "q5_k",
+    "bits": 5.5
+   }
+  ]
+ },
+ "taskspec": {
+  "version": 1,
+  "task_name": "support-email-to-ticket",
+  "description": "Turn a customer support email into a structured JSON ticket for a SaaS helpdesk.",
+  "input_format": "The free-text body of one customer email.",
+  "output_format": "A single JSON object with keys: category (one of billing, bug, account, feature_request, other), priority (low, medium, high, urgent), summary (one sentence, max 25 words), customer_sentiment (negative, neutral, positive).",
+  "seed_examples": [
+   {
+    "input": "Hi, I was charged twice for my Pro subscription this month. Can you refund the extra charge? Order #48213.",
+    "output": "{\"category\": \"billing\", \"priority\": \"high\", \"summary\": \"Customer was double-charged for the Pro subscription this month and requests a refund for order #48213.\", \"customer_sentiment\": \"negative\"}"
+   },
+   {
+    "input": "The export to CSV button does nothing in Firefox. Works fine in Chrome.",
+    "output": "{\"category\": \"bug\", \"priority\": \"medium\", \"summary\": \"CSV export button is unresponsive in Firefox but works in Chrome.\", \"customer_sentiment\": \"neutral\"}"
+   },
+   {
+    "input": "Our whole team is locked out since this morning, nobody can log in and we have a client demo in an hour!!!",
+    "output": "{\"category\": \"account\", \"priority\": \"urgent\", \"summary\": \"Entire team cannot log in since this morning, blocking a client demo in one hour.\", \"customer_sentiment\": \"negative\"}"
+   },
+   {
+    "input": "Love the new dashboard! Would be great if we could also schedule reports to go out by email every Monday.",
+    "output": "{\"category\": \"feature_request\", \"priority\": \"low\", \"summary\": \"Customer likes the new dashboard and requests scheduled weekly email reports.\", \"customer_sentiment\": \"positive\"}"
+   },
+   {
+    "input": "How do I change the email address on my account? I switched jobs.",
+    "output": "{\"category\": \"account\", \"priority\": \"low\", \"summary\": \"Customer asks how to change the email address on their account after switching jobs.\", \"customer_sentiment\": \"neutral\"}"
+   },
+   {
+    "input": "Your API has been returning 500 errors on /v2/orders for the last 20 minutes. Our checkout is down.",
+    "output": "{\"category\": \"bug\", \"priority\": \"urgent\", \"summary\": \"API endpoint /v2/orders has returned 500 errors for 20 minutes, taking the customer's checkout down.\", \"customer_sentiment\": \"negative\"}"
+   },
+   {
+    "input": "Can I get an invoice with our VAT number on it? We need it for accounting. VAT: SE556677889901.",
+    "output": "{\"category\": \"billing\", \"priority\": \"medium\", \"summary\": \"Customer requests an invoice including VAT number SE556677889901 for accounting.\", \"customer_sentiment\": \"neutral\"}"
+   },
+   {
+    "input": "I cancelled my plan last week but I still see it as active and I'm worried I'll be charged again.",
+    "output": "{\"category\": \"billing\", \"priority\": \"high\", \"summary\": \"Plan still shows as active a week after cancellation and customer fears another charge.\", \"customer_sentiment\": \"negative\"}"
+   },
+   {
+    "input": "Is there a dark mode? My eyes hurt in the evening lol",
+    "output": "{\"category\": \"feature_request\", \"priority\": \"low\", \"summary\": \"Customer asks whether a dark mode is available for evening use.\", \"customer_sentiment\": \"neutral\"}"
+   },
+   {
+    "input": "The mobile app crashes every time I open the calendar tab. iPhone 15, iOS 19.2, app version 4.8.1.",
+    "output": "{\"category\": \"bug\", \"priority\": \"high\", \"summary\": \"Mobile app crashes when opening the calendar tab on iPhone 15, iOS 19.2, app 4.8.1.\", \"customer_sentiment\": \"negative\"}"
+   },
+   {
+    "input": "Just wanted to say your support team was amazing yesterday, Sara fixed my issue in 5 minutes. Thanks!",
+    "output": "{\"category\": \"other\", \"priority\": \"low\", \"summary\": \"Customer thanks the support team, praising Sara for resolving their issue in five minutes.\", \"customer_sentiment\": \"positive\"}"
+   },
+   {
+    "input": "We need SSO with Okta before we can roll this out to 400 employees. Is that on the roadmap?",
+    "output": "{\"category\": \"feature_request\", \"priority\": \"medium\", \"summary\": \"Customer needs Okta SSO before rolling out to 400 employees and asks about the roadmap.\", \"customer_sentiment\": \"neutral\"}"
+   },
+   {
+    "input": "2FA codes aren't arriving by SMS. I've tried 5 times. I can't get into my account.",
+    "output": "{\"category\": \"account\", \"priority\": \"high\", \"summary\": \"SMS two-factor codes are not arriving after five attempts, locking the customer out.\", \"customer_sentiment\": \"negative\"}"
+   },
+   {
+    "input": "Why did my price go up from 12 to 15 euros? Nobody told me about this.",
+    "output": "{\"category\": \"billing\", \"priority\": \"medium\", \"summary\": \"Customer questions an unannounced price increase from 12 to 15 euros.\", \"customer_sentiment\": \"negative\"}"
+   },
+   {
+    "input": "Search results are really slow when I have more than 10k records, takes like 30 seconds.",
+    "output": "{\"category\": \"bug\", \"priority\": \"medium\", \"summary\": \"Search takes around 30 seconds when the account has more than 10,000 records.\", \"customer_sentiment\": \"neutral\"}"
+   }
+  ],
+  "eval_criteria": "Output is a single valid JSON object with exactly the four keys; category and priority are from the allowed sets and match the email; summary is faithful, specific and at most 25 words; sentiment matches the tone.",
+  "target": {
+   "max_size_gb": 7,
+   "min_tok_s": 40,
+   "laptop_ram_gb": 16
+  }
+ },
+ "stats": {
+  "seeds": 15,
+  "expects_json": true,
+  "dry_run": false,
+  "load_s": 77.1,
+  "input_rounds": 1,
+  "inputs": 2730,
+  "answered": 2729,
+  "dropped": {
+   "invalid_json": 1
+  },
+  "heldout_answered": 100,
+  "heldout_dropped": {},
+  "heldout_source": "gemini-3.8-flash",
+  "train": 2030,
+  "heldout": 100,
+  "elapsed_s": 148.0
+ },
+ "config": {},
+ "effective": {},
+ "heldout": 100,
+ "train": 2030,
+ "gguf_bytes": 6523292032,
+ "times": {
+  "data": [
+   1791024973,
+   1791025122
+  ],
+  "reap": [
+   1791025123,
+   1791025642
+  ],
+  "heal": [
+   1791025643,
+   1791025876
+  ],
+  "quantize": [
+   1791025877,
+   1791026426
+  ],
+  "eval": [
+   1791026427,
+   1791026498
+  ],
+  "package": [
+   1791026499,
+   1791026504
+  ]
+ }
+}
