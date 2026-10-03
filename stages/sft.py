@@ -101,7 +101,7 @@ def train_sft(base: str, examples: list[dict], out_dir: Path, *,
               max_len: int = 2048, max_tokens: int = 16384, max_bs: int = 16,
               grad_accum: int = 1, kd_teacher: str | None = None, kd_weight: float = 0.0,
               kd_temp: float = 1.0, targets: list[str] = ATTN, train_experts: bool = True,
-              train_router: bool = True, seed: int = 0,
+              train_router: bool = True, seed: int = 0, max_minutes: float = 0.0,
               progress: Callable[[float, str], None] = lambda pct, msg: None) -> Path:
     from transformers import AutoTokenizer
 
@@ -175,6 +175,10 @@ def train_sft(base: str, examples: list[dict], out_dir: Path, *,
                 progress(5 + 85 * step / total,
                          f"step {step}/{total} loss {ema:.3f} lr {sched.get_last_lr()[0]:.1e} eta {eta / 60:.0f}m")
             if step >= total:
+                break
+            if max_minutes and time.time() - t0 > 60 * max_minutes:
+                log(f"sft: time cap of {max_minutes:g} min reached at step {step}/{total}; stopping early")
+                total = step
                 break
         epoch += 1
 
