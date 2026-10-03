@@ -187,7 +187,7 @@ struct CallOverlay: View {
         case .connecting: return "Calling Dr. Lobbot…"
         case .failed: return "Call failed"
         case .off: return "Call ended"
-        case .live: return voice.isSpeaking ? "Dr. Lobbot is talking" : voice.micMuted ? "Mic muted" : "Listening"
+        case .live: return voice.isSpeaking ? "Dr. Lobbot is talking…" : voice.micMuted ? "Mic muted" : "Your turn: I'm listening"
         }
     }
 

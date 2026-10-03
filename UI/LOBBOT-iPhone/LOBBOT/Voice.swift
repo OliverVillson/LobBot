@@ -62,10 +62,16 @@ enum VoiceConfig {
     }
 }
 
-/// Speaker playback of Gemini's 24 kHz PCM, plus (when listening) mic → 16 kHz PCM chunks with echo cancellation.
-/// Every audio-session and engine call runs on one private serial queue: they can block for seconds
-/// (category switch, echo cancellation), and on the main thread that froze the whole app during calls.
+/// Speaker playback of Gemini's 24 kHz PCM, plus (when listening) mic → 16 kHz PCM chunks.
+/// No voice-processing echo cancellation: enabling it could hold the audio session for seconds and froze the
+/// app during calls. Echo is avoided by turn-taking instead (`VoiceAgent` closes the mic while he speaks).
+/// Every audio-session and engine call runs on one private serial queue, never on the main thread.
 nonisolated final class VoiceAudio: @unchecked Sendable {
+    enum AudioError: LocalizedError {
+        case noMicrophone
+        var errorDescription: String? { "No microphone input is available." }
+    }
+
     private let queue = DispatchQueue(label: "dev.lobbot.audio", qos: .userInitiated)
     // Owned by `queue`.
     private var engine = AVAudioEngine()
@@ -161,12 +167,11 @@ nonisolated final class VoiceAudio: @unchecked Sendable {
         teardownEngine()
         let session = AVAudioSession.sharedInstance()
         if listening {
-            try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.defaultToSpeaker])
+            try session.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker])
         } else {
             try session.setCategory(.playback, mode: .spokenAudio)
         }
         try session.setActive(true)
-        if listening { try? session.overrideOutputAudioPort(.speaker) }
         self.listening = listening
         active = true
         rebuilds = 0
@@ -187,8 +192,8 @@ nonisolated final class VoiceAudio: @unchecked Sendable {
         player = AVAudioPlayerNode()
         if listening {
             let input = engine.inputNode
-            try input.setVoiceProcessingEnabled(true)   // echo cancellation: Lobbot must not hear himself
             let inFormat = input.outputFormat(forBus: 0)
+            guard inFormat.sampleRate > 0, inFormat.channelCount > 0 else { throw AudioError.noMicrophone }
             converter = AVAudioConverter(from: inFormat, to: sendFormat)
             input.installTap(onBus: 0, bufferSize: 2048, format: inFormat) { [weak self] buffer, _ in
                 self?.convertAndSend(buffer)
@@ -209,8 +214,8 @@ nonisolated final class VoiceAudio: @unchecked Sendable {
         if engine.isRunning { engine.stop() }
     }
 
-    /// Bounded: at most once a second and five times per call. Enabling echo cancellation itself posts a
-    /// configuration change, so an unbounded rebuild loops forever.
+    /// Bounded: at most once a second and five times per call, so a configuration change that keeps firing
+    /// can never turn into a rebuild loop.
     private func rebuild() {
         guard active, !engine.isRunning, rebuilds < 5 else { return }
         let now = ProcessInfo.processInfo.systemUptime
@@ -307,7 +312,8 @@ final class VoiceAgent {
     enum Status: Equatable { case off, connecting, live, failed(String) }
 
     var status: Status = .off { didSet { syncUplink() } }
-    var isSpeaking = false
+    /// He is speaking. The mic uplink closes meanwhile (turn-taking instead of echo cancellation).
+    var isSpeaking = false { didSet { syncUplink() } }
     /// The mic is open (call mode). Typed chat runs with the mic closed.
     var isListening = false { didSet { syncUplink() } }
     var micMuted = false { didSet { syncUplink() } }
@@ -483,7 +489,7 @@ final class VoiceAgent {
     }
 
     private func syncUplink() {
-        uplink.set(socket: socket, open: status == .live && isListening && !micMuted)
+        uplink.set(socket: socket, open: status == .live && isListening && !micMuted && !isSpeaking)
     }
 
     private func send(_ object: [String: Any]) {
