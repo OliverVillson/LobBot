@@ -41,8 +41,10 @@ class Config:
     heal_targets: list[str] = field(default_factory=lambda: ["q_proj", "k_proj", "v_proj", "o_proj"])
     heal_train_experts: bool = True  # also LoRA the experts, not just attention and router
     heal_kd_weight: float = 0.0  # >0 adds logit KL to the unpruned teacher (needs it in GPU memory)
+    heal_max_minutes: float | None = None  # wall-clock cap on heal; None uses LOBBOT_HEAL_MAX_MINUTES or 60
     dense_fallback: bool = True
     student_epochs: float = 2.0
+    student_max_minutes: float | None = None  # same for the dense student (LOBBOT_STUDENT_MAX_MINUTES)
     # Quantize: aim below the TaskSpec max size by this margin.
     size_margin_gb: float = 0.5
     bit_floor: str = "q2_k"

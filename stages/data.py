@@ -38,6 +38,9 @@ MAX_MODEL_LEN = int(os.environ.get("LOBBOT_DATA_MAX_LEN", 8192))
 GPU_UTIL = float(os.environ.get("LOBBOT_DATA_GPU_UTIL", 0.85))
 TP = int(os.environ.get("LOBBOT_DATA_TP", 1))
 BATCH = int(os.environ.get("LOBBOT_DATA_BATCH", 256))
+# FlashInfer's B200 decode kernels are JIT-built at startup and need ninja plus a matching nvcc.
+# FLASH_ATTN ships prebuilt. Empty string lets vLLM choose.
+ATTN_BACKEND = os.environ.get("LOBBOT_DATA_ATTN_BACKEND", "FLASH_ATTN")
 OVERSHOOT = 1.3      # extra inputs requested to cover dedupe and answer filtering
 MAX_ROUNDS = 6
 MAX_INPUT_CHARS = 6000  # keeps every answer prompt well inside MAX_MODEL_LEN
@@ -176,7 +179,8 @@ class Teacher:
 
         self.SamplingParams = SamplingParams
         self.llm = LLM(model=model_path, max_model_len=MAX_MODEL_LEN, gpu_memory_utilization=GPU_UTIL,
-                       tensor_parallel_size=TP, seed=0)
+                       tensor_parallel_size=TP, seed=0,
+                       **({"attention_backend": ATTN_BACKEND} if ATTN_BACKEND else {}))
 
     def chat(self, convs: list[list[dict]], temperature: float, max_tokens: int) -> list[Gen]:
         sp = self.SamplingParams(temperature=temperature, top_p=0.95 if temperature > 0.5 else 0.9,
