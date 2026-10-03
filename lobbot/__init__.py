@@ -1,1 +1,1 @@
-"""LobBot frontend: TUI, SSH connection, planner, download (owned by the frontend track)."""
+"""LobBot developer CLI (backend only; end users use the desktop app)."""

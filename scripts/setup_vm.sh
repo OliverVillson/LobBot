@@ -60,6 +60,7 @@ export LOBBOT_MODELS=$NVME/models
 export LOBBOT_LLAMA_CPP=$NVME/llama.cpp
 export LOBBOT_VLLM_PY=$NVME/venv-vllm/bin/python
 export HF_HOME=$NVME/hf-cache
+export LOBBOT_JOBS=$NVME/jobs
 export PATH=$NVME/venv-train/bin:\$PATH
 ENV
 

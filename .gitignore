@@ -5,3 +5,4 @@ __pycache__/
 jobs/
 *.gguf
 *.egg-info/
+*.whl

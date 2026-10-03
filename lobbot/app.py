@@ -1,5 +1,5 @@
-"""Entry point for the `lobbot` command. The frontend track replaces this stub with the Textual app."""
+"""Entry point for the `lobbot` developer command. Stub until the CLI is built."""
 
 
 def main() -> None:
-    print("LobBot TUI is not built yet. Backend: python pipeline.py --job <dir>")
+    print("LobBot dev CLI is not built yet. Use: python pipeline.py --job <dir>, or the API in agent/server.py")
