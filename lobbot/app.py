@@ -11,6 +11,8 @@
     lobbot save <job> --chat         back it up on the VM, download it (resumable,
                                      sha256-checked), import into Ollama, chat
     lobbot pull                      update the VM checkout
+    lobbot chat / ask <model>        talk to a saved model; JSON answers shown as fields
+                                     and code, --out DIR writes the files, C is compiled
 
 Everything talks to agent/server.py on the VM through an SSH tunnel the CLI
 opens itself; logs and job files are read over the same SSH connection.
@@ -983,7 +985,8 @@ def cmd_save(a) -> None:
         raise CliError("ollama create failed (is the Ollama app running?)")
     ok(f"saved in {d} and imported into Ollama. Chat with: lobbot chat {name}")
     if a.chat:
-        os.execvp("ollama", ["ollama", "run", name])
+        cmd_chat(argparse.Namespace(model=name, prompt=[], plain=False, verbose=False, history=False,
+                                    out=None, no_check=False, raw=False))
 
 
 def pull_script(r: Remote, repo: str) -> str:
@@ -1043,11 +1046,124 @@ def cmd_pull(a) -> None:
         print("The API code changed; restart it when no job is running: lobbot up --restart")
 
 
+def answer_one(model: str, messages: list[dict], out: str | None, check: bool, raw: bool) -> str:
+    """Ask the local model once and print its answer readably (JSON as fields and code)."""
+    from lobbot import answer
+
+    state = {"mode": None, "n": 0}  # mode: "live" prints tokens as they come, "json" renders at the end
+
+    def on_token(tok: str) -> None:
+        if state["mode"] is None:
+            head = tok.lstrip()
+            if not head:
+                return
+            state["mode"] = "json" if not raw and head[0] in "{[`" else "live"
+        state["n"] += 1
+        if state["mode"] == "live":
+            sys.stdout.write(tok)
+            sys.stdout.flush()
+        elif sys.stderr.isatty():
+            sys.stderr.write(f"\r  {c('writing…', '2')} {state['n']} tokens")
+            sys.stderr.flush()
+
+    try:
+        text, stats = answer.ollama_chat(model, messages, on_token)
+    except answer.OllamaError as e:
+        raise CliError(str(e))
+    if state["mode"] == "json" and sys.stderr.isatty():
+        sys.stderr.write("\r\x1b[K")
+    codes = []
+    if state["mode"] == "live":
+        print()
+    elif state["mode"] == "json":
+        shown, codes = answer.render(text, c, min(shutil.get_terminal_size((100, 24)).columns, 100))
+        print(shown + "\n")
+    if not raw and state["mode"] == "live":
+        codes = answer.code_fields(answer.parse(text) or {})
+    if answer.speed(stats):
+        print(c(answer.speed(stats), "2"))
+    if codes and out:
+        paths = answer.write(codes, Path(out).expanduser())
+        ok(f"wrote {', '.join(p.name for p in paths)} to {Path(out).expanduser()}")
+    if codes and check:
+        res = answer.compile_check(codes)
+        if res is None and any(x.name.endswith((".c", ".h")) for x in codes):
+            warn("no C compiler found (cc, clang or gcc), so the code was not compiled")
+        elif res:
+            good, cmd, output = res
+            warnings = output.count("warning:")
+            if good:
+                ok("compiles" + (f", with {warnings} warning(s)" if warnings else "") + c(f"   {cmd}", "2"))
+            else:
+                print(c("✗ ", "31") + "does not compile" + c(f"   {cmd}", "2"))
+            if output:
+                body = output.splitlines()
+                print("\n".join("  " + l for l in body[:12]) + (f"\n  ... {len(body) - 12} more lines" if len(body) > 12 else ""))
+    return text
+
+
+def cmd_ask(a) -> None:
+    if a.file:
+        prompt = Path(a.file).read_text()
+    elif a.prompt and a.prompt != ["-"]:
+        prompt = " ".join(a.prompt)
+    elif not sys.stdin.isatty():
+        prompt = sys.stdin.read()
+    else:
+        raise CliError(f'give a prompt, e.g. lobbot ask {a.model} "...", or -f FILE, or pipe it in')
+    answer_one(a.model, [{"role": "user", "content": prompt}], a.out, not a.no_check, a.raw)
+
+
+def read_message() -> str | None:
+    """One message from the prompt; \"\"\" opens and closes a multi-line one. None at the end."""
+    try:
+        line = input(c("» ", "1"))
+    except EOFError:
+        print()
+        return None
+    if not line.strip().startswith('"""'):
+        return line
+    lines = [line.strip()[3:]]
+    while True:
+        if lines[-1].rstrip().endswith('"""') and (len(lines) > 1 or len(lines[0].strip()) > 3):
+            lines[-1] = lines[-1].rstrip()[:-3]
+            return "\n".join(lines).strip()
+        try:
+            lines.append(input(c("… ", "2")))
+        except EOFError:
+            return "\n".join(lines).strip()
+
+
 def cmd_chat(a) -> None:
-    if not shutil.which("ollama"):
-        raise CliError("ollama is not installed here; get it from https://ollama.com/download")
-    os.execvp("ollama", ["ollama", "run", "--verbose", a.model, *a.prompt] if a.verbose
-              else ["ollama", "run", a.model, *a.prompt])
+    if a.plain:
+        if not shutil.which("ollama"):
+            raise CliError("ollama is not installed here; get it from https://ollama.com/download")
+        os.execvp("ollama", ["ollama", "run", *(["--verbose"] if a.verbose else []), a.model, *a.prompt])
+    if a.prompt:
+        answer_one(a.model, [{"role": "user", "content": " ".join(a.prompt)}], a.out, not a.no_check, a.raw)
+        return
+    print(f"Chatting with {c(a.model, '1')}. " + ("The model sees the whole conversation. " if a.history else
+          "Each message is answered on its own, as the model was trained (--history keeps the conversation). ")
+          + 'Start and end a multi-line message with """. Quit with /bye or Ctrl-D.')
+    history: list[dict] = []
+    while True:
+        msg = read_message()
+        if msg is None or msg.strip() in ("/bye", "/exit", "/quit"):
+            return
+        if not msg.strip():
+            continue
+        messages = history + [{"role": "user", "content": msg}]
+        try:
+            text = answer_one(a.model, messages, a.out, not a.no_check, a.raw)
+        except KeyboardInterrupt:
+            print(c("\n(stopped)", "2"))
+            continue
+        except CliError as e:
+            print(c("error: ", "31") + str(e), file=sys.stderr)
+            continue
+        if a.history:
+            history = messages + [{"role": "assistant", "content": text}]
+        print()
 
 
 # ----------------------------------------------------------------- argument parsing
@@ -1155,10 +1271,24 @@ def parser() -> argparse.ArgumentParser:
                     help=f"re-point the VM checkout's origin first (default {GITHUB_URL})")
     sp.add_argument("-y", "--yes", action="store_true", help="don't ask before stashing")
 
-    sp = add("chat", cmd_chat, "chat with an installed model in Ollama")
+    def answer_opts(sp):
+        sp.add_argument("--out", metavar="DIR", help="write the answer's code fields to files in DIR")
+        sp.add_argument("--no-check", action="store_true", help="don't compile C code to check it")
+        sp.add_argument("--raw", action="store_true", help="print answers exactly as the model wrote them")
+
+    sp = add("chat", cmd_chat, "chat with an installed model in Ollama; JSON answers are shown readably")
     sp.add_argument("model")
     sp.add_argument("prompt", nargs="*", help="one-shot prompt (default interactive)")
-    sp.add_argument("-v", "--verbose", action="store_true", help="show tok/s after each answer")
+    sp.add_argument("--history", action="store_true", help="send the whole conversation, not just the last message")
+    sp.add_argument("--plain", action="store_true", help="use plain `ollama run` instead")
+    sp.add_argument("-v", "--verbose", action="store_true", help="with --plain: show tok/s (always shown otherwise)")
+    answer_opts(sp)
+
+    sp = add("ask", cmd_ask, "ask an installed model one question and show the answer readably")
+    sp.add_argument("model")
+    sp.add_argument("prompt", nargs="*", help="the question (or - / a pipe to read it from stdin)")
+    sp.add_argument("-f", "--file", help="read the question from a file")
+    answer_opts(sp)
     return p
 
 
