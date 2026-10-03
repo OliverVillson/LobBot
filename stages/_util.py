@@ -89,7 +89,9 @@ class Job:
             (self.root / ".done" / s).unlink(missing_ok=True)
 
     def save_config(self) -> None:
-        (self.root / "config.json").write_text(json.dumps(asdict(self.config), indent=2))
+        """Record the effective config of this run. config.json stays the user's
+        overrides only, so later default changes still apply on resume."""
+        (self.root / "work" / "config.effective.json").write_text(json.dumps(asdict(self.config), indent=2))
 
 
 def run(cmd: list[str], stage: str, cwd: str | Path | None = None, env: dict | None = None) -> None:
