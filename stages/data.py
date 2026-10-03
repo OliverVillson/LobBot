@@ -43,6 +43,8 @@ BATCH = int(os.environ.get("LOBBOT_DATA_BATCH", 256))
 # FlashInfer's B200 decode kernels are JIT-built at startup and need ninja plus a matching nvcc.
 # FLASH_ATTN ships prebuilt. Empty string lets vLLM choose.
 ATTN_BACKEND = os.environ.get("LOBBOT_DATA_ATTN_BACKEND", "FLASH_ATTN")
+# FlashInfer's top-p/top-k sampler is JIT-built the same way during warmup.
+os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
 OVERSHOOT = 1.3      # extra inputs requested to cover dedupe and answer filtering
 MAX_ROUNDS = 6
 MAX_INPUT_CHARS = 6000  # keeps every answer prompt well inside MAX_MODEL_LEN
