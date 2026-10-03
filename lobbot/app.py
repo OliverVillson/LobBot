@@ -106,6 +106,7 @@ class Board:
         self.started: dict[str, float] = {}
         self.ended: dict[str, float] = {}
         self.drawn = 0
+        self.note = ""  # e.g. "reconnecting", shown in the footer
 
     def update(self, e: dict) -> None:
         st = e.get("stage")
@@ -150,7 +151,8 @@ class Board:
         end = max(self.ended.values()) if all(r["status"] in ("done", "skipped", "error") for r in self.stages.values()) \
             and self.ended else time.time()
         cur = next((st for st, r in self.stages.items() if r["status"] == "running"), None)
-        return c(f"  elapsed {dur(end - t0)}" + (f" · now: {cur}" if cur else ""), "2")
+        return c(f"  elapsed {dur(end - t0)}" + (f" · now: {cur}" if cur else ""), "2") + \
+            (c(f"  · {self.note}", "33") if self.note else "")
 
     def draw(self) -> None:
         if not TTY:
@@ -189,10 +191,17 @@ def check_job_id(job: str, loose: bool = False) -> str:
     return job
 
 
-def watch(r: Remote, job_id: str) -> str:
-    """Stream a job's progress until its run ends, reconnecting if the tunnel drops.
+# A run that ended while the stream was down: its final event, rebuilt from GET /jobs/{id}.
+FINAL_FROM_STATE = {"done": {"status": "done"}, "stopped": {"status": "stopped"},
+                    "partial": {"status": "done", "model": False, "msg": "partial run, no packaged model"}}
 
-    Returns the final state: done, error, detached or unknown."""
+
+def watch(r: Remote, job_id: str) -> str:
+    """Stream a job's progress until its run ends, reconnecting whenever the stream drops.
+
+    A dropped SSH tunnel often closes the stream between two events, which looks
+    like a clean end, so an end without the run's final event is a reconnect too.
+    Returns the final state: done, error, stopped or detached."""
     import http.client
 
     board = Board()
@@ -200,10 +209,12 @@ def watch(r: Remote, job_id: str) -> str:
     final, seen, failures = None, 0, 0
     try:
         while final is None:
+            started, problem = time.time(), "the progress stream closed"
             try:
                 with r.tunnel() as base:
+                    api = Api(base, r.token())
                     n = 0
-                    for e in Api(base, r.token()).events(job_id):
+                    for e in api.events(job_id):
                         if not e:
                             board.draw()  # keepalive: refresh the elapsed clock
                             continue
@@ -211,31 +222,42 @@ def watch(r: Remote, job_id: str) -> str:
                         if n <= seen:
                             continue  # the stream replays the run from its start after a reconnect
                         seen, failures = n, 0
+                        if board.note:
+                            board.note = ""
                         if e.get("stage") == "pipeline":
                             if e["status"] != "running":
                                 final = e
                             continue
                         board.update(e)
                         board.draw()
-                if final is None:
-                    break  # stream closed cleanly without a final event
+                    if final is None:  # ended without the final event: did the run end meanwhile?
+                        st = api.get(f"/jobs/{job_id}")
+                        if st["state"] in FINAL_FROM_STATE:
+                            final = FINAL_FROM_STATE[st["state"]]
+                        elif st["state"] in ("error", "queued"):
+                            final = {"status": "error", "msg": st.get("error") or "not running"}
             except (OSError, http.client.HTTPException, ApiError, RemoteError) as e:
                 if isinstance(e, ApiError) and e.status in (401, 404):
                     raise
-                failures += 1
-                if failures > 20:
-                    raise CliError(f"lost the connection to the VM ({e}); the job keeps running. "
-                                   f"Try again with: lobbot watch {job_id}")
-                if not TTY:
-                    print(f"connection lost ({e}); reconnecting...", file=sys.stderr)
-                time.sleep(min(30, 3 * failures))
+                problem = f"connection lost ({e})"
+            if final is not None:
+                break
+            if time.time() - started > 60:
+                failures = 0  # it streamed for a while: a fresh drop, not a dead connection
+            failures += 1
+            if failures > 20:
+                raise CliError(f"{problem}, and reconnecting keeps failing; the job keeps running. "
+                               f"Try again with: lobbot watch {job_id}")
+            board.note = f"reconnecting ({problem.split(' (')[0]})"
+            board.draw()
+            if not TTY:
+                print(f"{problem}; reconnecting...", file=sys.stderr)
+            time.sleep(min(30, 2 * failures))
     except KeyboardInterrupt:
         print(f"\nStopped watching. Pick it up again with: lobbot watch {job_id}")
         return "detached"
+    board.note = ""
     board.draw()
-    if final is None:
-        warn("the progress stream ended early; check: lobbot status " + job_id)
-        return "unknown"
     if final["status"] == "done":
         if "model" in final and not final["model"]:
             ok(f"pipeline run finished: {final.get('msg', '')}")
