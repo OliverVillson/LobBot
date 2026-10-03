@@ -64,9 +64,10 @@ def test_missing_taskspec_fails(tmp_path):
 def test_config_accepts_time_caps(tmp_path):
     from stages._util import Job
 
-    (tmp_path / "config.json").write_text(json.dumps({"heal_max_minutes": 20, "student_max_minutes": 15, "heal_max_len": 4096}))
+    (tmp_path / "config.json").write_text(json.dumps({"heal_max_minutes": 20, "student_max_minutes": 15, "heal_max_len": 4096, "student_lr": 5e-5}))
     cfg = Job(tmp_path).config
     assert (cfg.heal_max_minutes, cfg.student_max_minutes, cfg.heal_max_len) == (20, 15, 4096)
+    assert cfg.student_lr == 5e-5
 
 
 def test_overrides_file_is_not_frozen(tmp_path):
