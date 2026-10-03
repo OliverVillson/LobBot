@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#F6F0E7"><meta name="description" content="Six palettes appliquées au logo Sillon et à une interface LOBBOT.">
+  <title>LOBBOT — Sillon, les couleurs en action</title>
+  <link rel="preload" href="assets/fonts/Manrope.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="assets/palettes/palette-tokens.css"><link rel="stylesheet" href="palettes.css">
+</head>
+<body data-palette="incision">
+  <a class="skip" href="#main">Aller aux palettes</a>
+  <header class="page-header wrap"><a class="brand" href="palettes.html"><svg class="sillon" viewBox="0 0 128 128" aria-hidden="true"></svg><span>lobbot</span></a><span class="header-note">Sillon · logo M</span><a class="text-link" href="assets/palettes/lobbot-sillon-palettes.zip" download>Les fichiers SVG <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v12m-5-5 5 5 5-5M5 19h14"/></svg></a></header>
+  <main id="main" class="wrap">
+    <div class="intro"><h1>Un sillon.<br>Six tempéraments.</h1><p>Le même logo, six façons de faire vivre LOBBOT. Choisissez une palette pour l’appliquer à toute l’interface.</p></div>
+    <fieldset class="palette-field"><legend>Choisir une palette</legend><div class="palette-picker" id="palette-picker"></div></fieldset>
+    <section class="application" aria-label="Application de la palette">
+      <div class="proposition"><div class="application-brand"><svg class="sillon" viewBox="0 0 128 128" aria-hidden="true"></svg><span>lobbot</span></div><h2>Coupez le modèle.<br>Gardez la capacité.</h2><p>Un agent de compression autonome qui teste la capacité à préserver à chaque modification du modèle.</p><div class="actions"><button class="button primary" type="button" id="run">Lancer une expérience <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12h16m-6-6 6 6-6 6"/></svg></button><a class="text-link" href="#colors">Voir les couleurs</a></div><span class="sample-note">Aperçu de marque · simulation visuelle</span></div>
+      <div class="emblem"><svg class="sillon" viewBox="0 0 128 128" role="img" aria-label="Logo Sillon, le cerveau ouvert de LOBBOT"></svg><div class="emblem-caption"><span id="palette-title">Incision</span><span id="palette-description">Corail chirurgical</span></div></div>
+    </section>
+    <section class="workspace" aria-labelledby="workspace-title">
+      <div class="workspace-title"><h2 id="workspace-title">Dans l’interface.</h2><p>Actions, sélection et résultat de l’expérience.</p></div>
+      <div class="workspace-body">
+        <div class="configuration"><label for="capability">Capacité à préserver</label><select id="capability"><option value="code">Code</option><option value="maths">Raisonnement mathématique</option><option value="classification">Classification</option></select><label for="budget">Budget de mémoire · exemple</label><div class="range-line"><input id="budget" type="range" min="2" max="16" value="8" step="1"><output for="budget" id="budget-value">8 Go</output></div><div class="configuration-note"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 4 6v6c0 5 8 9 8 9s8-4 8-9V6ZM8 12l3 3 5-6"/></svg><p>Chaque modification doit satisfaire le critère d’évaluation choisi.</p></div></div>
+        <div class="result"><div class="result-top"><span>Expérience / <span id="capability-name">code</span></span><span class="status neutral" id="status">Prêt à tester</span></div><div class="model-comparison"><div><span>Modèle initial</span><div class="model-track"><div class="model-fill original"></div></div></div><div><span>Candidat spécialisé</span><div class="model-track"><div class="model-fill candidate" id="candidate"></div></div></div></div><p class="result-description" id="result-description" aria-live="polite">Choisissez une capacité, puis lancez l’expérience pour voir les états de l’interface.</p><button class="text-link restore" type="button" id="restore">Voir une restauration <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 8h8a7 7 0 1 1-7 10M5 8V3M5 8h5"/></svg></button><span class="sample-note">Données illustratives. Aucun modèle ni benchmark n’est exécuté.</span></div>
+      </div>
+    </section>
+    <section class="color-section" id="colors" aria-labelledby="colors-title"><div class="colors-heading"><h2 id="colors-title">La palette <span id="palette-label">Incision</span>.</h2><a class="text-link" id="download-tokens" href="assets/palettes/tokens-incision.json" download>Télécharger les tokens <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v12m-5-5 5 5 5-5M5 19h14"/></svg></a></div><div class="color-swatches" id="color-swatches"></div><div class="color-footer"><p id="palette-note">Précis et provocant.</p><a class="text-link" id="download-logo" href="assets/palettes/sillon-incision-accent.svg" download>Le logo dans cette couleur <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v12m-5-5 5 5 5-5M5 19h14"/></svg></a></div></section>
+  </main>
+  <footer class="wrap page-footer"><span>LOBBOT / Exploration de couleurs</span><a href="assets/palettes/sillon-palettes.png" target="_blank" rel="noopener">Comparer les six palettes sur une planche</a></footer>
+  <script src="palettes.js"></script>
+</body>
+</html>

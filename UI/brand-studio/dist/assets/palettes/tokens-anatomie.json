@@ -1,0 +1,12 @@
+{
+  "id": "anatomie",
+  "name": "Anatomie",
+  "note": "Bordeaux et rose · organique et singulier",
+  "canvas": "#F3E7E6",
+  "surface": "#FCF4F2",
+  "ink": "#592C3B",
+  "secondary": "#805764",
+  "line": "#D4B5BB",
+  "accent": "#A13D58",
+  "onaccent": "#FFFFFF"
+}

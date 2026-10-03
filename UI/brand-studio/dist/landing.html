@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f5f5f1"><meta name="description" content="LOBBOT is an autonomous model-compression agent that experiments on a pretrained model while testing the capability you want to preserve.">
+  <title>LOBBOT — Cut the model. Keep the capability.</title>
+  <link rel="icon" type="image/svg+xml" href="assets/logos/favicon.svg">
+  <link rel="preload" href="assets/fonts/Archivo.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body data-direction="incision">
+  <a class="skip" href="#main">Skip to content</a>
+  <header class="site-header"><a class="brand identity-link" href="index.html?direction=incision" aria-label="LOBBOT identity"><img src="assets/logos/incision-symbol-ink.svg" alt="" width="28" height="28"><span>LOBBOT</span></a><nav aria-label="Main navigation"><a href="#method">The method</a><a href="#contract">The contract</a><a href="#constraints">Your constraints</a></nav><a class="header-link identity-link" href="index.html?direction=incision">Identity Lab <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 19 19 5M5 5h14v14"/></svg></a></header>
+  <main id="main">
+    <section class="landing-hero wrap">
+      <div><h1>Cut the model.<br>Keep the<br><span>capability.</span></h1><p class="hero-description">Give LOBBOT a pretrained model and a skill to preserve. The agent experiments on its structure, tests each change, and keeps the reductions that meet your criterion.</p><div class="hero-actions"><a class="button solid" href="#contract">Explore the contract <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12h16m-6-6 6 6-6 6"/></svg></a><a class="text-link" href="#method">How it works <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v16m-6-6 6 6 6-6"/></svg></a></div><p class="hero-footnote">Hackathon concept · Capability-guided model compression</p></div>
+      <div class="experiment" data-experiment><div class="experiment-header"><span>Target capability: code</span><span class="experiment-state" data-state>Original model</span></div><div class="model-bars" data-model aria-label="Illustrative model components surrounding a protected capability"></div><div class="experiment-axis"><span>Model structure</span><span class="protected-legend"><i></i>Target capability</span></div><p class="experiment-description" data-description>The protected signal stays fixed. Surrounding components can be removed.</p><div class="experiment-controls"><button type="button" class="button accent" data-run>Run the experiment <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 5 10 7-10 7z"/></svg></button><button type="button" class="reset-button" data-reset>Reset</button></div><p class="simulation-note">Illustrative sequence. No real model or benchmark is running.</p></div>
+    </section>
+    <div class="landing-marquee wrap" aria-label="Core principles"><span><i></i>Capability first</span><span><i></i>Test every change</span><span><i></i>Restore on failure</span><span><i></i>Reduce to purpose</span></div>
+    <section class="landing-mechanism wrap" id="method"><div class="section-heading"><h2>One capability.<br>A continuous test.</h2><p>Inspired by awake brain surgery: keep checking the function while changing the structure. Every accepted reduction is an experiment with an explicit criterion.</p></div><div class="flow-list"><div class="flow-step"><h3><span class="step-index" aria-hidden="true">01</span><span>Choose the skill.</span></h3><p>Start with your pretrained model and tasks that represent the capability you need.</p></div><div class="flow-step"><h3><span class="step-index" aria-hidden="true">02</span><span>Remove a candidate.</span></h3><p>The agent modifies or removes model components, then evaluates the resulting model.</p></div><div class="flow-step"><h3><span class="step-index" aria-hidden="true">03</span><span>Keep or restore.</span></h3><p>Compare the evaluation with your acceptance criterion. A damaging change is reversed.</p><div class="branch"><span>Pass → keep</span><span>Fail → restore</span></div></div><div class="flow-step"><h3><span class="step-index" aria-hidden="true">04</span><span>Specialize further.</span></h3><p>Repeat the search toward your size, memory, latency or hardware constraints.</p></div></div></section>
+    <section class="developer-section" id="contract"><div class="developer-grid wrap"><div><h2>You define<br>what must survive.</h2><p>Coding, mathematical reasoning, classification, or another target task. The evaluation you choose tells the agent which reductions are acceptable.</p><p>LOBBOT aims to find the structure necessary for your use case, instead of trying to preserve every capability equally.</p></div><div class="code-specimen"><pre><span class="comment"># Illustrative input contract</span>
+<span class="key">model</span>: <span class="value">your_pretrained_model</span>
+<span class="key">preserve</span>:
+  <span class="key">capability</span>: <span class="value">code</span>
+  <span class="key">benchmark</span>: <span class="value">your_task_suite</span>
+  <span class="key">acceptance</span>: <span class="value">your_quality_criterion</span>
+<span class="key">constraints</span>:
+  <span class="key">memory</span>: <span class="value">your_budget</span>
+  <span class="key">latency</span>: <span class="value">your_target</span>
+  <span class="key">hardware</span>: <span class="value">your_device</span>
+
+<span class="comment"># modify → evaluate → keep / restore</span></pre><p>This describes the product concept. It is not an implemented SDK, executable command, or public API.</p></div></div></section>
+    <section class="constraint-section wrap" id="constraints"><div class="section-heading"><h2>Make the model fit<br>the job.</h2><p>The search starts with a function to preserve. Optional deployment constraints define where the specialized model should ultimately run.</p></div><div class="constraint-list"><div><h3>Size & memory</h3><p>Provide a target model size or memory budget. Resource savings must be measured on the resulting model.</p></div><div><h3>Latency & hardware</h3><p>Define your target device and latency requirements. A smaller structure alone does not prove faster inference.</p></div><div><h3>Local & edge</h3><p>Explore specialized models for constrained environments. Compatibility depends on the actual model, runtime and hardware.</p></div></div><p class="research-note">LOBBOT is a hackathon project. This page presents the proposed mechanism. No measured compression ratio, benchmark retention, inference speed or supported model list has been published here.</p></section>
+    <section class="landing-close"><div class="wrap"><div><h2>Less model.<br>Same mission.</h2><p>A model shaped around the capability you need.<br>A reduction process guided by evidence.</p></div><a class="button solid identity-link" href="index.html?direction=incision">Explore the LOBBOT identity <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12h16m-6-6 6 6-6 6"/></svg></a></div></section>
+  </main>
+  <footer class="site-footer wrap"><span>LOBBOT / Autonomous model compression</span><span>Hackathon concept · October 2026</span><a href="#main">Back to top <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20V4m-6 6 6-6 6 6"/></svg></a></footer><script src="app.js"></script>
+</body>
+</html>

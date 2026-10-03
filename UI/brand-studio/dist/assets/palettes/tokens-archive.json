@@ -1,0 +1,12 @@
+{
+  "id": "archive",
+  "name": "Archive",
+  "note": "Charbon et papier · discret et intemporel",
+  "canvas": "#ECEDE7",
+  "surface": "#F8F8F0",
+  "ink": "#292D26",
+  "secondary": "#626858",
+  "line": "#C4C8BB",
+  "accent": "#292D26",
+  "onaccent": "#F8F8F0"
+}

@@ -1,0 +1,12 @@
+{
+  "id": "sauge",
+  "name": "Sauge",
+  "note": "Vert végétal · calme et expérimental",
+  "canvas": "#EEF2E8",
+  "surface": "#F8FAF2",
+  "ink": "#233C30",
+  "secondary": "#526453",
+  "line": "#BCC7B6",
+  "accent": "#B9CFA6",
+  "onaccent": "#233C30"
+}
