@@ -1,38 +1,52 @@
 import SwiftUI
 
-/// One screen, built around Dr. Lobbot: he sits on top and talks, the panel under him follows
-/// the consultation, and the bar at the bottom lets you type to him or call him full screen.
-/// The stage stays the same view in both layouts so the WebGL mascot is never reloaded.
+/// One screen, built around Dr. Lobbot. Three layouts of the same stage:
+/// - home: he's big on top, his bubble under him;
+/// - consultation (job, chart, target, surgery, discharge): he shrinks to a picture-in-picture tile at the
+///   top left, his bubble beside him, and the panel takes the screen;
+/// - call from the home page: he fills the screen.
+/// The stage is always the same view (AnyLayout keeps its identity), so the WebGL mascot never reloads.
 struct ContentView: View {
     @Environment(Session.self) private var session
     @State private var splash = true
 
     var body: some View {
         GeometryReader { geo in
+            let full = session.fullScreenCall
+            let pip = session.diagnosing
+            let tile = min(150, geo.size.width * 0.38)
+            let layout = pip ? AnyLayout(HStackLayout(alignment: .top, spacing: 14)) : AnyLayout(VStackLayout(spacing: -14))
             ZStack {
                 VStack(spacing: 12) {
-                    if !session.inCall {
+                    if !full {
                         header
                         if case .failed(let message) = session.voice.status {
                             VoiceErrorBanner(message: message)
                         }
                     }
 
-                    VStack(spacing: -14) {
-                        MascotStage(cornerRadius: session.inCall ? 0 : 28)
-                            .frame(height: session.inCall ? nil : min(geo.size.width - 32, geo.size.height * 0.42))
-                            .frame(maxHeight: session.inCall ? .infinity : nil)
-                            .ignoresSafeArea(edges: session.inCall ? .all : [])
-                        if !session.inCall, let line = session.line {
-                            SpeechBubble(text: line)
-                                .padding(.horizontal, 24)
-                                .transition(.opacity.combined(with: .offset(y: -8)))
+                    layout {
+                        MascotStage(cornerRadius: full ? 0 : pip ? 22 : 28)
+                            .frame(width: pip ? tile : nil,
+                                   height: full ? nil : pip ? tile * 1.15 : min(geo.size.width - 32, geo.size.height * 0.42))
+                            .frame(maxHeight: full ? .infinity : nil)
+                            .ignoresSafeArea(edges: full ? .all : [])
+                            .overlay(alignment: .topLeading) {
+                                if pip, session.inCall { LiveBadge() }
+                            }
+                        if !full, let line = session.line {
+                            SpeechBubble(text: line, tail: pip ? .leading : .top)
+                                .lineLimit(pip ? 7 : nil)
+                                .truncationMode(.head)   // a live transcript keeps its latest words
+                                .padding(.horizontal, pip ? 0 : 24)
+                                .padding(.top, pip ? 6 : 0)
+                                .transition(.opacity)
                         }
                     }
-                    .padding(.horizontal, session.inCall ? 0 : 16)
+                    .padding(.horizontal, full ? 0 : 16)
                     .animation(.easeOut(duration: 0.25), value: session.line)
 
-                    if !session.inCall {
+                    if !full {
                         if session.voice.isOn, !session.voice.heard.isEmpty {
                             Text(session.voice.heard)
                                 .font(.footnote)
@@ -56,16 +70,17 @@ struct ContentView: View {
                     }
                 }
 
-                if session.inCall {
+                if full {
                     CallOverlay().transition(.opacity)
                 }
             }
         }
         .background(Brand.canvas.ignoresSafeArea())
         .safeAreaInset(edge: .bottom) {
-            if !session.inCall { Composer() }
+            if !session.fullScreenCall { Composer() }
         }
-        .animation(.snappy(duration: 0.4), value: session.inCall)
+        .animation(.snappy(duration: 0.45), value: session.fullScreenCall)
+        .animation(.snappy(duration: 0.45), value: session.diagnosing)
         .overlay {
             if splash {
                 SplashView().transition(.opacity.combined(with: .scale(scale: 1.08)))
@@ -116,6 +131,26 @@ struct ContentView: View {
         case .surgery: SurgeryPanel()
         case .done: ResultPanel()
         }
+    }
+}
+
+/// "Live" tag on the picture-in-picture tile while a call is on.
+private struct LiveBadge: View {
+    @Environment(Session.self) private var session
+
+    var body: some View {
+        let voice = session.voice
+        HStack(spacing: 5) {
+            Circle().fill(voice.micMuted ? Brand.rose : Color.green).frame(width: 7, height: 7)
+            Text(voice.micMuted ? "Muted" : voice.isSpeaking ? "Talking" : "Live")
+                .font(.caption2.weight(.bold))
+                .foregroundStyle(.white)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(Color.black.opacity(0.25), in: Capsule())
+        .padding(8)
+        .accessibilityElement(children: .combine)
     }
 }
 

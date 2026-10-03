@@ -65,7 +65,11 @@ One palette, **Anatomie: bordeaux and rose**, light only. No dark mode, no other
 - **One screen, built around the mascot:** header (logo + "Replay" pill), Dr. Lobbot's stage with his
   speech bubble under it, the panel for the current phase (home → the job → the chart → the target → the
   surgery board → discharge), and the
-  composer docked at the bottom (text field + mic). The mic opens a full-screen call where the stage fills the page.
+  composer docked at the bottom (text field + mic).
+- **Three layouts of the same stage** (never recreate it, the WebGL would reload): big on the home page; a
+  picture-in-picture tile (150 pt, top left, 22 pt radius) during a consultation, with his bubble beside him
+  (tail pointing at him) and the panel taking the screen; full screen for a call started from the home page.
+  A call during a consultation stays in the tile with a "Live" tag, and Mute and End move into the bottom bar.
 - Components to reuse: `PrimaryButton`, `OptionTile`, `Field`, `.card()` (`Brand.swift`), `SpeechBubble`,
   `MascotStage` (`MascotStage.swift`).
 

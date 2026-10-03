@@ -38,11 +38,11 @@ struct MascotStage: View {
     }
 }
 
-/// What Lobbot says, typed out letter by letter. The tail points up (bubble under him)
-/// or down (bubble above his head, in a call).
+/// What Lobbot says, typed out letter by letter. `tail` is the side facing him: top (bubble under
+/// the stage), bottom (above his head in a full-screen call) or leading (beside his picture-in-picture tile).
 struct SpeechBubble: View {
     let text: String
-    var tailOnTop = true
+    var tail: Edge = .top
     @State private var shown = 0
     @State private var typed = ""
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -58,12 +58,12 @@ struct SpeechBubble: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
         .background(Brand.surface, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-        .overlay(alignment: tailOnTop ? .topLeading : .bottom) {
+        .overlay(alignment: tail == .bottom ? .bottom : .topLeading) {
             BubbleTail()
                 .fill(Brand.surface)
                 .frame(width: 20, height: 11)
-                .rotationEffect(.degrees(tailOnTop ? 0 : 180))
-                .offset(x: tailOnTop ? 36 : 0, y: tailOnTop ? -10 : 10)
+                .rotationEffect(.degrees(tail == .bottom ? 180 : tail == .leading ? -90 : 0))
+                .offset(tailOffset)
         }
         .shadow(color: Brand.ink.opacity(0.14), radius: 12, y: 4)
         .accessibilityElement(children: .ignore)
@@ -78,6 +78,16 @@ struct SpeechBubble: View {
                 try? await Task.sleep(for: .milliseconds(28))
                 if Task.isCancelled { return }
             }
+        }
+    }
+}
+
+private extension SpeechBubble {
+    var tailOffset: CGSize {
+        switch tail {
+        case .bottom: CGSize(width: 0, height: 10)
+        case .leading: CGSize(width: -15, height: 24)
+        default: CGSize(width: 36, height: -10)
         }
     }
 }

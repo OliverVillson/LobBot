@@ -149,9 +149,10 @@ final class Session {
     let lobbot = LobbotController()
     let voice = VoiceAgent()
 
-    var phase: Phase = .home
-    /// Full-screen voice call with Lobbot.
-    var inCall = false
+    var phase: Phase = .home { didSet { reframe() } }
+    /// A voice call with Lobbot is on (mic open). Full screen from the home page, picture-in-picture
+    /// during a consultation.
+    var inCall = false { didSet { reframe() } }
     var history: [SurgeryRecord] = []
     /// What Lobbot is saying; nil hides the speech bubble.
     var line: String?
@@ -162,9 +163,23 @@ final class Session {
 
     @ObservationIgnored private var run: Task<Void, Never>?
     @ObservationIgnored private var speech: Task<Void, Never>?
+    @ObservationIgnored private var framedClose: Bool?
 
     init() {
         voice.session = self
+    }
+
+    /// A consultation is on: Lobbot shrinks to a picture-in-picture tile and the panel takes the screen.
+    var diagnosing: Bool { phase != .home }
+    var fullScreenCall: Bool { inCall && !diagnosing }
+
+    /// Close-up whenever he's in a small tile or a full-screen call; wide when his props need room
+    /// (the home stage, and the operating room during surgery).
+    private func reframe() {
+        let close = phase != .surgery && (diagnosing || inCall)
+        guard close != framedClose else { return }
+        framedClose = close
+        lobbot.setFraming(close: close)
     }
 
     var jobTitle: String { job.isBlank ? QualityRun.demoJob : job.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -232,10 +247,6 @@ final class Session {
     func begin() {
         speech?.cancel()
         run?.cancel()
-        if inCall {   // the surgery needs the board: leave the full screen, keep talking
-            inCall = false
-            lobbot.setFraming(close: false)
-        }
         rows = Stage.allCases.map { StageRow(stage: $0) }
         phase = .surgery
         line = "Practice first: the big model does your job a couple of thousand times."
@@ -317,14 +328,12 @@ final class Session {
 
     func startCall() {
         inCall = true
-        lobbot.setFraming(close: true)
         if voice.status == .live { voice.setListening(true) } else { voice.start(listening: true) }
         voiceChanged()
     }
 
     func endCall() {
         inCall = false
-        lobbot.setFraming(close: false)
         voice.stop()
     }
 
