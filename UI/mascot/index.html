@@ -575,6 +575,13 @@ function notesAt(tw) {
   }
   return { line: NOTES.length - 1, frac: 1, writing: false, done: true };
 }
+// Redraw (and re-upload) the sheet only when the writing moved, not on every frame: lighter during calls.
+let notesKey = '', notesTip = { x: 0, y: 0 };
+function drawNotesCached(w) {
+  const key = w.line + ':' + Math.floor(w.frac * 100);
+  if (key !== notesKey) { notesKey = key; notesTip = drawNotes(w); }
+  return notesTip;
+}
 function drawNotes(w) {
   const c = nctx;
   c.fillStyle = '#fffaf8'; c.fillRect(0, 0, 600, 780);
@@ -723,7 +730,7 @@ const SCENES = {
       clipboard.visible = true; clipboard.scale.setScalar(Math.max(0.001, k * 1.3));
       const close = framing === 'close';   // in a call the clipboard sits below his face, like a desk
       clipboard.position.set(close ? 0.3 : Math.min(1.9, halfW - 0.7), (close ? -1.45 : -0.25) + Math.sin(s * 1.3) * 0.02, close ? 1.2 : 0.9);
-      const w = notesAt(s - 0.8), tip = drawNotes(w);
+      const w = notesAt(s - 0.8), tip = drawNotesCached(w);
       pen.visible = s > 0.35;
       const lift = w.writing ? 0 : 0.06;
       pen.position.set((tip.x / 600 - 0.5) * SHEET_W, (0.5 - (tip.y - 8) / 780) * SHEET_H + SHEET_Y + (w.writing ? Math.sin(s * 38) * 0.008 : 0), 0.02 + lift);

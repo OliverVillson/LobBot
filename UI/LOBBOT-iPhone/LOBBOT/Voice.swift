@@ -63,12 +63,13 @@ enum VoiceConfig {
 }
 
 /// Speaker playback of Gemini's 24 kHz PCM, plus (when listening) mic → 16 kHz PCM chunks with echo cancellation.
-/// Runs on audio threads, so nothing here is main-actor isolated.
+/// Every audio-session and engine call runs on one private serial queue: they can block for seconds
+/// (category switch, echo cancellation), and on the main thread that froze the whole app during calls.
 nonisolated final class VoiceAudio: @unchecked Sendable {
+    private let queue = DispatchQueue(label: "dev.lobbot.audio", qos: .userInitiated)
+    // Owned by `queue`.
     private var engine = AVAudioEngine()
     private var player = AVAudioPlayerNode()
-    private let playFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 24_000, channels: 1, interleaved: false)!
-    private let sendFormat = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16_000, channels: 1, interleaved: true)!
     private var converter: AVAudioConverter?
     private var listening = false
     private var tapped = false
@@ -76,7 +77,10 @@ nonisolated final class VoiceAudio: @unchecked Sendable {
     private var observers: [NSObjectProtocol] = []
     private var rebuilds = 0
     private var lastRebuild = 0.0
+    // Audio render thread only.
     private var lastLevel = 0.0
+    private let playFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 24_000, channels: 1, interleaved: false)!
+    private let sendFormat = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16_000, channels: 1, interleaved: true)!
     private let lock = NSLock()
     private var pending = 0
 
@@ -93,7 +97,67 @@ nonisolated final class VoiceAudio: @unchecked Sendable {
 
     /// `listening: false` is playback only (typed chat): no mic, no permission needed.
     /// The session is configured and activated first, then the engine is built on top of it.
-    func start(listening: Bool) throws {
+    func start(listening: Bool) async throws {
+        try await withCheckedThrowingContinuation { (done: CheckedContinuation<Void, Error>) in
+            queue.async {
+                do {
+                    try self.startOnQueue(listening: listening)
+                    done.resume()
+                } catch {
+                    done.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    func stop() {
+        queue.async { self.stopOnQueue() }
+    }
+
+    /// Plays 16-bit little-endian mono PCM at 24 kHz, as sent by Gemini. Returns its loudness, 0…1.
+    @discardableResult
+    func play(pcm16 data: Data) -> Float {
+        let frames = data.count / 2
+        guard frames > 0, let buffer = AVAudioPCMBuffer(pcmFormat: playFormat, frameCapacity: AVAudioFrameCount(frames)),
+              let out = buffer.floatChannelData?[0] else { return 0 }
+        buffer.frameLength = AVAudioFrameCount(frames)
+        var energy: Float = 0
+        data.withUnsafeBytes { raw in
+            for i in 0..<frames {
+                let v = Float(Int16(littleEndian: raw.loadUnaligned(fromByteOffset: i * 2, as: Int16.self))) / 32768
+                out[i] = v
+                energy += v * v
+            }
+        }
+        nonisolated(unsafe) let pcm = buffer   // handed over to the audio queue, never touched here again
+        queue.async { [weak self] in
+            guard let self, self.engine.isRunning else { return }
+            self.lock.lock(); self.pending += 1; self.lock.unlock()
+            self.player.scheduleBuffer(pcm) { [weak self] in
+                guard let self else { return }
+                self.lock.lock(); self.pending -= 1; let idle = self.pending <= 0; self.lock.unlock()
+                if idle { self.onPlaybackIdle?() }
+            }
+        }
+        return Self.loudness(energy, frames)
+    }
+
+    /// The user talked over Lobbot: drop what is queued.
+    func interrupt() {
+        queue.async {
+            guard self.engine.isRunning else { return }
+            self.player.stop()
+            self.player.play()
+        }
+    }
+
+    private static func loudness(_ energy: Float, _ frames: Int) -> Float {
+        min(1, (energy / Float(max(frames, 1))).squareRoot() * 6)
+    }
+
+    // MARK: on `queue`
+
+    private func startOnQueue(listening: Bool) throws {
         teardownEngine()
         let session = AVAudioSession.sharedInstance()
         if listening {
@@ -110,48 +174,12 @@ nonisolated final class VoiceAudio: @unchecked Sendable {
         try buildEngine()
     }
 
-    func stop() {
+    private func stopOnQueue() {
         active = false
         teardownEngine()
         observers.forEach { NotificationCenter.default.removeObserver($0) }
         observers = []
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
-    }
-
-    /// Plays 16-bit little-endian mono PCM at 24 kHz, as sent by Gemini. Returns its loudness, 0…1.
-    @discardableResult
-    func play(pcm16 data: Data) -> Float {
-        let frames = data.count / 2
-        guard engine.isRunning, frames > 0,
-              let buffer = AVAudioPCMBuffer(pcmFormat: playFormat, frameCapacity: AVAudioFrameCount(frames)),
-              let out = buffer.floatChannelData?[0] else { return 0 }
-        buffer.frameLength = AVAudioFrameCount(frames)
-        var energy: Float = 0
-        data.withUnsafeBytes { raw in
-            for i in 0..<frames {
-                let v = Float(Int16(littleEndian: raw.loadUnaligned(fromByteOffset: i * 2, as: Int16.self))) / 32768
-                out[i] = v
-                energy += v * v
-            }
-        }
-        lock.lock(); pending += 1; lock.unlock()
-        player.scheduleBuffer(buffer) { [weak self] in
-            guard let self else { return }
-            self.lock.lock(); self.pending -= 1; let idle = self.pending <= 0; self.lock.unlock()
-            if idle { self.onPlaybackIdle?() }
-        }
-        return Self.loudness(energy, frames)
-    }
-
-    private static func loudness(_ energy: Float, _ frames: Int) -> Float {
-        min(1, (energy / Float(max(frames, 1))).squareRoot() * 6)
-    }
-
-    /// The user talked over Lobbot: drop what is queued.
-    func interrupt() {
-        guard engine.isRunning else { return }
-        player.stop()
-        player.play()
     }
 
     private func buildEngine() throws {
@@ -182,7 +210,7 @@ nonisolated final class VoiceAudio: @unchecked Sendable {
     }
 
     /// Bounded: at most once a second and five times per call. Enabling echo cancellation itself posts a
-    /// configuration change, so an unbounded rebuild loops forever and freezes the app.
+    /// configuration change, so an unbounded rebuild loops forever.
     private func rebuild() {
         guard active, !engine.isRunning, rebuilds < 5 else { return }
         let now = ProcessInfo.processInfo.systemUptime
@@ -193,25 +221,31 @@ nonisolated final class VoiceAudio: @unchecked Sendable {
         try? buildEngine()
     }
 
-    /// iOS stops the engine without an error when the route or hardware format changes (typically right after
-    /// the session switches category) and after interruptions such as a phone call. Rebuild it each time.
+    /// iOS stops the engine without an error when the route or hardware format changes and after
+    /// interruptions such as a phone call; rebuild it (bounded) when that really happened.
     private func observeSystemChanges() {
         let center = NotificationCenter.default
         observers = [
-            center.addObserver(forName: .AVAudioEngineConfigurationChange, object: nil, queue: .main) { [weak self] note in
-                guard let self, self.active, let changed = note.object as? AVAudioEngine, changed === self.engine else { return }
-                // Let the change settle; rebuild only if it really left the engine stopped.
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in self?.rebuild() }
+            center.addObserver(forName: .AVAudioEngineConfigurationChange, object: nil, queue: nil) { [weak self] note in
+                guard let self, let changed = note.object as? AVAudioEngine else { return }
+                self.queue.asyncAfter(deadline: .now() + 0.3) {
+                    guard changed === self.engine else { return }
+                    self.rebuild()
+                }
             },
-            center.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: .main) { [weak self] note in
-                guard let self, self.active,
-                      let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+            center.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: nil) { [weak self] note in
+                guard let self, let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
                       AVAudioSession.InterruptionType(rawValue: raw) == .ended else { return }
-                try? AVAudioSession.sharedInstance().setActive(true)
-                self.rebuild()
+                self.queue.async {
+                    guard self.active else { return }
+                    try? AVAudioSession.sharedInstance().setActive(true)
+                    self.rebuild()
+                }
             },
         ]
     }
+
+    // MARK: audio render thread
 
     private func convertAndSend(_ buffer: AVAudioPCMBuffer) {
         guard let converter else { return }
@@ -244,13 +278,23 @@ nonisolated final class MicUplink: @unchecked Sendable {
     private let lock = NSLock()
     private var socket: URLSessionWebSocketTask?
     private var open = false
+    private var count = 0
+
+    /// Mic chunks sent so far (shown in the call's diagnostic line).
+    var sent: Int {
+        lock.lock(); defer { lock.unlock() }
+        return count
+    }
 
     func set(socket: URLSessionWebSocketTask?, open: Bool) {
         lock.lock(); self.socket = socket; self.open = open; lock.unlock()
     }
 
     func send(_ pcm: Data) {
-        lock.lock(); let target = open ? socket : nil; lock.unlock()
+        lock.lock()
+        let target = open ? socket : nil
+        if target != nil { count += 1 }
+        lock.unlock()
         guard let target else { return }
         let text = #"{"realtimeInput":{"audio":{"mimeType":"audio/pcm;rate=16000","data":""# + pcm.base64EncodedString() + #""}}}"#
         target.send(.string(text)) { _ in }
@@ -270,6 +314,10 @@ final class VoiceAgent {
     /// Loudness of your voice and of his, 0…1, for the call's aurora.
     var micLevel: Float = 0
     var voiceLevel: Float = 0
+    /// Where the call is, and how much audio went each way (the call's diagnostic line).
+    var stage = ""
+    var sent = 0
+    var received = 0
     /// What the user said or typed last, shown as a caption in the call.
     var heard = ""
 
@@ -290,6 +338,9 @@ final class VoiceAgent {
         }
         status = .connecting
         isListening = listening
+        stage = listening ? "Asking for the mic" : "Connecting"
+        sent = 0
+        received = 0
         session?.voiceChanged()
         Task { await connect(key: key) }
     }
@@ -302,7 +353,13 @@ final class VoiceAgent {
             if on, !(await AVAudioApplication.requestRecordPermission()) {
                 return fail("Microphone access is off. Turn it on in Settings › LOBBOT.")
             }
-            do { try audio.start(listening: on) } catch { fail("Audio couldn't start: \(error.localizedDescription)") }
+            stage = "Starting audio"
+            do {
+                try await audio.start(listening: on)
+                stage = on ? "Live" : "Live (no mic)"
+            } catch {
+                fail("Audio couldn't start: \(error.localizedDescription)")
+            }
         }
     }
 
@@ -339,6 +396,7 @@ final class VoiceAgent {
         if isListening, !(await AVAudioApplication.requestRecordPermission()) {
             return fail("Microphone access is off. Turn it on in Settings › LOBBOT.")
         }
+        stage = "Connecting to Gemini"
         var components = URLComponents(string: VoiceConfig.endpoint)!
         components.queryItems = [URLQueryItem(name: "key", value: key)]
         let task = URLSession.shared.webSocketTask(with: components.url!)
@@ -351,17 +409,23 @@ final class VoiceAgent {
                 return fail("Gemini refused the session. Check the model id \(VoiceConfig.model).")
             }
             audio.onChunk = { [uplink] data in uplink.send(data) }
-            audio.onLevel = { [weak self] level in
-                Task { @MainActor in self?.micLevel = level }
+            audio.onLevel = { [weak self, uplink] level in
+                let sent = uplink.sent
+                Task { @MainActor in
+                    self?.micLevel = level
+                    self?.sent = sent
+                }
             }
             audio.onPlaybackIdle = { [weak self] in
                 Task { @MainActor in self?.playbackDrained() }
             }
-            try audio.start(listening: isListening)
+            stage = "Starting audio"
+            try await audio.start(listening: isListening)
         } catch {
             return fail(closeReason(of: task) ?? "Couldn't reach Gemini: \(error.localizedDescription)")
         }
         status = .live
+        stage = isListening ? "Live" : "Live (no mic)"
         session?.voiceChanged()
         pending.forEach(sendTurn)
         pending = []
@@ -391,6 +455,7 @@ final class VoiceAgent {
                     guard let inline = part["inlineData"] as? [String: Any], let b64 = inline["data"] as? String,
                           let pcm = Data(base64Encoded: b64) else { continue }
                     voiceLevel = audio.play(pcm16: pcm)
+                    received += 1
                     setSpeaking(true)
                 }
             }

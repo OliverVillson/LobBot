@@ -67,7 +67,7 @@ struct ContentView: View {
                 }
 
                 if full {
-                    CallOverlay().transition(.opacity)
+                    CallOverlay()   // no fade: it must be on screen the moment the call starts
                 }
             }
         }

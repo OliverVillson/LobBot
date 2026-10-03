@@ -90,84 +90,92 @@ struct CallOverlay: View {
     var body: some View {
         let voice = session.voice
         VStack(spacing: 14) {
-            HStack(spacing: 8) {
-                Circle().fill(voice.status == .live ? Color.green : Brand.rose).frame(width: 8, height: 8)
-                Text(status).font(.subheadline.weight(.semibold))
-            }
-            .foregroundStyle(.white)
-            .padding(.horizontal, 14)
-            .padding(.vertical, 8)
-            .background(Color.black.opacity(0.18), in: Capsule())
-            .padding(.top, 8)
-            .accessibilityElement(children: .combine)
-
-            if case .failed(let message) = voice.status {
-                VStack(spacing: 8) {
-                    Text(message).font(.footnote).multilineTextAlignment(.center)
-                    Button("Try again") { voice.start(listening: true) }
-                        .font(.footnote.weight(.semibold))
-                        .buttonStyle(.bordered)
-                        .tint(.white)
+            // Top: state, diagnostics, his words above his head. Takes whatever room is left.
+            VStack(spacing: 10) {
+                HStack(spacing: 8) {
+                    Circle().fill(voice.status == .live ? Color.green : Brand.rose).frame(width: 8, height: 8)
+                    Text(status).font(.subheadline.weight(.semibold))
                 }
                 .foregroundStyle(.white)
-                .padding(.horizontal, 12)
-            }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+                .background(Color.black.opacity(0.22), in: Capsule())
+                .accessibilityElement(children: .combine)
 
-            // His words float above his head so they never cover his face.
-            if let line = session.line {
-                SpeechBubble(text: line, tail: .bottom)
-                    .lineLimit(6)
-                    .truncationMode(.head)   // a long live transcript keeps its latest words visible
-            }
+                CallDiagnostics(voice: voice)
 
-            Spacer()
-
-            if !voice.heard.isEmpty {
-                Text(voice.heard)
-                    .font(.footnote.weight(.medium))
-                    .foregroundStyle(.white)
-                    .lineLimit(2)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 7)
-                    .background(Color.black.opacity(0.22), in: Capsule())
-                    .frame(maxWidth: .infinity, alignment: .trailing)
-                    .accessibilityLabel("You: \(voice.heard)")
-            }
-
-            if typing {
-                HStack(spacing: 6) {
-                    TextField("Type to Dr. Lobbot…", text: $draft)
-                        .focused($focused)
-                        .submitLabel(.send)
-                        .onSubmit(send)
-                        .foregroundStyle(Brand.ink)
-                        .padding(.vertical, 13)
-                        .padding(.leading, 16)
-                    Button(action: send) {
-                        Image(systemName: "arrow.up.circle.fill").font(.title2)
+                if case .failed(let message) = voice.status {
+                    VStack(spacing: 8) {
+                        Text(message).font(.footnote).multilineTextAlignment(.center)
+                        Button("Try again") { voice.start(listening: true) }
+                            .font(.footnote.weight(.semibold))
+                            .buttonStyle(.bordered)
+                            .tint(.white)
                     }
-                    .foregroundStyle(Brand.accent)
-                    .padding(.trailing, 8)
-                    .disabled(draft.isBlank)
-                    .accessibilityLabel("Send")
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 12)
                 }
-                .background(Brand.surface, in: Capsule())
-            }
 
-            HStack(spacing: 28) {
-                CallButton(symbol: voice.micMuted ? "mic.slash.fill" : "mic.fill",
-                           label: voice.micMuted ? "Unmute" : "Mute", active: voice.micMuted) {
-                    voice.micMuted.toggle()
-                    session.voiceChanged()
-                }
-                CallButton(symbol: "keyboard", label: "Type", active: typing) {
-                    typing.toggle()
-                    focused = typing
-                }
-                CallButton(symbol: "phone.down.fill", label: "End", tint: Brand.restored) {
-                    session.endCall()
+                // His words float above his head so they never cover his face.
+                if let line = session.line {
+                    SpeechBubble(text: line, tail: .bottom)
+                        .lineLimit(5)
+                        .truncationMode(.head)   // a long live transcript keeps its latest words visible
                 }
             }
+            .padding(.top, 8)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+
+            // Bottom: always on screen, whatever the top holds.
+            VStack(spacing: 14) {
+                if !voice.heard.isEmpty {
+                    Text(voice.heard)
+                        .font(.footnote.weight(.medium))
+                        .foregroundStyle(.white)
+                        .lineLimit(2)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 7)
+                        .background(Color.black.opacity(0.22), in: Capsule())
+                        .frame(maxWidth: .infinity, alignment: .trailing)
+                        .accessibilityLabel("You: \(voice.heard)")
+                }
+
+                if typing {
+                    HStack(spacing: 6) {
+                        TextField("Type to Dr. Lobbot…", text: $draft)
+                            .focused($focused)
+                            .submitLabel(.send)
+                            .onSubmit(send)
+                            .foregroundStyle(Brand.ink)
+                            .padding(.vertical, 13)
+                            .padding(.leading, 16)
+                        Button(action: send) {
+                            Image(systemName: "arrow.up.circle.fill").font(.title2)
+                        }
+                        .foregroundStyle(Brand.accent)
+                        .padding(.trailing, 8)
+                        .disabled(draft.isBlank)
+                        .accessibilityLabel("Send")
+                    }
+                    .background(Brand.surface, in: Capsule())
+                }
+
+                HStack(spacing: 28) {
+                    CallButton(symbol: voice.micMuted ? "mic.slash.fill" : "mic.fill",
+                               label: voice.micMuted ? "Unmute" : "Mute", active: voice.micMuted) {
+                        voice.micMuted.toggle()
+                        session.voiceChanged()
+                    }
+                    CallButton(symbol: "keyboard", label: "Type", active: typing) {
+                        typing.toggle()
+                        focused = typing
+                    }
+                    CallButton(symbol: "phone.down.fill", label: "End", tint: Brand.restored) {
+                        session.endCall()
+                    }
+                }
+            }
+            .fixedSize(horizontal: false, vertical: true)
         }
         .padding(.horizontal, 20)
         .padding(.bottom, 12)
@@ -186,6 +194,22 @@ struct CallOverlay: View {
     private func send() {
         session.send(text: draft)
         draft = ""
+    }
+}
+
+/// One line under the call state: where the call is and how much audio went each way.
+/// Lets you (and a screenshot) tell at a glance whether the mic, Gemini or the speaker is the problem.
+private struct CallDiagnostics: View {
+    let voice: VoiceAgent
+
+    var body: some View {
+        let hears = voice.micLevel > 0.03
+        Text("\(voice.stage) · mic \(hears ? "hears you" : "quiet") · sent \(voice.sent) · got \(voice.received)")
+            .font(.caption.monospacedDigit())
+            .foregroundStyle(.white.opacity(0.85))
+            .lineLimit(1)
+            .minimumScaleFactor(0.8)
+            .accessibilityLabel("Call status: \(voice.stage), sent \(voice.sent) audio chunks, received \(voice.received)")
     }
 }
 
