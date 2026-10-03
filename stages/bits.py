@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-# Approximate bits per weight for llama.cpp quant types.
+# Bits per weight for llama.cpp quant types (block bytes * 8 / block size).
 BPW = {
     "q2_k": 2.625,
     "q3_k": 3.4375,
@@ -23,6 +23,23 @@ BPW = {
     "q8_0": 8.5,
 }
 LADDER = ["q2_k", "q3_k", "q4_k", "q5_k", "q6_k"]
+
+# Relative weight MSE, ||W - Q(W)||^2 / ||W||^2, measured by quantizing and
+# dequantizing Qwen3-MoE expert tensors with llama.cpp (2026-10-03, no imatrix).
+# Each step up the ladder cuts the error ~4x, i.e. ~2^(-2 * extra bits) as
+# rate-distortion theory predicts. This is what an upgrade buys.
+REL_MSE = {
+    "q2_k": 0.0876,
+    "q3_k": 0.0227,
+    "q4_k": 0.00507,
+    "q5_k": 0.00130,
+    "q6_k": 0.000314,
+    "q8_0": 0.0000196,
+}
+
+# ffn_down writes straight into the residual stream; llama.cpp's own mixes
+# give it extra bits for that reason.
+KIND_WEIGHT = {"gate": 1.0, "up": 1.0, "down": 1.5}
 
 # Static types for everything outside the experts. Attention and the output
 # head are read on every token, so their bits cost speed directly.
@@ -52,7 +69,8 @@ class MoEShape:
             n_layers=cfg["num_hidden_layers"],
             hidden=cfg["hidden_size"],
             moe_intermediate=cfg["moe_intermediate_size"],
-            n_experts=cfg["num_experts"],
+            # transformers 5 saves Qwen3-MoE configs with num_local_experts
+            n_experts=cfg.get("num_experts") or cfg["num_local_experts"],
             n_experts_active=cfg["num_experts_per_tok"],
             vocab=cfg["vocab_size"],
             n_heads=n_heads,
@@ -103,25 +121,61 @@ class LayerBits:
     down: str
 
 
+def _normalise(xs: list[float]) -> list[float]:
+    """Scale to mean 1; non-finite or non-positive entries become the mean."""
+    good = [x for x in xs if x == x and 0 < x < float("inf")]
+    mean = sum(good) / len(good) if good else 1.0
+    return [(x if x in good else mean) / mean for x in xs]
+
+
+def sensitivities(
+    n_layers: int,
+    layer_importance: list[float] | None = None,
+    proj_energy: dict[str, list[float]] | None = None,
+    reap_weight: float = 1.0,
+) -> dict[str, list[float]]:
+    """Per-layer, per-projection weight on quantization error.
+
+    layer_importance: REAP-stage score per MoE block (how much the experts move
+        the residual stream on task data). Shared by gate, up and down.
+    proj_energy: task imatrix energy per projection, sum_j E[x_j^2] * ||W[:, j]||^2,
+        the expected output energy of the tensor on task tokens. Quantization
+        error in a tensor scales with it, so it separates layers *and*
+        projections. See quantize.imatrix_energy().
+    Both are normalised to mean 1 and multiplied; either may be missing.
+    """
+    li = _normalise(layer_importance) if layer_importance else [1.0] * n_layers
+    if len(li) != n_layers:
+        raise ValueError("importance must have one score per layer")
+    out = {}
+    for kind in ("gate", "up", "down"):
+        e = _normalise(proj_energy[kind]) if proj_energy and kind in proj_energy else [1.0] * n_layers
+        out[kind] = [KIND_WEIGHT[kind] * (li[i] ** reap_weight) * e[i] for i in range(n_layers)]
+    return out
+
+
 def allocate(
     shape: MoEShape,
-    importance: list[float],
+    importance: list[float] | None,
     budget_gb: float,
     floor: str = "q2_k",
     ceiling: str = "q6_k",
+    proj_energy: dict[str, list[float]] | None = None,
+    max_gb_per_token: float | None = None,
 ) -> list[LayerBits]:
-    """Greedy allocation: start every layer at `floor`, then repeatedly buy the
-    upgrade with the best (importance x error reduction) per extra byte until
-    the next upgrade would exceed the budget.
+    """Greedy rate-distortion allocation: start every layer at `floor`, then
+    repeatedly buy the upgrade with the largest drop in weighted error
+    (sensitivity x REL_MSE reduction) per extra byte, until the next upgrade
+    would break the size budget (or the per-token read budget, which sets
+    laptop tok/s).
 
-    ffn_down is upgraded first and may sit up to two steps above gate/up,
-    since it is usually the most quantization-sensitive projection.
+    ffn_down may sit up to two steps above gate/up; gate/up never above down.
     """
-    if len(importance) != shape.n_layers:
-        raise ValueError("importance must have one score per layer")
     lo, hi = LADDER.index(floor), LADDER.index(ceiling)
-    total_w = sum(importance) or 1.0
-    w = [x / total_w for x in importance]
+    sens = sensitivities(shape.n_layers, importance, proj_energy)
+    w_down = sens["down"]
+    w_gu = [g + u for g, u in zip(sens["gate"], sens["up"])]
+    frac = shape.n_experts_active / shape.n_experts
 
     gate_up = [lo] * shape.n_layers
     down = [lo] * shape.n_layers
@@ -136,33 +190,41 @@ def allocate(
     current = size()
     if current > budget_gb:
         raise ValueError(f"budget {budget_gb:.2f} GB is below the floor size {current:.2f} GB")
+    per_token = bytes_per_token_gb(shape, [LayerBits(i, LADDER[lo], LADDER[lo]) for i in range(shape.n_layers)])
 
     def err(level: int) -> float:
-        return 2.0 ** -BPW[LADDER[level]]
+        return REL_MSE[LADDER[level]]
 
     while True:
-        best = None
+        cands = []
         for i in range(shape.n_layers):
-            # Candidate 1: raise down by one (stays <= gate_up + 2).
+            # Raise down by one (stays <= gate_up + 2).
             if down[i] < hi and down[i] < gate_up[i] + 2:
                 extra = _gb(proj, BPW[LADDER[down[i] + 1]] - BPW[LADDER[down[i]]])
-                gain = 1.5 * w[i] * (err(down[i]) - err(down[i] + 1))
-                cand = (gain / extra, i, "down", extra)
-                best = cand if best is None or cand[0] > best[0] else best
-            # Candidate 2: raise gate+up by one (stays <= down).
+                gain = w_down[i] * (err(down[i]) - err(down[i] + 1))
+                cands.append((gain / extra, i, "down", extra))
+            # Raise gate+up by one (stays <= down).
             if gate_up[i] < hi and gate_up[i] < down[i]:
                 extra = _gb(2 * proj, BPW[LADDER[gate_up[i] + 1]] - BPW[LADDER[gate_up[i]]])
-                gain = 2 * w[i] * (err(gate_up[i]) - err(gate_up[i] + 1))
-                cand = (gain / extra, i, "gate_up", extra)
-                best = cand if best is None or cand[0] > best[0] else best
-        if best is None or current + best[3] > budget_gb:
+                gain = w_gu[i] * (err(gate_up[i]) - err(gate_up[i] + 1))
+                cands.append((gain / extra, i, "gate_up", extra))
+        # Best value first; skip upgrades that do not fit, a cheaper one may.
+        bought = False
+        for _, i, which, extra in sorted(cands, reverse=True):
+            if current + extra > budget_gb:
+                continue
+            if max_gb_per_token is not None and per_token + extra * frac > max_gb_per_token:
+                continue
+            if which == "down":
+                down[i] += 1
+            else:
+                gate_up[i] += 1
+            current += extra
+            per_token += extra * frac
+            bought = True
             break
-        _, i, which, extra = best
-        if which == "down":
-            down[i] += 1
-        else:
-            gate_up[i] += 1
-        current += extra
+        if not bought:
+            break
 
     return [LayerBits(i, LADDER[gate_up[i]], LADDER[down[i]]) for i in range(shape.n_layers)]
 
@@ -205,7 +267,8 @@ def quantize_args(layers: list[LayerBits]) -> list[str]:
 
 
 def heatmap(layers: list[LayerBits]) -> list[dict]:
-    """bit_widths entries for eval.json (consumed by the scoreboard screen)."""
+    """bit_widths entries for eval.json (consumed by the scoreboard screen).
+    quantize.py replaces this with the types actually written to the GGUF."""
     out = []
     for l in layers:
         for tensor, t in (("ffn_gate_exps", l.gate_up), ("ffn_up_exps", l.gate_up), ("ffn_down_exps", l.down)):

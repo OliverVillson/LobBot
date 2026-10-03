@@ -39,7 +39,10 @@ class Config:
     heal_lr: float = 1e-4
     heal_lora_r: int = 16
     heal_targets: list[str] = field(default_factory=lambda: ["q_proj", "k_proj", "v_proj", "o_proj"])
+    heal_train_experts: bool = True  # also LoRA the experts, not just attention and router
+    heal_kd_weight: float = 0.0  # >0 adds logit KL to the unpruned teacher (needs it in GPU memory)
     dense_fallback: bool = True
+    student_epochs: float = 2.0
     # Quantize: aim below the TaskSpec max size by this margin.
     size_margin_gb: float = 0.5
     bit_floor: str = "q2_k"
