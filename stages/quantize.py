@@ -165,18 +165,39 @@ def tok_s(cfg, gb_per_token: float) -> float:
     return round(cfg.laptop_bandwidth_gb_s * 0.65 / max(gb_per_token, 1e-9), 1)
 
 
+def healed_dir(job: Job) -> Path:
+    """Scaffold layout first; the REAP thread's early layout as a fallback."""
+    for p in (job.path("work", "healed"), job.path("heal", "model"), job.path("reap", "model")):
+        if (p / "config.json").exists():
+            return p
+    return job.path("work", "healed")
+
+
+def layer_importance(job: Job, n_layers: int) -> list[float] | None:
+    """work/layer_importance.json, else per-layer REAP saliency summed over kept experts."""
+    p = job.path("work", "layer_importance.json")
+    if p.exists():
+        imp = json.loads(p.read_text())
+    else:
+        sal = next((q for q in (job.path("work", "saliency.json"), job.path("reap", "saliency.json")) if q.exists()), None)
+        if sal is None:
+            return None
+        layers = sorted(json.loads(sal.read_text())["layers"], key=lambda l: l["layer"])
+        imp = [l.get("layer_saliency_kept") or sum(l["saliency"][e] for e in l["kept"]) for l in layers]
+    if len(imp) != n_layers:
+        emit(STAGE, msg=f"layer importance has {len(imp)} entries for {n_layers} layers; ignoring")
+        return None
+    return imp
+
+
 def run_stage(job: Job) -> None:
     cfg, spec = job.config, job.spec
     cand_dir = job.path("work", "candidates")
     cand_dir.mkdir(exist_ok=True)
-    healed = job.path("work", "healed")
+    healed = healed_dir(job)
 
     shape = bits.MoEShape.from_hf_config(json.loads((healed / "config.json").read_text()))
-    imp_path = job.path("work", "layer_importance.json")
-    importance = json.loads(imp_path.read_text()) if imp_path.exists() else None
-    if importance is not None and len(importance) != shape.n_layers:
-        emit(STAGE, msg=f"layer_importance has {len(importance)} entries for {shape.n_layers} layers; ignoring")
-        importance = None
+    importance = layer_importance(job, shape.n_layers)
     budget = spec.target.max_size_gb - cfg.size_margin_gb
     # Laptop decode speed is bandwidth-bound, so the tok/s floor is a cap on bytes read per token.
     max_per_token = cfg.laptop_bandwidth_gb_s * 0.65 / spec.target.min_tok_s
