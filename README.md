@@ -77,11 +77,22 @@ lobbot new "turn support emails into JSON tickets"   # drafts a TaskSpec with Ge
 lobbot run my.taskspec.json --fast  # or --example; live stage progress, Ctrl-C detaches
 lobbot status [job] | watch <job> | logs <job> [-s heal] [-f] | eval <job>
 lobbot resume <job> [--from quantize] | stop <job>
-lobbot install <job> --chat         # resumable download, ollama create, ollama run
+lobbot save <job> --chat            # keep the model: see below
+lobbot pull                         # git pull the VM checkout (refuses while the GPU is busy)
 ```
 
+`lobbot save` (alias `install`; `run --save` chains it) copies the job's
+report, spec, Modelfile and, if the small system disk has room, the GGUF to
+`~/lobbot-saved/<task>-<job>/` on the VM. That disk survives a pause, unlike
+`/mnt/nvme`, which is wiped when the VM is paused or stopped. Then it downloads
+the GGUF to `~/lobbot-models/<task>-<job>/` (resumable), checks its sha256
+against the VM's, writes `eval.json` and `lobbot.json` next to it, and runs
+`ollama create`. API keys are never pasted anywhere: `lobbot secret NAME`
+takes them from your local environment or a hidden prompt, and stores them in
+`~/.lobbot-env` on the VM.
+
 `--fast` sets `n_generate=400, n_heldout=30, reap_calib_samples=128,
-dense_fallback=false`; `--set key=value` overrides any `Config` field. `run`
+heal_max_minutes=20, dense_fallback=false`; `--set key=value` overrides any `Config` field. `run`
 refuses to start while something else is on the GPU unless you add `--force`.
 The API token lives in `~/.lobbot-token` on the VM (`lobbot token` prints it).
 

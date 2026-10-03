@@ -7,8 +7,9 @@
     lobbot run spec.json --fast      start a job and watch its stages live
     lobbot status [job]              all jobs, or one job's stages
     lobbot watch / logs / resume / stop / eval <job>
-    lobbot download <job>            fetch the GGUF (resumable) and Modelfile
-    lobbot install <job> --chat      import into Ollama and chat with it
+    lobbot save <job> --chat         back it up on the VM, download it (resumable,
+                                     sha256-checked), import into Ollama, chat
+    lobbot pull                      update the VM checkout
 
 Everything talks to agent/server.py on the VM through an SSH tunnel the CLI
 opens itself; logs and job files are read over the same SSH connection.
@@ -39,7 +40,7 @@ STAGES = ["data", "reap", "heal", "quantize", "eval", "package"]
 # (small data set, short calibration, no dense student); "full" is the defaults.
 PRESETS: dict[str, dict] = {
     "fast": {"n_generate": 400, "n_heldout": 30, "reap_calib_samples": 128, "heal_epochs": 1.0,
-             "dense_fallback": False},
+             "heal_max_minutes": 20, "dense_fallback": False},
     "full": {},
 }
 
@@ -213,7 +214,11 @@ def watch(r: Remote, job_id: str) -> str:
         warn("the progress stream ended early; check: lobbot status " + job_id)
         return "unknown"
     if final["status"] == "done":
-        ok(f"pipeline finished. Next: lobbot eval {job_id}  then  lobbot install {job_id} --chat")
+        if "model" in final and not final["model"]:
+            ok(f"pipeline run finished: {final.get('msg', '')}")
+            return "done"
+        ok(f"pipeline finished. Next: lobbot eval {job_id}  then  lobbot save {job_id} --chat")
+        warn(PAUSE_WARNING)
         return "done"
     print(c("✗ pipeline failed: ", "31") + str(final.get("msg", "")))
     print(f"  logs: lobbot logs {job_id}    retry: lobbot resume {job_id}")
@@ -281,8 +286,15 @@ def cmd_init(a) -> None:
             val = input(f"{label} [{getattr(s, name)}]: ").strip()
             if val:
                 setattr(s, name, val)
+    home = str(Path.home())
+    for name in ("repo", "jobs"):  # an unquoted ~/x is expanded by the local shell to this Mac's home
+        v = getattr(s, name)
+        if v == home or v.startswith(home + "/"):
+            setattr(s, name, "~" + v[len(home):])
     p = cfgmod.save(s)
     ok(f"saved {p}")
+    for name in ("host", "ssh_key", "repo", "jobs"):
+        print(f"  {name:<8} {getattr(s, name) or '(ssh default)'}")
     print("Next: lobbot doctor")
 
 
@@ -294,6 +306,12 @@ def cmd_doctor(a) -> None:
 echo "ssh=ok $(hostname)"
 if cd {rpath(s.repo)} 2>/dev/null; then
   echo "repo=ok $(git log -1 --format='%h %s' 2>/dev/null | cut -c1-70) [$(git rev-parse --abbrev-ref HEAD 2>/dev/null)]"
+  timeout 15 git fetch -q origin 2>/dev/null
+  behind=$(git rev-list --count HEAD..@{{u}} 2>/dev/null || echo "?")
+  dirty=$(git status --porcelain --untracked-files=no 2>/dev/null | grep -c . || true)
+  if [ "$behind" = "?" ]; then echo "git=warn no upstream branch to compare with"
+  elif [ "$behind" != 0 ] || [ "$dirty" != 0 ]; then echo "git=warn $behind commit(s) behind $(git rev-parse --abbrev-ref @{{u}}), $dirty changed file(s) (lobbot pull updates it)"
+  else echo "git=ok up to date with $(git rev-parse --abbrev-ref @{{u}})"; fi
 else echo "repo=missing no checkout at {s.repo}"; fi
 [ -f .env.vm ] && echo "envvm=ok .env.vm present" || echo "envvm=missing run scripts/setup_vm.sh"
 [ -f .env.vm ] && . ./.env.vm
@@ -328,6 +346,7 @@ python3 -c 'import urllib.request; urllib.request.urlopen("http://127.0.0.1:{s.r
         mark = {"ok": c("✓", "32"), "warn": c("!", "33")}.get(status, c("✗", "31"))
         bad += status == "missing"
         print(f" {mark} {key:<8} {detail}")
+    print(c("  note: " + PAUSE_WARNING, "2"))
     if bad:
         raise CliError(f"{bad} check(s) failed")
 
@@ -464,8 +483,12 @@ for name, body in b["files"].items():
     if a.detach:
         print(f"Watch it with: lobbot watch {job_id}")
         return
-    if watch(r, job_id) == "error":
+    state = watch(r, job_id)
+    if state == "error":
         sys.exit(1)
+    if state == "done" and a.save:
+        cmd_save(argparse.Namespace(host=a.host, job=job_id, out=None, force=False, name=None, chat=False,
+                                    no_ollama=False, no_backup=False))
 
 
 def cmd_status(a) -> None:
@@ -567,58 +590,163 @@ def model_dir(s: cfgmod.Settings, api: Api, job: str, out: str | None) -> Path:
     return Path(s.models_dir).expanduser() / f"{task}-{job}"
 
 
+PAUSE_WARNING = ("Pausing or stopping the VM wipes /mnt/nvme, including every job and model on it. "
+                 "Keep models with: lobbot save <job>")
+
+
+def sha256_file(path: Path) -> str:
+    import hashlib
+
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        while chunk := f.read(1 << 22):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def remote_sha256(r: Remote, job: str) -> str:
+    """sha256 of the job's GGUF on the VM, cached next to it in out/model.gguf.sha256."""
+    f = rpath(r.s.jobs.rstrip("/") + f"/{job}/out/model.gguf")
+    out = r.sh(f'f={f}; h="$f.sha256"\n[ -f "$f" ] || {{ echo "no model.gguf for job {job}" >&2; exit 1; }}\n'
+               'if [ -s "$h" ] && [ "$h" -nt "$f" ]; then cat "$h"; else sha256sum "$f" | cut -d" " -f1 | tee "$h"; fi',
+               timeout=600)
+    return out.strip().split()[0]
+
+
 def do_download(a, r: Remote, s: cfgmod.Settings) -> Path:
+    """Download the job's GGUF, Modelfile and eval report, and verify the GGUF's sha256."""
     job = check_job_id(a.job)
     with r.tunnel() as base:
         api = Api(base, r.token())
+        st = api.get(f"/jobs/{job}")
+        if st["stages"]["package"]["status"] not in ("done", "skipped"):
+            raise CliError(f"job {job} has no packaged model yet (state {st['state']}); see: lobbot status {job}")
         d = model_dir(s, api, job, a.out)
         d.mkdir(parents=True, exist_ok=True)
         dest = d / "model.gguf"
-        (d / "Modelfile").write_text(api.get(f"/jobs/{job}/modelfile"))
-        if dest.exists() and not a.force:
-            ok(f"already downloaded: {dest}  (--force to fetch again)")
-            return d
+        try:
+            (d / "Modelfile").write_text(api.get(f"/jobs/{job}/modelfile"))
+            (d / "eval.json").write_text(json.dumps(api.get(f"/jobs/{job}/eval"), indent=2))
+        except ApiError as e:
+            if e.status != 404:
+                raise
         if a.force:
             dest.unlink(missing_ok=True)
-        t0, last = time.time(), [0.0]
+        if dest.exists():
+            print(f"Already downloaded: {dest}")
+        else:
+            t0, last = time.time(), [0.0]
 
-        def progress(done: int, total: int) -> None:
-            now = time.time()
-            if now - last[0] < 0.25 and done != total:
-                return
-            last[0] = now
-            rate = done / max(now - t0, 1e-6) / 1e6
-            pct = 100 * done / total if total else 0
-            msg = f"\r  {done / 1e9:6.2f} / {total / 1e9:.2f} GB  {pct:5.1f}%  {rate:6.1f} MB/s"
-            sys.stdout.write(msg if TTY else "")
-            sys.stdout.flush()
+            def progress(done: int, total: int) -> None:
+                now = time.time()
+                if now - last[0] < 0.25 and done != total:
+                    return
+                last[0] = now
+                rate = done / max(now - t0, 1e-6) / 1e6
+                pct = 100 * done / total if total else 0
+                if TTY:
+                    sys.stdout.write(f"\r  {done / 1e9:6.2f} / {total / 1e9:.2f} GB  {pct:5.1f}%  {rate:6.1f} MB/s")
+                    sys.stdout.flush()
 
-        api.download(job, dest, progress)
-        if TTY:
-            print()
-    size = dest.stat().st_size / 1e9
-    ok(f"{dest}  ({size:.2f} GB) and Modelfile")
+            try:
+                api.download(job, dest, progress)
+            except ApiError as e:
+                if e.status == 404:
+                    raise CliError(f"job {job} has no model.gguf on the VM: {e}")
+                raise
+            if TTY:
+                print()
+    print("Verifying sha256 ...")
+    want, got = remote_sha256(r, job), sha256_file(dest)
+    if want != got:
+        bad = dest.with_name("model.gguf.bad")
+        dest.replace(bad)
+        raise CliError(f"checksum mismatch (VM {want[:12]}, local {got[:12]}); moved the file to {bad}. "
+                       f"Run lobbot save {job} again to re-download.")
+    (d / "model.gguf.sha256").write_text(f"{got}  model.gguf\n")
+    ok(f"{dest}  ({dest.stat().st_size / 1e9:.2f} GB, sha256 {got[:12]} verified)")
     return d
+
+
+def backup_on_vm(r: Remote, job: str, name: str) -> None:
+    """Copy the job's final artifacts to ~/lobbot-saved/<name> on the VM's system disk,
+    which survives a pause. The GGUF is copied only if that small disk has room for it."""
+    s = r.s
+    src = rpath(s.jobs.rstrip("/") + "/" + job)
+    out = r.sh(f"""src={src}; dst="$HOME/lobbot-saved/{name}"; mkdir -p "$dst"
+for f in taskspec.json config.json out/eval.json out/Modelfile out/model.gguf.sha256; do
+  [ -f "$src/$f" ] && cp "$src/$f" "$dst/"
+done
+size=$(stat -c %s "$src/out/model.gguf")
+free=$(df --output=avail -B1 "$dst" | tail -1)
+if [ -f "$dst/model.gguf" ] && [ "$(stat -c %s "$dst/model.gguf")" = "$size" ]; then echo "gguf=present $dst"
+elif [ $((free - size)) -gt $((2 * 1024 * 1024 * 1024)) ]; then cp "$src/out/model.gguf" "$dst/model.gguf.tmp" && mv "$dst/model.gguf.tmp" "$dst/model.gguf" && echo "gguf=copied $dst"
+else echo "gguf=skipped $dst $((size / 1000000)) $((free / 1000000))"; fi""", timeout=900).strip()
+    kind, _, rest = out.splitlines()[-1].partition("=")
+    parts = rest.split()
+    if parts[0] in ("present", "copied"):
+        ok(f"VM backup: {parts[1]} (system disk, survives a pause)")
+    else:
+        ok(f"VM backup: report, spec and Modelfile in {parts[1]}")
+        warn(f"the system disk has only {int(parts[3]) / 1000:.1f} GB free, too little for the "
+             f"{int(parts[2]) / 1000:.1f} GB model, so the VM's only copy of it is on /mnt/nvme. "
+             "Your laptop copy is the safe one.")
 
 
 def cmd_download(a) -> None:
     r, s = connect(a)
     d = do_download(a, r, s)
-    print(f"Next: lobbot install {a.job} --chat   (or: cd {d} && ollama create mymodel -f Modelfile)")
+    print(f"Next: lobbot save {a.job} --chat   (or: cd {d} && ollama create mymodel -f Modelfile)")
 
 
-def cmd_install(a) -> None:
-    if not shutil.which("ollama"):
-        raise CliError("ollama is not installed here; get it from https://ollama.com/download")
+def cmd_save(a) -> None:
+    """Keep a finished model: VM backup, verified download to this Mac, Ollama import."""
     r, s = connect(a)
+    job = check_job_id(a.job)
+    if not a.no_backup:
+        with r.tunnel() as base:
+            task = Api(base, r.token()).get(f"/jobs/{job}").get("task_name") or "model"
+        backup_on_vm(r, job, f"{task}-{job}")
     d = do_download(a, r, s)
     name = a.name or "lobbot-" + d.name.rsplit("-", 1)[0]
+    manifest = {"job": job, "host": s.host, "saved": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "sha256": (d / "model.gguf.sha256").read_text().split()[0], "ollama_name": name}
+    if (d / "eval.json").exists():
+        rep = json.loads((d / "eval.json").read_text())
+        manifest["winner"] = next((c for c in rep["candidates"] if c["name"] == rep["winner"]), None)
+    (d / "lobbot.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    if a.no_ollama:
+        print(f"Saved in {d}")
+        return
+    if not shutil.which("ollama"):
+        warn(f"ollama is not installed, so the model is saved in {d} but not imported. "
+             "Get it from https://ollama.com/download, then run this again.")
+        return
     print(f"Importing into Ollama as {name} ...")
     if subprocess.call(["ollama", "create", name, "-f", "Modelfile"], cwd=d) != 0:
         raise CliError("ollama create failed (is the Ollama app running?)")
-    ok(f"installed. Chat with: lobbot chat {name}   (or: ollama run {name})")
+    ok(f"saved in {d} and imported into Ollama. Chat with: lobbot chat {name}")
     if a.chat:
         os.execvp("ollama", ["ollama", "run", name])
+
+
+def cmd_pull(a) -> None:
+    """Update the VM checkout (git pull --ff-only)."""
+    s = settings(a)
+    r = Remote(s)
+    if not a.force and gpu_processes(r):
+        raise CliError("a job is using the GPU; its next stage would pick up the new code. "
+                       "Wait for it, or add --force.")
+    out = r.sh(f"""set -e
+cd {rpath(s.repo)}
+before=$(git rev-parse HEAD)
+git pull -q --ff-only
+echo "head=$(git log -1 --format='%h %s')"
+git diff --quiet "$before" HEAD -- agent/ common/ || echo "api=changed" """, timeout=120)
+    info = dict(l.split("=", 1) for l in out.splitlines() if "=" in l)
+    ok(f"VM checkout now at {info.get('head', '?')}")
+    if "api" in info:
+        print("The API code changed; restart it when no job is running: lobbot up --restart")
 
 
 def cmd_chat(a) -> None:
@@ -678,6 +806,7 @@ def parser() -> argparse.ArgumentParser:
     sp.add_argument("--name", help="job id (letters and digits; default random)")
     sp.add_argument("--force", action="store_true", help="start even if the GPU is busy")
     sp.add_argument("-d", "--detach", action="store_true", help="start and return without watching")
+    sp.add_argument("--save", action="store_true", help="when it finishes, save the model (lobbot save)")
 
     sp = add("status", cmd_status, "list jobs, or show one job's stages", aliases=["jobs", "ls"])
     sp.add_argument("job", nargs="?")
@@ -704,15 +833,23 @@ def parser() -> argparse.ArgumentParser:
     sp.add_argument("job")
     sp.add_argument("--json", action="store_true")
 
-    for name, fn, help in [("download", cmd_download, "download a job's GGUF (resumable) and Modelfile"),
-                           ("install", cmd_install, "download a job's model and import it into Ollama")]:
-        sp = add(name, fn, help)
-        sp.add_argument("job")
-        sp.add_argument("-o", "--out", help="directory (default ~/lobbot-models/<task>-<job>)")
-        sp.add_argument("--force", action="store_true", help="download again even if present")
-        if name == "install":
-            sp.add_argument("--name", help="Ollama model name (default lobbot-<task>)")
-            sp.add_argument("--chat", action="store_true", help="start chatting right after")
+    sp = add("download", cmd_download, "download a job's GGUF (resumable, sha256-checked) and Modelfile")
+    sp.add_argument("job")
+    sp.add_argument("-o", "--out", help="directory (default ~/lobbot-models/<task>-<job>)")
+    sp.add_argument("--force", action="store_true", help="download again even if present")
+
+    sp = add("save", cmd_save, "keep a finished model: VM backup, verified download, Ollama import",
+             aliases=["install"])
+    sp.add_argument("job")
+    sp.add_argument("-o", "--out", help="directory (default ~/lobbot-models/<task>-<job>)")
+    sp.add_argument("--force", action="store_true", help="download again even if present")
+    sp.add_argument("--name", help="Ollama model name (default lobbot-<task>)")
+    sp.add_argument("--chat", action="store_true", help="start chatting right after")
+    sp.add_argument("--no-ollama", action="store_true", help="only download")
+    sp.add_argument("--no-backup", action="store_true", help="skip the copy to ~/lobbot-saved on the VM")
+
+    sp = add("pull", cmd_pull, "update the LobBot checkout on the VM (git pull --ff-only)")
+    sp.add_argument("--force", action="store_true", help="pull even while the GPU is busy")
 
     sp = add("chat", cmd_chat, "chat with an installed model in Ollama")
     sp.add_argument("model")

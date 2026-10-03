@@ -63,6 +63,8 @@ def test_full_flow(cli):
     assert "pipeline finished" in p.stdout
     conf = json.loads((cli.tmp / "jobs/demo/config.json").read_text())
     assert conf["n_generate"] == 400 and conf["dense_fallback"] is False and conf["heal_lr"] == 0.0002
+    assert conf["heal_max_minutes"] == 20
+    assert "lobbot save demo" in p.stdout and "wipes /mnt/nvme" in p.stderr
 
     assert "demo" in cli("status").stdout
     st = cli("status", "demo").stdout
@@ -83,8 +85,21 @@ def test_full_flow(cli):
     cli("download", "demo")
     assert (d / "model.gguf").read_bytes() == model and not (d / "model.gguf.part").exists()
 
-    cli("install", "demo")
+    # A corrupted local copy is caught by the sha256 check and moved aside.
+    (d / "model.gguf").write_bytes(b"garbage")
+    assert "checksum mismatch" in cli("download", "demo", ok=False).stderr
+    assert (d / "model.gguf.bad").exists() and not (d / "model.gguf").exists()
+
+    p = cli("save", "demo")
+    assert "sha256" in p.stdout and "verified" in p.stdout
     assert "ollama create lobbot-support-email-to-ticket -f Modelfile" in (cli.home / "ollama.calls").read_text()
+    assert (d / "model.gguf").read_bytes() == model
+    assert (d / "model.gguf.sha256").read_text().split()[0] == json.loads((d / "lobbot.json").read_text())["sha256"]
+    assert json.loads((d / "eval.json").read_text())["winner"] == "lobbot-moe"
+    saved = cli.home / "lobbot-saved/support-email-to-ticket-demo"
+    assert (saved / "model.gguf").read_bytes() == model
+    assert {"taskspec.json", "config.json", "eval.json", "Modelfile"} <= {f.name for f in saved.iterdir()}
+    cli("install", "demo", "--no-ollama")  # alias, and a second save reuses the backup and download
 
     p = cli("resume", "demo", "--from", "eval")
     assert "pipeline finished" in p.stdout
@@ -114,3 +129,17 @@ def test_secret_and_restart(cli):
     assert oct(env_file.stat().st_mode & 0o777) == "0o600"
     assert "API restarted" in p.stdout
     assert "API started" in cli("up", "--restart").stdout
+
+
+def test_run_save_chain(cli):
+    p = cli("run", "--example", "--fast", "--name", "chained", "--save")
+    assert "imported into Ollama" in p.stdout
+    assert (cli.tmp / "models/support-email-to-ticket-chained/model.gguf").exists()
+
+
+def test_init_keeps_remote_tilde(cli):
+    home = str(cli.home)
+    p = cli("init", "--host", "local", "--repo", f"{home}/LobBot", "--jobs", "/mnt/nvme/jobs")
+    conf = json.loads((cli.tmp / "config.json").read_text())
+    assert conf["repo"] == "~/LobBot" and conf["jobs"] == "/mnt/nvme/jobs"
+    assert "~/LobBot" in p.stdout
