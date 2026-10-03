@@ -44,13 +44,16 @@ def chat_template(job: Job, gguf_path) -> str:
         return ""
 
 
-# Gemma 4: system is its own turn; the assistant role is "model".
+# Gemma 4: system is its own turn; the assistant role is "model". The
+# generation prompt ends with an empty thought channel, Gemma 4's non-thinking
+# prompt and the exact prefix the student is trained on (stages/taskdata.py).
 GEMMA4_TEMPLATE = """{{- if .System }}<|turn>system
 {{ .System }}<turn|>
 {{ end }}{{- range .Messages }}{{- if ne .Role "system" }}<|turn>{{ if eq .Role "assistant" }}model{{ else }}{{ .Role }}{{ end }}
 {{ .Content }}<turn|>
 {{ end }}{{- end }}<|turn>model
-"""
+<|channel>thought
+<channel|>"""
 
 # Gemma 2/3 have no system role: the system prompt is folded into the first user turn.
 GEMMA3_TEMPLATE = """{{- $sys := .System }}{{- $first := true }}{{- range .Messages }}{{- if eq .Role "user" }}<start_of_turn>user
