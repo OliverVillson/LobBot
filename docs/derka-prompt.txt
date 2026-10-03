@@ -1,0 +1,287 @@
+LOBBOT iPHONE APP: WIRE IT TO THE REAL BACKEND (prompt for coding agents)
+=========================================================================
+Written 2026-10-03 13:00 UTC from Oliver's side. Backend: OliverVillson/LobBot,
+branch main at 0823d0f or later (includes PR #21: one job at a time and a stop endpoint).
+App: UI/LOBBOT-iPhone on the `ui` branch (PR #19).
+Every API behaviour quoted below was checked against the real server in dry-run mode.
+
+GOAL
+----
+Today the app runs a scripted surgery. Make it really train a model on the GPU
+VM and follow it to the end:
+  describe the task -> start the job on the VM -> follow live progress
+  -> show the real results -> the model is ready to chat with on the Mac.
+
+KEEP THE GOOFY VIBE
+-------------------
+Oliver wants the look and personality kept. Do not change the mascot, the
+surgery theme, colours, fonts, layout, animations or the playful copy tone.
+Dr. Lobbot can stay a surgeon who scrubs in, makes cuts and walks out with a
+jar. Only the data behind the screens changes. Follow UI/CLAUDE.md:
+  - Wire the backend through Session.swift (operate(), voiceTool, new data
+    fields) and VoiceConfig in Voice.swift. Views keep reading the same
+    published fields (params, score, cuts, phase, history, ...).
+  - Put the HTTP code in one new non-UI file, LOBBOT/Backend.swift, called only
+    from Session.swift. After adding it, run `python3 LOBBOT-iPhone/create-project.py`
+    (never hand-edit project.pbxproj).
+  - Mascot state only via LobbotController.show(_:).
+  - Any new UI is built from PrimaryButton, OptionTile, Field, .card(),
+    SpeechBubble and Brand.* colours; say in the commit that it needs Nolann's review.
+  - Remove the "Simulation" / "Illustrative run" labels only once real data
+    is shown (rule 7).
+
+WHAT THE BACKEND IS (so the app doesn't promise something else)
+--------------------------------------------------------------
+- The user does NOT pick a model size or upload weights. The backend always
+  starts from the same big model (Qwen3 30B, 61 GB) and specializes it for
+  ONE task the user describes with examples.
+- Stages, in order: data, reap, heal, quantize, eval, package.
+- The result is a ~6.5 GB model file (GGUF) that runs in Ollama on a 16 GB
+  Mac or PC at about 50 tokens/s. It cannot run on an iPhone.
+- A real run takes about 12 to 25 minutes.
+- No cut is ever "restored" in the real pipeline; restored stays 0.
+
+1. CONNECTING TO THE API
+------------------------
+The API runs on the GPU VM, bound to 127.0.0.1:8700. Only Oliver's Mac can
+SSH to the VM, so the app always reaches it through Oliver's Mac:
+  - Oliver runs `lobbot up` (starts the API on the VM if it is not running).
+  - iOS Simulator on Oliver's Mac: Oliver runs `lobbot tunnel`.
+    Base URL: http://127.0.0.1:8700
+  - Real iPhone on the same Wi-Fi: Oliver runs
+      ssh -N -L 0.0.0.0:8700:127.0.0.1:8700 <vm>
+    (<vm> is the VM host from Oliver's lobbot config; `lobbot tunnel` only
+    listens on localhost). Base URL:
+      http://<MAC_LAN_IP>:8700   (or http://<oliver-mac-name>.local:8700)
+  - Token: the token from ~/.lobbot-token on the VM (Oliver prints it with
+    `lobbot token` and sends it to you privately). Every request except
+    GET /health sends the header  Authorization: Bearer <LOBBOT_TOKEN>
+
+Config, same pattern as the Gemini key:
+  Secrets.xcconfig (gitignored, never commit):
+      LOBBOT_API_BASE = http:/$()/127.0.0.1:8700
+      LOBBOT_TOKEN = <LOBBOT_TOKEN>
+      OLLAMA_BASE = http:/$()/<MAC_LAN_IP>:11434
+    Note the /$()/ : in xcconfig files `//` starts a comment, so a plain
+    http://... value silently becomes "http:".
+  Secrets.example.xcconfig: add the three keys with empty values.
+  Info.plist: add
+      <key>LobbotAPIBase</key><string>$(LOBBOT_API_BASE)</string>
+      <key>LobbotToken</key><string>$(LOBBOT_TOKEN)</string>
+      <key>OllamaBase</key><string>$(OLLAMA_BASE)</string>
+      <key>NSAppTransportSecurity</key>
+      <dict><key>NSAllowsLocalNetworking</key><true/></dict>
+      <key>NSLocalNetworkUsageDescription</key>
+      <string>Dr. Lobbot talks to the LobBot lab on your Mac.</string>
+
+On launch, call GET /health (5 s timeout). If it fails, show a friendly
+"can't reach the lab" state with a retry, instead of letting the user fill
+the chart and fail at the end.
+
+DEVELOP WITHOUT THE VM (do this first)
+From the repo root on any Mac:
+    python3 -m pip install fastapi uvicorn
+    LOBBOT_DRY_RUN=1 LOBBOT_JOBS=/tmp/lobbot-jobs LOBBOT_TOKEN=dev \
+      python3 -m uvicorn agent.server:app --host 0.0.0.0 --port 8700
+Token "dev". It walks every stage in about a second and serves placeholder
+eval and model files. A dry run is too fast to test Stop; to watch the
+operating-room animation for longer, add an artificial delay in the app's
+event handling only while testing.
+
+2. THE API (complete contract)
+------------------------------
+GET  /health
+     -> {"ok": true, "dry_run": false, "gpu": "NVIDIA B200"}
+POST /jobs                body: TaskSpec (section 3)
+     -> 200 {"job_id": "92484b2f6c"}    creates the job AND starts training
+     -> 422 {"detail": "invalid TaskSpec: ..."}
+     -> 409 {"detail": "job <id> is running; ...", "running_job": "<id>"}
+GET  /jobs
+     -> [{"job_id", "task_name", "state", "created"}], newest first
+GET  /jobs/{id}
+     -> {"job_id", "task_name", "state", "created",
+         "stages": {"data": {"status", "pct", "msg"}, "reap": {...}, ...},
+         "error": null | "message"}
+     state is one of: queued, running, done, error, stopped, partial
+GET  /jobs/{id}/events    Server-Sent Events (section 4)
+POST /jobs/{id}/resume    body {}  continues from the finished stages
+     -> 200 {"job_id"} | 409 with running_job, as above
+POST /jobs/{id}/stop      waits until the job has exited (seconds, up to ~40 s)
+     -> 200 {"job_id": "...", "state": "stopped"}
+     -> 409 {"detail": "job is not running"}
+GET  /jobs/{id}/eval      -> eval.json (section 6); 404 until ready
+GET  /jobs/{id}/model     the GGUF (not useful on the phone)
+GET  /jobs/{id}/modelfile Ollama Modelfile text
+
+Errors are JSON {"detail": "..."}. Use a 60 s timeout for /stop and 120 s for
+/events (the server sends a keepalive every 15 s).
+
+3. THE INTAKE MUST PRODUCE A TASKSPEC
+-------------------------------------
+Today the chart collects model size, capability, hardware and max loss. The
+backend has none of these; posting them returns 422. Replace the intake data
+in Session.swift with:
+
+    var taskName = ""          // lowercase slug, e.g. "support-email-to-ticket"
+    var taskDescription = ""   // one or two sentences: what the model must do
+    var inputFormat = ""       // what the user will paste in
+    var outputFormat = ""      // what it must answer
+    var seedExamples: [(input: String, output: String)] = []  // 3 to 50, aim for 10+
+    var evalCriteria = ""      // what makes an answer good
+
+Body for POST /jobs (leave "target" out; the defaults are right):
+    {"version": 1,
+     "task_name": "support-email-to-ticket",
+     "description": "Turn customer support emails into JSON tickets.",
+     "input_format": "Free-text email body",
+     "output_format": "JSON with fields: category, priority, summary",
+     "seed_examples": [{"input": "...", "output": "..."}, ...],
+     "eval_criteria": "Valid JSON, correct category and priority, faithful summary"}
+Full real example: examples/support-tickets.taskspec.json in the repo.
+
+Do NOT send a target.max_size_gb below 7: the backend treats it as a hard
+limit and fails if the model can't fit. So the "Phone" and "Edge board"
+hardware options can't be honoured; drop the hardware step or make it
+display-only "Runs on your Mac or PC (16 GB)".
+
+Easiest way to collect this without new screens: Dr. Lobbot interviews for it.
+In VoiceConfig, change update_chart's parameters to:
+    task_name, description, input_format, output_format, eval_criteria: STRING
+    seed_examples: ARRAY of OBJECT {input: STRING, output: STRING}
+and change the persona so he asks, in his own voice, what the one job is and
+for a few real examples of input and the answer the user wants. When at least
+3 examples are in, he reads the chart back and asks for consent before
+start_surgery. Remove the persona line saying every surgery is a simulation,
+and describe the real method (focus on the parts the task uses, retrain it
+from the big model, pack it small) instead of "undoing cuts that hurt".
+The typed intake screens should show the same fields; the size picker and
+the weights-file importer go away (or show "Patient: Qwen3 30B, 61 GB").
+
+4. REPLACE operate() WITH THE REAL JOB
+--------------------------------------
+begin():
+  1. POST /jobs with the TaskSpec.
+  2. On 200: save job_id in UserDefaults ("currentJob"), then follow it.
+  3. On 409: say a job is already running (in Lobbot's voice), and offer
+     "Watch it": set currentJob = running_job and follow that job.
+  4. On 422: show detail; send the user back to the chart.
+
+Following a job (SSE):
+
+    struct Progress: Decodable {
+        let stage: String; let status: String; let pct: Double?; let msg: String?
+    }
+
+    var req = URLRequest(url: base.appending(path: "jobs/\(jobId)/events"))
+    req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+    req.timeoutInterval = 120
+    let (bytes, _) = try await URLSession.shared.bytes(for: req)
+    cuts = []                      // the stream replays the run from its start
+    for try await line in bytes.lines {
+        guard line.hasPrefix("data: "),          // ":" lines are keepalives
+              let e = try? JSONDecoder().decode(Progress.self,
+                                                from: Data(line.dropFirst(6).utf8))
+        else { continue }
+        if e.stage == "pipeline" {
+            if e.status == "running" { continue }    // first event of a run
+            finish(e.status)          // "done", "error" or "stopped"; stream ends
+            break
+        }
+        // one Cut per stage; outcome .testing while "running",
+        // .kept when "done" or "skipped" (skipped = reused a cached result)
+    }
+
+Event examples (real, from a dry run):
+    {"stage": "pipeline", "status": "running", "msg": "started"}
+    {"stage": "data", "status": "running", "pct": 54.4, "msg": "teacher answering 512/2730"}
+    {"stage": "reap", "status": "done", "pct": 100, "msg": "kept 64 experts per layer"}
+    {"stage": "quantize", "status": "running", "pct": 75, "msg": "lobbot-moe 6.49 GB, ~50.1 tok/s on the laptop"}
+    {"stage": "pipeline", "status": "done", "msg": "/mnt/nvme/jobs/.../model.gguf"}
+    {"stage": "pipeline", "status": "stopped", "msg": "stopped; resume to continue"}
+Never show the final pipeline event's msg (it is a server file path).
+
+Stage rows: keep the surgery flavour, but one row per real stage. Suggested
+labels (plain meaning first, reword in Lobbot's voice as you like):
+    data      Teaching: the big model writes practice examples for your task
+    reap      Focusing: removing the parts your task never uses
+    heal      Refreshing: the focused model relearns from the big model
+    quantize  Packing: shrinking it to fit your laptop
+    eval      Testing: checking quality against the big model
+    package   Wrapping up: getting your model ready
+Show msg as the row's small detail line. Map planDone/phase from the first
+events; "params" can move from 61 GB toward the final size when quantize
+reports it, or stay until the result.
+
+finish(status):
+  done    -> fetch /eval, show the result (section 6), mascot .succeeded.
+  error   -> GET /jobs/{id} for "error", show it kindly, offer "Try again"
+             = POST /jobs/{id}/resume {} and follow again.
+  stopped -> its own state, not an error: "Surgery paused", offer Resume
+             (same resume call). Finished stages are kept.
+
+5. STOP, BACKGROUND AND RELAUNCH
+--------------------------------
+- Stop button (Session.stop()): POST /jobs/{id}/stop, show a short "putting
+  the scalpel down" state while it waits (up to ~40 s), then the stopped state.
+  409 "job is not running" means it already ended: GET /jobs/{id} and show that.
+- iOS kills the stream when the app goes to the background. On scenePhase
+  .active, and on launch, if currentJob is set: GET /jobs/{id} and route by
+  state (running/queued -> reopen the events stream; done -> result;
+  error/stopped -> those states; partial -> treat like error with Resume).
+- Home "recent surgeries" (history): load from GET /jobs instead of keeping
+  them in memory, so real runs survive relaunch. Tapping a done one opens its
+  result.
+
+6. REAL RESULTS (result screen and report)
+------------------------------------------
+GET /jobs/{id}/eval:
+    {"teacher": {"name": "Qwen3-30B-A3B-Instruct-2507", "size_gb": 61.0, "score": 0.981},
+     "candidates": [{"name": "lobbot-moe", "size_gb": 6.52, "score": 0.974,
+                     "tok_s_est": 49, "meets_target": true}, ...],
+     "winner": "lobbot-moe",
+     "samples": {"lobbot-moe": [{"input": "...", "output": "..."}]},
+     ...}
+  winner        = the candidate whose name == eval.winner
+  quality kept  = winner.score / teacher.score  (e.g. 99%)
+  before        = teacher.size_gb (61 GB);  after = winner.size_gb (~6.5 GB)
+  lighter       = teacher.size_gb / winner.size_gb  (about 9x)
+  speed         = winner.tok_s_est tokens/s on a 16 GB laptop
+  examples      = 2 or 3 of samples[winner.name]
+Never invent numbers; if /eval returns 404, keep waiting or show the error.
+"Fits a phone" is not true for this model; say it runs on a 16 GB Mac or PC.
+
+7. TALKING TO THE FINISHED MODEL
+--------------------------------
+The phone can't run it. When a job is done, Oliver runs on his Mac:
+    lobbot save <job_id>
+which downloads the model, checks it, and loads it into Ollama as
+"lobbot-<task_name>". Ollama on that Mac must listen on the network:
+    OLLAMA_HOST=0.0.0.0 ollama serve
+(If the Ollama menu-bar app is running instead: `launchctl setenv OLLAMA_HOST 0.0.0.0`,
+then quit and reopen Ollama.)
+The result screen shows the job_id and "Ready on your Mac" so Oliver can run it.
+
+Then add a "Talk to your model" mode, separate from the Dr. Lobbot voice chat
+(which stays on Gemini):
+    POST <OLLAMA_BASE>/api/chat
+    {"model": "lobbot-<task_name>", "messages": [{"role": "user", "content": "..."}],
+     "stream": true}
+  Streamed JSON lines; each has message.content; the last has "done": true,
+  eval_count and eval_duration (nanoseconds).
+  tokens/s = eval_count / eval_duration * 1e9. Show it, it's the demo moment.
+  To check the model is installed: GET <OLLAMA_BASE>/api/tags and look for
+  "lobbot-<task_name>" (Ollama may list it with a ":latest" suffix).
+
+ACCEPTANCE CHECK (against the dry-run server, then the real one)
+---------------------------------------------------------------
+1. App launches, /health OK, no "can't reach" state.
+2. Fill the chart by voice or typing with 3+ examples; start -> 200, the
+   operating room shows six real stage rows filling in.
+3. Start a second one while the first runs (real VM, or by hand with
+   curl) -> the app offers to watch the running job.
+4. Background the app and come back mid-run -> it reconnects and catches up.
+5. Stop -> paused state; Resume -> continues and finishes.
+6. Result screen shows numbers from /eval, no simulation labels.
+7. After `lobbot save` on Oliver's Mac, "Talk to your model" answers and
+   shows tokens/s.
+Never commit Secrets.xcconfig, the token, or the VM address.
