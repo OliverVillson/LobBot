@@ -29,6 +29,8 @@ class Config:
     # Data
     n_generate: int = 2000
     n_heldout: int = 100
+    # Gemini writes the held-out test inputs when GEMINI_API_KEY is set ("" = teacher writes them)
+    testgen_model: str = "gemini-3.8-flash"
     # REAP: fraction of experts removed per layer. 0.5 keeps 64 of 128.
     # Raising it frees bytes for more bits per remaining expert.
     reap_sparsity: float = 0.5

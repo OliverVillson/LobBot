@@ -135,39 +135,23 @@ def agreement(answer: str, reference: str) -> float:
     return _f1(answer, reference)
 
 
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
-
-
 def judge_key(model: str) -> str | None:
     """The API key the judge model needs, or None if it is not set."""
     if model.startswith("gemini"):
-        return os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+        from stages.gemini import api_key
+
+        return api_key()
     return os.environ.get("ANTHROPIC_API_KEY")
-
-
-def _ask_gemini(model: str, prompt: str) -> str:
-    """One Gemini call over its OpenAI-compatible endpoint, retrying rate limits."""
-    import httpx
-
-    for attempt in range(6):
-        r = httpx.post(GEMINI_URL, timeout=120, headers={"Authorization": f"Bearer {judge_key(model)}"}, json={
-            "model": model, "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.0, "max_tokens": 1024, "reasoning_effort": "low",
-        })
-        if r.status_code in (429, 500, 502, 503, 504) and attempt < 5:
-            time.sleep(2 ** attempt)
-            continue
-        r.raise_for_status()
-        return r.json()["choices"][0]["message"].get("content") or ""
-    return ""
 
 
 def judge(spec, model: str, inputs: list[str], answers: list[str]) -> float | None:
     """Mean judge score in [0, 1]; None if no answer could be judged. gemini-*
-    models go to the Gemini API; claude-* go to Anthropic, through condense.chat
-    when CONDENSE_API_KEY is set."""
+    models go to the Gemini API, claude-* to Anthropic; both through
+    condense.chat when CONDENSE_API_KEY is set (stages/gemini.py, stages/condense.py)."""
     if model.startswith("gemini"):
-        ask = lambda prompt: _ask_gemini(model, prompt)
+        from stages import gemini
+
+        ask = lambda prompt: gemini.chat(model, [{"role": "user", "content": prompt}])
     else:
         from stages.condense import anthropic_client
 
