@@ -50,3 +50,9 @@ def test_template_family_falls_back_to_model_id():
     assert template_family("", "google/gemma-3-4b-it") == "gemma3"
     assert template_family("", "Qwen/Qwen3-4B-Instruct-2507") == "chatml"
     assert template_family("{{ unknown }}", "google/gemma-4-E4B-it") is None  # readable but unknown: leave it to Ollama
+
+
+def test_eval_generates_at_least_as_long_as_teacher_answers():
+    from stages import data, eval as ev
+    assert ev.MAX_TOKENS >= data.ANSWER_MAX_TOKENS
+    assert ev.CTX_PER_SLOT >= ev.MAX_TOKENS + data.MAX_INPUT_CHARS // 3
