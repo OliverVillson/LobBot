@@ -1,7 +1,7 @@
 # LobBot
 
-Hackathon lobotomy machine for LLMs: type `lobbot`, describe one job, and get a
-small model specialised for it that you download and own. A 30B
+Hackathon lobotomy machine for LLMs: describe one job, and get a small model
+specialised for it that you download, run offline and own. A 30B
 mixture-of-experts teacher becomes a ~6.5 GB GGUF that runs at 40+ tok/s on a
 16 GB laptop.
 
@@ -11,8 +11,10 @@ mixture-of-experts teacher becomes a ~6.5 GB GGUF that runs at 40+ tok/s on a
 |---|---|---|
 | `common/` | shared | `TaskSpec` schema and the JSON progress protocol. Change only together. |
 | `pipeline.py`, `stages/` | backend | Compression pipeline that runs on the GPU VM |
-| `scripts/setup_vm.sh` | backend | One-time VM setup |
-| `lobbot/`, `agent/` | frontend | TUI, SSH, planner, download; thin FastAPI agent on the VM |
+| `agent/server.py` | backend | HTTP API on the VM that the desktop app talks to |
+| `scripts/` | backend | VM setup and API launcher |
+| `lobbot/` | backend | Developer CLI (Oliver only) |
+| `app/`, `web/` | frontend | Desktop app (wraps Ollama for local inference) and landing page |
 | `examples/` | shared | Demo `TaskSpec` (support email to JSON ticket) |
 
 ## Pipeline
@@ -45,6 +47,20 @@ export ANTHROPIC_API_KEY=...                   # for the eval judge
 python pipeline.py --job /mnt/nvme/jobs/demo
 ```
 
+## HTTP API
+
+```bash
+source .env.vm
+LOBBOT_TOKEN=<secret> bash scripts/serve_api.sh     # listens on 127.0.0.1:8700
+ssh -L 8700:127.0.0.1:8700 <vm>                     # on the laptop
+```
+
+`GET /health`, `POST /jobs` (TaskSpec body), `GET /jobs`, `GET /jobs/{id}`,
+`GET /jobs/{id}/events` (SSE progress lines, replayed from the start of the
+latest run), `POST /jobs/{id}/resume`, `GET /jobs/{id}/eval`,
+`GET /jobs/{id}/model` (GGUF, Range supported), `GET /jobs/{id}/modelfile`.
+All but `/health` need `Authorization: Bearer $LOBBOT_TOKEN`.
+
 ## Without a GPU
 
 `LOBBOT_DRY_RUN=1` walks every stage with placeholder outputs, so the TUI and
@@ -52,5 +68,6 @@ agent can be built against the real pipeline contract on a laptop.
 
 ```bash
 LOBBOT_DRY_RUN=1 python pipeline.py --job /tmp/lobbot-job   # after copying a taskspec.json in
+LOBBOT_DRY_RUN=1 LOBBOT_JOBS=/tmp/lobbot-jobs LOBBOT_TOKEN=dev uvicorn agent.server:app --port 8700
 python -m pytest
 ```

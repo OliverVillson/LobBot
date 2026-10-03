@@ -43,6 +43,19 @@ uv pip install -q --python "$NVME/venv-train/bin/python" \
   trl peft datasets accelerate anthropic httpx fastapi uvicorn sentencepiece gguf
 uv pip install -q --python "$NVME/venv-train/bin/python" -e "$REPO" --no-deps
 
+# Written before the llama.cpp build so the data stage works even if that step fails.
+cat > "$REPO/.env.vm" <<ENV
+export LOBBOT_MODELS=$NVME/models
+export LOBBOT_LLAMA_CPP=$NVME/llama.cpp
+export LOBBOT_VLLM_PY=$NVME/venv-vllm/bin/python
+export HF_HOME=$NVME/hf-cache
+export LOBBOT_JOBS=$NVME/jobs
+export PATH=$NVME/venv-train/bin:\$PATH
+ENV
+
+say "vLLM smoke test"
+"$NVME/venv-vllm/bin/python" -c "import vllm, torch; print('vllm', vllm.__version__, 'torch', torch.__version__, 'cuda ok:', torch.cuda.is_available())" || echo 'WARNING: vLLM import failed; the data stage will not run'
+
 say "llama.cpp with CUDA"
 if ! command -v nvcc >/dev/null && [ ! -x /usr/local/cuda/bin/nvcc ]; then
   echo "nvcc not found. Install the CUDA toolkit (12.8+ for B200), e.g.:"
@@ -55,13 +68,6 @@ cmake -S "$NVME/llama.cpp" -B "$NVME/llama.cpp/build" -DGGML_CUDA=ON -DCMAKE_CUD
 cmake --build "$NVME/llama.cpp/build" -j"$(nproc)" --target llama-quantize llama-imatrix llama-server llama-cli
 uv pip install -q --python "$NVME/venv-train/bin/python" -r "$NVME/llama.cpp/requirements/requirements-convert_hf_to_gguf.txt" || true
 
-cat > "$REPO/.env.vm" <<ENV
-export LOBBOT_MODELS=$NVME/models
-export LOBBOT_LLAMA_CPP=$NVME/llama.cpp
-export LOBBOT_VLLM_PY=$NVME/venv-vllm/bin/python
-export HF_HOME=$NVME/hf-cache
-export PATH=$NVME/venv-train/bin:\$PATH
-ENV
 
 say "Done. Weights still downloading: tail -f $NVME/download.log"
 echo "Then: source .env.vm && python pipeline.py --job $NVME/jobs/demo  (after copying a taskspec.json there)"

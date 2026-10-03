@@ -6,16 +6,15 @@ requires-python = ">=3.11"
 dependencies = []
 
 [project.optional-dependencies]
-# Laptop side (frontend): TUI, SSH, planner, download.
-tui = ["textual", "asyncssh", "httpx", "anthropic"]
-# VM side: installed by scripts/setup_vm.sh into its own venvs.
-dev = ["pytest"]
+# VM side ML deps are installed by scripts/setup_vm.sh into their own venvs.
+api = ["fastapi", "uvicorn", "httpx"]
+dev = ["pytest", "fastapi", "uvicorn", "httpx"]
 
 [project.scripts]
 lobbot = "lobbot.app:main"
 
 [tool.setuptools.packages.find]
-include = ["lobbot*", "common*", "stages*"]
+include = ["lobbot*", "common*", "stages*", "agent*"]
 
 [build-system]
 requires = ["setuptools>=68"]
