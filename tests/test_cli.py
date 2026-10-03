@@ -329,3 +329,49 @@ def test_run_refuses_while_busy_and_stop_frees_it(cli):
         assert "no running pipeline" in cli("stop", "busy", "--yes").stderr
     finally:
         proc.kill()
+
+
+def test_watch_survives_a_dropped_stream(monkeypatch, capsys):
+    """A tunnel drop between events ends the stream with no error and no final event:
+    watch must reconnect and keep going, not give up (shell1 lost its watch this way)."""
+    import contextlib
+
+    from lobbot import app
+
+    ev = lambda st, status, **k: {"stage": st, "status": status, "ts": 0, **k}
+    run = [ev("pipeline", "running"), ev("data", "done"), ev("heal", "running", pct=8.0, msg="moe step 10/127")]
+    streams = [run[:2], run, run + [ev("heal", "done"), ev("pipeline", "done", model=False, msg="partial")]]
+    calls = []
+
+    class FakeApi:
+        def __init__(self, base, token):
+            pass
+
+        def events(self, job_id):
+            calls.append(job_id)
+            yield from streams[len(calls) - 1]  # then the stream just ends, as after a tunnel drop
+
+        def get(self, path):
+            return {"state": "running", "error": None}
+
+    class FakeRemote:
+        @contextlib.contextmanager
+        def tunnel(self):
+            yield "http://127.0.0.1:1"
+
+        def token(self):
+            return "t"
+
+    monkeypatch.setattr(app, "Api", FakeApi)
+    monkeypatch.setattr(app.time, "sleep", lambda s: None)
+    assert app.watch(FakeRemote(), "shell1") == "done"
+    assert len(calls) == 3
+    out = capsys.readouterr()
+    assert "ended early" not in out.out + out.err and "reconnecting" in out.err
+
+    # The run finished while the stream was down: the job's state ends the watch.
+    calls.clear()
+    streams[:] = [run[:2]]
+    monkeypatch.setattr(FakeApi, "get", lambda self, path: {"state": "error", "error": "heal: CUDA OOM"})
+    assert app.watch(FakeRemote(), "shell1") == "error"
+    assert "heal: CUDA OOM" in capsys.readouterr().out
