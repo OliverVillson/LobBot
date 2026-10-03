@@ -1,0 +1,127 @@
+LobBot: which tech providers we used, why, and how
+===================================================
+
+LobBot turns one large open model into a small model that does a single job
+well and runs offline on a 16 GB laptop. A 61 GB teacher (Qwen3-30B-A3B)
+becomes a 6.52 GB GGUF file through expert pruning (REAP), distillation
+healing and mixed-bit quantization. This file explains each outside service
+or project the pipeline depends on: why we picked it, and where in the code
+it is used.
+
+Results referred to below (Gemini judge, scored on held-out tests):
+  - Support email to JSON ticket: 0.974 for the 6.52 GB model vs 0.981 for
+    the teacher, measured at 56.7 tok/s on an Apple M5 MacBook with 16 GB.
+  - Plain English to shell command: 0.77 vs 0.84 for the teacher (91%).
+  - Estimated speed on a 16 GB M4 MacBook Air: about 49 tok/s.
+
+
+1. evroc (GPU cloud)
+--------------------
+Why: Every heavy step needs a large GPU. Running the 30B teacher in vLLM,
+pruning experts, LoRA-healing the pruned model and building GGUFs do not fit
+on a laptop. evroc gave us a single NVIDIA B200 VM with a large local NVMe
+disk, which is enough to hold the teacher weights, the pruned model and all
+intermediate files for a job, and to run a full job in about 25 minutes of
+GPU time.
+
+How:
+  - scripts/setup_vm.sh does the one-time setup on the evroc Ubuntu 24.04
+    GPU image: formats and mounts the NVMe disk, installs the Python
+    environments, builds llama.cpp and downloads the weights.
+  - pipeline.py and all of stages/ (data, reap, heal, quantize, eval,
+    package) run on that VM, with jobs stored under /mnt/nvme/jobs/.
+  - agent/server.py is the HTTP API on the VM. The `lobbot` CLI (lobbot/)
+    reaches it from a laptop over an SSH tunnel, starts jobs and streams
+    their progress.
+
+
+2. Google DeepMind: Gemini and Gemma (main sponsor)
+---------------------------------------------------
+Why: A model trained on its teacher's answers should not be graded by that
+same teacher, and its tests should not be written by it either, or they
+share the teacher's blind spots. Gemini is an independent model that writes
+the tests and grades the answers. Gemma is a strong small dense model, which
+gives us a second, simpler candidate to compare against the pruned MoE.
+
+How:
+  - Test writing (stages/testgen.py): Gemini (Config.testgen_model,
+    gemini-3.8-flash) writes the held-out test inputs in several styles
+    (short, messy, formal, edge cases and so on). The teacher answers them,
+    and none of them are used for training.
+  - Judging (stages/eval.py, judge()): Gemini scores every held-out answer
+    from 0 to 10 against the criteria in the job's TaskSpec. The teacher's
+    own answers get the same grading, so each result can be read as a share
+    of the teacher's score. The eval stage then picks the winner: the best
+    score among candidates that meet the size and speed targets, with the
+    pruned MoE preferred when it is within 0.02 of the best.
+  - Task drafting (lobbot/taskgen.py, `lobbot new "<task>"`): Gemini turns a
+    one-line task description into a full TaskSpec with seed examples and
+    grading criteria.
+  - Dense fallback student (stages/heal.py, Config.student =
+    google/gemma-4-E4B-it): Gemma 4 E4B is fine-tuned on the same teacher
+    data at the same time as the MoE is healed, then quantized to Q4_K_M.
+    On the email-to-ticket task it scored 0.982, slightly above the MoE, but
+    ran at about 26 tok/s against the MoE's ~49, so the MoE won on speed.
+    Gemma stays in as the backup candidate.
+  - stages/gemini.py is the small client both stages use. It talks to
+    Gemini's OpenAI-compatible endpoint directly.
+
+
+3. condense.chat (prompt compression)
+-------------------------------------
+Why: condense.chat compresses prompt text so a model sees more content for
+the same number of input tokens. When Gemini writes test inputs, more varied
+examples lead to more varied tests.
+
+How (a small integration, by design):
+  - stages/condense.py, compress(): one call per run to condense's
+    /v1/compress API with the helene-1.1 model.
+  - stages/testgen.py uses it on the seed examples Gemini is shown. With
+    condense on, Gemini sees 8 examples instead of 4 for about the same
+    token cost. The first example is left uncompressed and the prompt says
+    the rest are shortened, so Gemini still writes full, natural inputs.
+  - If the call fails, the uncompressed text is used, so condense can never
+    block a job.
+
+What we did not do, and why:
+  - The judge prompt is not compressed. Compression is extractive and can
+    drop details that matter for grading (in a test it dropped "to EUR" from
+    an invoice email).
+  - Gemini calls do not go through condense's proxy. Its /gemini/ route only
+    forwards to Google Vertex AI, which needs Google Cloud credentials, and
+    we use an AI Studio key. The proxy route exists in stages/gemini.py but
+    is off unless CONDENSE_GEMINI_URL is set.
+
+
+4. Open-source models and tools
+-------------------------------
+Qwen3-30B-A3B-Instruct-2507 (Alibaba Qwen), the teacher and the model we
+compress. It is a mixture-of-experts model with 128 experts per layer and
+about 3B active parameters per token. REAP needs an MoE, and the small
+active size is why the compressed model is fast on a laptop.
+(stages/_util.py, Config.teacher)
+
+vLLM, fast batched inference for the teacher. It writes about 2,000
+training examples per job from the TaskSpec seeds and answers the held-out
+tests. (stages/data.py)
+
+PyTorch, Hugging Face Transformers and PEFT, used to implement REAP pruning,
+LoRA healing and the dense student fine-tune directly.
+(stages/reap.py, stages/heal.py, stages/sft.py)
+
+llama.cpp and the GGUF format. The quantize stage converts the healed model
+to GGUF, computes a task importance matrix (imatrix) and runs llama-quantize
+with a different bit width per expert tensor, from q2_k up to q6_k, based on
+how much each layer matters for the task. (stages/quantize.py,
+stages/bits.py)
+
+Ollama, how people run the result. The package stage writes out/model.gguf
+plus an Ollama Modelfile with the right chat template and stop tokens, and
+`lobbot save <job> --chat` installs it with `ollama create`.
+(stages/package.py, lobbot/app.py)
+
+
+Not used
+--------
+Matrix OS was considered as a sponsor integration and skipped. Nothing in
+LobBot depends on it.
