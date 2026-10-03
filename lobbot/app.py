@@ -476,19 +476,50 @@ cat >> "$f.tmp"; mv "$f.tmp" "$f" """, input=line + "\n")
         ok("API restarted so new jobs see it")
 
 
+def draft_on_vm(r: Remote, desc: str, seeds: int, provider: str | None) -> dict:
+    """Run lobbot.taskgen on the VM with its ~/.lobbot-env keys; the key never leaves the VM."""
+    from common.taskspec import TaskSpec
+
+    print(f"No API key on this machine, so drafting on the VM ({r.s.host}) with the key in ~/.lobbot-env...")
+    args = f"{shlex.quote(desc)} --seeds {int(seeds)}" + (f" --provider {shlex.quote(provider)}" if provider else "")
+    try:
+        out = r.sh(r.env_prelude() + f"exec python3 -m lobbot.taskgen {args}", timeout=360)
+    except RemoteError as e:
+        msg = str(e)
+        if "No module named lobbot.taskgen" in msg:
+            msg += "\nThe VM checkout is too old for this; update it with: lobbot pull"
+        elif "no LLM API key" in msg or "needs" in msg:
+            msg += "\nAdd a key on the VM with: lobbot secret GEMINI_API_KEY"
+        raise CliError("drafting on the VM failed: " + msg)
+    try:
+        spec = json.loads(out[out.index("{"):])
+        TaskSpec.from_dict(spec)
+    except (ValueError, KeyError, TypeError) as e:
+        raise CliError(f"the VM returned something that is not a valid TaskSpec: {e}")
+    return spec
+
+
 def cmd_new(a) -> None:
     if a.example:
         spec = json.loads(example_text(Remote(settings(a))))
     else:
         if not a.description:
             raise CliError('describe the task, e.g. lobbot new "turn support emails into JSON tickets"')
-        from lobbot.taskgen import TaskgenError, draft_taskspec
+        from lobbot.taskgen import TaskgenError, _resolve_provider, draft_taskspec
 
-        print("Drafting a TaskSpec (this calls Gemini, or Claude if only ANTHROPIC_API_KEY is set)...")
+        desc = " ".join(a.description)
         try:
-            spec = draft_taskspec(" ".join(a.description), n_seeds=a.seeds, provider=a.provider)
-        except TaskgenError as e:
-            raise CliError(str(e))
+            local = not a.on_vm and bool(_resolve_provider(a.provider))
+        except TaskgenError:
+            local = False  # no key on this Mac: use the one in ~/.lobbot-env on the VM
+        if local:
+            print("Drafting a TaskSpec with your local API key (Gemini, or Claude if only ANTHROPIC_API_KEY is set)...")
+            try:
+                spec = draft_taskspec(desc, n_seeds=a.seeds, provider=a.provider)
+            except TaskgenError as e:
+                raise CliError(str(e))
+        else:
+            spec = draft_on_vm(Remote(settings(a)), desc, a.seeds, a.provider)
     out = Path(a.out or f"{spec['task_name']}.taskspec.json")
     out.write_text(json.dumps(spec, indent=2, ensure_ascii=False) + "\n")
     ok(f"wrote {out}  ({spec['task_name']}, {len(spec['seed_examples'])} seed examples)")
@@ -975,6 +1006,8 @@ def parser() -> argparse.ArgumentParser:
     sp.add_argument("--seeds", type=int, default=12, help="seed examples to draft (3-50)")
     sp.add_argument("--provider", choices=["gemini", "anthropic"])
     sp.add_argument("--example", action="store_true", help="write the bundled support-ticket example instead")
+    sp.add_argument("--on-vm", action="store_true",
+                    help="draft on the VM with its ~/.lobbot-env key even if this machine has one")
 
     sp = add("run", cmd_run, "start a pipeline job on the VM and watch it")
     sp.add_argument("spec", nargs="?", help="TaskSpec JSON file")

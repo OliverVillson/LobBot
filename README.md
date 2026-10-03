@@ -75,7 +75,7 @@ uv tool install --editable .        # or: pipx install -e .
 lobbot init                         # VM host (default evroc-user@194.14.81.33), key, checkout path
 lobbot doctor                       # SSH, checkout, venvs, weights, llama.cpp, GPU, API
 lobbot secret GEMINI_API_KEY        # stored in ~/.lobbot-env on the VM (mode 600) for the eval judge
-lobbot new "turn support emails into JSON tickets"   # drafts a TaskSpec with Gemini
+lobbot new "turn support emails into JSON tickets"   # drafts a TaskSpec with Gemini (uses the VM's key if this Mac has none)
 lobbot run my.taskspec.json --fast  # or --example; live stage progress, Ctrl-C detaches
 lobbot results <job>                # judge scores vs teacher, size, tok/s, held-out examples
 lobbot status [job] | watch <job> | logs <job> [-s heal] [-f]
