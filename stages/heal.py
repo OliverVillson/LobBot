@@ -1,93 +1,139 @@
 """Stage 3: heal by distillation.
 
-LoRA SFT of the pruned MoE on the unpruned teacher's answers, then merge.
-If dense_fallback is on, also SFTs the dense student on the same data so the
-eval stage has a second candidate. Writes:
+LoRA SFT of the pruned MoE on the unpruned teacher's answers (router,
+attention and experts), then merge. If dense_fallback is on, the dense
+student is SFT'd on the same data at the same time in a child process, so a
+crash there cannot take down the main path. Writes:
   work/healed/   pruned + healed MoE (merged HF model)
   work/dense/    dense student (merged HF model), if enabled
+
+Extra knobs beyond Config (env vars): LOBBOT_KD_WEIGHT (default 0; >0 adds
+logit KL to the unpruned teacher, which then sits in GPU memory too),
+LOBBOT_HEAL_EXPERTS (default 1; 0 trains attention and router only),
+LOBBOT_STUDENT_EPOCHS (default 2).
 """
 
 from __future__ import annotations
 
 import argparse
-import shutil
+import json
+import os
+import subprocess
+import sys
+import threading
+from pathlib import Path
 
-from common.progress import emit
+from common.progress import emit, parse
 from stages._util import DRY_RUN, Job
 
 STAGE = "heal"
+_lock = threading.Lock()
 
 
-def sft(job: Job, src: str, out_name: str, targets, r: int, pct_lo: float, pct_hi: float) -> None:
-    import torch
-    from datasets import load_dataset
-    from peft import LoraConfig
-    from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback
-    from trl import SFTConfig, SFTTrainer
+def _knob(cfg, name: str, env: str, default):
+    v = getattr(cfg, name, None)
+    if v is not None:
+        return v
+    raw = os.environ.get(env)
+    if raw is None:
+        return default
+    if isinstance(default, bool):
+        return raw.lower() not in ("0", "false", "no")
+    return type(default)(raw)
+
+
+def heal_moe(job: Job, progress) -> None:
+    from stages.sft import train_sft
+    from stages.taskdata import load_examples
 
     cfg = job.config
-    tok = AutoTokenizer.from_pretrained(src)
-    model = AutoModelForCausalLM.from_pretrained(src, torch_dtype=torch.bfloat16, device_map="cuda")
-    ds = load_dataset("json", data_files=str(job.path("data", "train.jsonl")), split="train")
+    kd = float(_knob(cfg, "heal_kd_weight", "LOBBOT_KD_WEIGHT", 0.0))
+    train_sft(
+        str(job.path("work", "reaped")), load_examples(job.path("data", "train.jsonl")), job.path("work", "healed"),
+        epochs=cfg.heal_epochs, lr=cfg.heal_lr, r=cfg.heal_lora_r, alpha=2 * cfg.heal_lora_r,
+        targets=cfg.heal_targets, train_experts=bool(_knob(cfg, "heal_train_experts", "LOBBOT_HEAL_EXPERTS", True)),
+        train_router=True, kd_teacher=job.model_path(cfg.teacher) if kd > 0 else None, kd_weight=kd,
+        max_tokens=16384, progress=progress)
 
-    class Progress(TrainerCallback):
-        def on_log(self, args, state, control, logs=None, **kw):
-            if state.max_steps:
-                frac = state.global_step / state.max_steps
-                loss = (logs or {}).get("loss")
-                emit(STAGE, pct=pct_lo + (pct_hi - pct_lo) * frac,
-                     msg=f"{out_name}: step {state.global_step}/{state.max_steps}" + (f" loss {loss:.3f}" if loss else ""))
 
-    trainer = SFTTrainer(
-        model=model,
-        processing_class=tok,
-        train_dataset=ds,
-        peft_config=LoraConfig(r=r, lora_alpha=2 * r, lora_dropout=0.0, target_modules=targets, task_type="CAUSAL_LM"),
-        args=SFTConfig(
-            output_dir=str(job.path("work", f"{out_name}-ckpt")),
-            num_train_epochs=cfg.heal_epochs,
-            learning_rate=cfg.heal_lr,
-            per_device_train_batch_size=4,
-            gradient_accumulation_steps=4,
-            gradient_checkpointing=True,
-            bf16=True,
-            max_length=2048,
-            logging_steps=5,
-            save_strategy="no",
-            report_to=[],
-        ),
-        callbacks=[Progress()],
-    )
-    trainer.train()
-    merged = trainer.model.merge_and_unload()
-    out = job.path("work", out_name)
-    if out.exists():
-        shutil.rmtree(out)
-    merged.save_pretrained(out, safe_serialization=True)
-    tok.save_pretrained(out)
-    del trainer, model, merged
-    torch.cuda.empty_cache()
+def train_dense(job: Job, progress) -> None:
+    from stages.sft import train_sft
+    from stages.taskdata import load_examples
+
+    cfg = job.config
+    train_sft(
+        job.model_path(cfg.student), load_examples(job.path("data", "train.jsonl")), job.path("work", "dense"),
+        epochs=float(_knob(cfg, "student_epochs", "LOBBOT_STUDENT_EPOCHS", 2.0)), lr=2e-4, r=32, alpha=64,
+        max_tokens=32768, progress=progress)
 
 
 def run_stage(job: Job) -> None:
     cfg = job.config
     if DRY_RUN:
+        import shutil
         shutil.copytree(job.path("work", "reaped"), job.path("work", "healed"), dirs_exist_ok=True)
         if cfg.dense_fallback:
             job.path("work", "dense").mkdir(exist_ok=True)
         emit(STAGE, pct=90, msg="dry run: copied pruned model")
-    else:
-        emit(STAGE, pct=1, msg="healing pruned MoE")
-        sft(job, str(job.path("work", "reaped")), "healed", cfg.heal_targets, cfg.heal_lora_r, 2, 60 if cfg.dense_fallback else 98)
-        if cfg.dense_fallback:
-            emit(STAGE, pct=60, msg=f"distilling dense student {cfg.student}")
-            sft(job, job.model_path(cfg.student), "dense", "all-linear", 32, 60, 98)
+        job.mark_done(STAGE, {"dense": cfg.dense_fallback})
+        emit(STAGE, "done", 100, "healed" + (" + dense student" if cfg.dense_fallback else ""))
+        return
 
-    job.mark_done(STAGE, {"dense": cfg.dense_fallback})
-    emit(STAGE, "done", 100, "healed" + (" + dense student" if cfg.dense_fallback else ""))
+    pct = {"moe": 0.0, "dense": 0.0 if cfg.dense_fallback else 100.0}
+
+    def report(part: str, p: float, m: str) -> None:
+        pct[part] = p
+        total = (pct["moe"] + pct["dense"]) / 2 if cfg.dense_fallback else pct["moe"]
+        with _lock:
+            emit(STAGE, pct=total, msg=("MoE: " if part == "moe" else "dense: ") + m)
+
+    child = reader = None
+    if cfg.dense_fallback:
+        child = subprocess.Popen(
+            [sys.executable, "-u", "-m", "stages.heal", "--job", str(job.root), "--part", "dense"],
+            cwd=Path(__file__).resolve().parents[1], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1, errors="replace")
+
+        def pump():
+            for line in child.stdout:
+                ev = parse(line)
+                if ev is None:
+                    with _lock:
+                        sys.stdout.write("[dense] " + line)
+                        sys.stdout.flush()
+                elif ev["status"] == "error":
+                    with _lock:
+                        print(f"[dense] failed: {ev.get('msg')}", flush=True)
+                elif "pct" in ev:
+                    report("dense", ev["pct"], ev.get("msg", ""))
+        reader = threading.Thread(target=pump, daemon=True)
+        reader.start()
+
+    try:
+        heal_moe(job, lambda p, m: report("moe", p, m))
+    except BaseException:
+        if child:
+            child.terminate()
+        raise
+
+    dense_ok = False
+    if child:
+        dense_ok = child.wait() == 0 and job.path("work", "dense", "config.json").exists()
+        reader.join(timeout=5)
+        if not dense_ok:
+            print("heal: dense student failed; continuing with the MoE only (see [dense] lines above)", flush=True)
+    job.mark_done(STAGE, {"dense": dense_ok})
+    emit(STAGE, "done", 100, "healed" + (" + dense student" if dense_ok else ""))
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--job", required=True)
-    run_stage(Job(ap.parse_args().job))
+    ap.add_argument("--part", choices=["all", "moe", "dense"], default="all")
+    a = ap.parse_args()
+    job = Job(a.job)
+    if a.part == "all":
+        run_stage(job)
+    else:
+        (heal_moe if a.part == "moe" else train_dense)(job, lambda p, m: emit(STAGE, pct=p, msg=m))
+        emit(STAGE, "done", 100, f"{a.part} trained")
