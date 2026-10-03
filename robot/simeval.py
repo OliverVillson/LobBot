@@ -157,8 +157,8 @@ def evaluate(job, site, make, seeds: list[int], clip: Path | None, label: str, p
     env = make_env(job, site, seeds[0], None if vision else 0)
     for i, seed in enumerate(seeds):
         if policy is None or not reuse:
-            # Expert-based policies follow the true row of their env, so they are
-            # built per episode; a GR00T checkpoint is loaded once.
+            # Dry-run stand-ins are rebuilt per episode so their noise is keyed by the
+            # episode seed; a GR00T checkpoint is loaded once.
             policy = make(env, seed)
         timed = TimedPolicy(policy)
         timed.times_ms = times

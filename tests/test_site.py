@@ -162,7 +162,7 @@ def test_copernicus_offline(tmp_path, monkeypatch):
     monkeypatch.setattr(copernicus, "_tile_blob", lambda name: blob)
 
     def fake_get(url, params=None, **kw):
-        w, h = int(params["WIDTH"]), int(params["HEIGHT"])
+        w, h = (int(params["WIDTH"]), int(params["HEIGHT"])) if params else (256, 256)
         buf = io.BytesIO()
         Image.new("RGB", (w, h), (10, 200, 30)).save(buf, "PNG")
         return buf.getvalue()
@@ -174,3 +174,56 @@ def test_copernicus_offline(tmp_path, monkeypatch):
     assert z[0].mean() > z[-1].mean()
     assert abs(z.mean() - LAT * 100) < 1.0
     assert img.shape == (128, 128, 3) and abs(int(img[64, 64, 1]) - 200) < 3
+
+
+def test_lantmateriet_offline(tmp_path, monkeypatch):
+    """STAC discovery, client-side bbox filter, two-tile mosaic and WMS, with fake responses."""
+    import io
+
+    from PIL import Image
+
+    monkeypatch.setenv("LANTMATERIET_USER", "u")
+    monkeypatch.setenv("LANTMATERIET_PASSWORD", "p")
+    box = geo.square_box(LAT, LON, 300)
+    mid_e = round((box.west + box.east) / 2)  # tile edge through the site
+    min_lon, min_lat, max_lon, max_lat = box.wgs84_bounds()
+    k = 2500
+    # west tile: z = 10, east tile: z = 20; both 1 m cells, 2.5 km square, north edge above the site
+    top = box.north + 1000
+    tiles = {"w.tif": _geotiff(np.full((k, 1000), 10.0), mid_e - 1000, top, 1.0, 1.0),
+             "e.tif": _geotiff(np.full((k, 1000), 20.0), mid_e, top, 1.0, 1.0)}
+    item = lambda name, b: {"id": name, "bbox": b, "assets": {"data": {"href": "https://dl/" + name}}}
+    seen = []
+
+    def fake_get(url, params=None, headers=None, **kw):
+        seen.append((url, headers))
+        if url.endswith("/collections"):
+            return json.dumps({"collections": [
+                {"id": "mhm-65_6", "extent": {"spatial": {"bbox": [[min_lon - 1, min_lat - 1, max_lon + 1, max_lat + 1]]}}},
+                {"id": "mhm-far", "extent": {"spatial": {"bbox": [[0, 0, 1, 1]]}}},
+                {"id": "other", "extent": {}}]}).encode()
+        if url.endswith("/search"):
+            assert params["collections"] == "mhm-65_6"
+            return json.dumps({"features": [
+                item("w.tif", [min_lon - 0.01, min_lat - 0.01, (min_lon + max_lon) / 2 + 0.001, max_lat + 0.01]),
+                item("e.tif", [(min_lon + max_lon) / 2 - 0.001, min_lat - 0.01, max_lon + 0.01, max_lat + 0.01]),
+                item("far.tif", [0, 0, 1, 1])]}).encode()
+        if url.startswith("https://dl/"):
+            assert headers["Authorization"].startswith("Basic ")
+            return tiles[url.rsplit("/", 1)[1]]
+        assert params["CRS"] == "EPSG:3006" and params["BBOX"].startswith(f"{box.south}")
+        buf = io.BytesIO()
+        Image.new("RGB", (int(params["WIDTH"]), int(params["HEIGHT"])), (1, 2, 3)).save(buf, "PNG")
+        return buf.getvalue()
+
+    monkeypatch.setattr(lantmateriet, "http_get", fake_get)
+    z, img = lantmateriet.fetch(box, 300, 64)
+    assert not any("far.tif" in u for u, _ in seen)
+    assert np.isfinite(z).all()
+    assert z[:, 0].mean() == pytest.approx(10.0) and z[:, -1].mean() == pytest.approx(20.0)
+    assert img.shape == (64, 64, 3)
+
+    monkeypatch.setattr(copernicus, "fetch", lambda *a: (_ for _ in ()).throw(AssertionError("not reached")))
+    site = build_site(LAT, LON, 300, source="auto", sites_dir=tmp_path)
+    meta = json.loads((site.dir / "site.json").read_text())
+    assert site.source == "lantmateriet" and meta["attribution"] == "© Lantmäteriet, CC BY 4.0"

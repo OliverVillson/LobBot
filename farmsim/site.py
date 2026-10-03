@@ -195,6 +195,9 @@ def build_site(lat: float, lon: float, size_m: float = 300.0, name: str = "", so
     meta.pop("dir")
     meta["source_requested"] = source
     meta["source_errors"] = errors
+    winner_mod = _source_module(winner)
+    meta["attribution"] = getattr(winner_mod, "ATTRIBUTION", "")
+    meta["source_note"] = getattr(winner_mod, "NOTE", "")
     meta["dem_shape"] = list(dem.shape)
     meta["ortho_shape"] = list(ortho.shape)
     meta["created"] = datetime.now(timezone.utc).isoformat(timespec="seconds")

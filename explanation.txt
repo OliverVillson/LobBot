@@ -1,0 +1,143 @@
+FARMER-PALANTIR: WHAT THIS IS AND HOW IT WORKS
+Written 2026-10-03 for the co-founders.
+
+1. THE IDEA
+
+Open data intelligence for Swedish farms, plus robots that can act on it.
+Everything is open source and free to use.
+
+There are two halves, and they share one data layer.
+
+  a) Data intelligence for farmers. You pick a field on a map and get one
+     place that shows its terrain, slope, imagery, sun and weather.
+
+  b) Applied intelligence for automated farming. The same field data builds
+     a simulator, and a robot driving model is trained and tested in that
+     simulator. The model is then compressed so it runs on a small computer
+     inside the tractor cab.
+
+Sweden is a good place to start because the key data is open:
+  - Lantmäteriet: 1 m elevation and 0.16-0.5 m aerial photos (CC BY 4.0).
+  - SMHI: weather.
+  - Jordbruksverket: field parcels.
+
+
+2. THE HACKATHON MVP: FROM A MAP CLICK TO A COMPRESSED ROBOT MODEL
+
+  Step 1  Pick a place.
+          A map page in the browser. Click a field in Sweden, choose the size
+          of the area (100-1000 m), and press "Build site".
+
+  Step 2  Build the site.
+          The system downloads elevation and an aerial photo for that square
+          from Lantmäteriet. It falls back to Copernicus 30 m satellite data
+          when no Lantmäteriet account is set up, and to a made-up demo field
+          when there is no internet. It also computes a short field summary:
+          elevation, slope, area and sun angle.
+
+  Step 3  Simulate.
+          A 3D driving simulator of that exact field, built on MuJoCo. A
+          tractor drives crop rows over the real terrain. Rain lowers grip,
+          the sun angle changes the light, and slopes slow the tractor.
+
+  Step 4  Make demonstrations.
+          A scripted "expert" driver follows the rows. Its drives are saved
+          as training data in the format NVIDIA's robot model expects.
+
+  Step 5  Train.
+          NVIDIA GR00T N1.7 learns to drive from the demos. GR00T is an open
+          robot foundation model with 3B parameters, and its licence allows
+          commercial use. Training runs on our B200 GPU at evroc.
+
+  Step 6  Compress.
+          Several smaller versions of the trained model are made:
+            - fewer denoising steps
+            - lower precision numbers (FP8 or NVFP4)
+            - removed layers
+          Which parts can be shrunk is decided by testing the model in the
+          simulator ("sim-in-the-loop"), not by generic rules. This is the
+          same idea LobBot uses for language models, applied to robots.
+
+  Step 7  Score.
+          Every version drives the same simulated episodes. We measure
+          success rate, how far it strays from the row, size in GB, and speed.
+
+  Step 8  Show.
+          - out/training.mp4: a short video of the field, the expert, the
+            trained model and each compressed model driving.
+          - out/footprint_vs_performance.png: a graph of how much smaller
+            each model is against how well it still drives.
+
+
+3. WHY IT MATTERS
+
+Big AI models do not fit in a tractor. A model that is small, fast and
+tested on your own field's terrain and weather is what makes autonomy cheap
+enough for ordinary farms. Free and open means no farmer is locked into a
+vendor.
+
+
+4. HOW THE CONTROL SYSTEM IS MEANT TO WORK (AFTER THE HACKATHON)
+
+  - The AI model only plans the path and speed.
+  - A standard controller steers the tractor along that path using RTK GPS.
+  - Implements (sprayer, hitch, PTO) are controlled over ISOBUS (ISO 11783),
+    the industry standard.
+  - A separate safety system handles obstacles, operating zones and the
+    emergency stop, following ISO 18497. The AI model is never part of the
+    safety system.
+
+
+5. STATUS (BE HONEST WHEN DEMOING)
+
+  Built and tested on a laptop with no GPU:
+    - map picker
+    - site building
+    - simulator and scripted expert driver
+    - video recording
+    - training-data export
+    - compression maths
+    - full pipeline in "dry run" mode
+
+  Not yet run for real (needs the B200):
+    - GR00T training
+    - GR00T compression on the real model
+
+  DRY RUN NUMBERS ARE NOT RESULTS. In dry run the "models" are the expert
+  driver with added noise. The video and graph say DRY RUN on them. Only
+  show numbers from a real run on the B200.
+
+  Needs an account:
+    - Real Lantmäteriet data needs a free Geotorget account at
+      geotorget.lantmateriet.se. Order the free Markhöjdmodell and Ortofoto
+      products, then set LANTMATERIET_USER and LANTMATERIET_PASSWORD on the
+      server.
+    - GR00T's backbone is gated on Hugging Face, so the server needs a
+      Hugging Face token (HF_TOKEN).
+
+  Known limits:
+    - The simulator uses simple vehicle physics, not full wheel and soil
+      contact.
+    - Isaac Sim (NVIDIA's photoreal simulator) cannot run on the B200
+      because the B200 has no RT cores.
+    - GR00T was pre-trained on robot arms and humanoids, not tractors, so it
+      learns driving entirely from our demos.
+    - For real farm driving after the hackathon, NVIDIA's Alpamayo driving
+      model fits better, but commercial use requires asking NVIDIA.
+
+
+6. LICENCES
+
+  - Our code: open source.
+  - GR00T N1.7 weights: NVIDIA Open Model License (commercial use OK, keep
+    the attribution).
+  - Lantmäteriet data: CC BY 4.0. Credit "© Lantmäteriet".
+  - Sentinel-2 cloudless imagery from EOX (2024 layer): CC BY-NC-SA 4.0,
+    non-commercial only. It is only used as a fallback.
+
+
+7. WHERE TO READ MORE
+
+  - docs/robot-mvp.md: technical design and module contracts.
+  - The feasibility plan, with research and sources:
+    https://claude.ai/code/artifact/d6032888-71d7-4033-be92-572c1274b227

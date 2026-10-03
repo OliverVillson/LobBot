@@ -16,6 +16,8 @@ import numpy as np
 from farmsim import geo
 
 NAME = "synthetic"
+ATTRIBUTION = "Synthetic terrain and imagery (LobBot), not real data"
+NOTE = "Deterministic synthetic site for tests and dry runs."
 
 
 def _rng(box: geo.Box) -> np.random.Generator:

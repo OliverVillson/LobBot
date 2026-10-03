@@ -194,8 +194,10 @@ def stitch(job, report: dict, site: dict, graph: Path, path: Path) -> tuple[Path
     max_frames = int(per_clip * fps)
 
     frames: list[np.ndarray] = []
-    title = f"{site.get('name') or site.get('id')}: {site['lat']:.4f}, {site['lon']:.4f}, {site['source']}"
-    frames += _card(title + dry, w, h, 2.0, fps)
+    title = f"{site.get('name') or site.get('id')}:\n{site['lat']:.4f}, {site['lon']:.4f}, {site['source']}"
+    if dry:
+        title += "\nDRY RUN: candidates are the expert plus noise, not GR00T"
+    frames += _card(title, w, h, 2.5, fps)
     preview = Path(site["dir"]) / "preview.png"
     if preview.exists():
         from PIL import Image
