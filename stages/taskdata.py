@@ -55,21 +55,22 @@ def _template(tok, msgs, **kw):
 
 def tokenize_example(tok, msgs: list[dict], max_len: int) -> dict:
     """input_ids plus labels with the prompt masked to -100, so loss is only on
-    the teacher's answer."""
+    the teacher's answer. The prompt is rendered exactly as at inference
+    (add_generation_prompt=True), which matters for templates whose generation
+    prompt differs from a rendered past turn (Gemma 4 adds an empty thought
+    channel). The answer is followed by the template's end-of-turn marker."""
+    answer = msgs[-1]["content"]
     if tok.chat_template:
-        full = _template(tok, msgs)
         prompt = _template(tok, msgs[:-1], add_generation_prompt=True)
+        full = _template(tok, msgs)
+        at = full.rfind(answer)
+        suffix = full[at + len(answer):] if at >= 0 else (tok.eos_token or "")
+        suffix = suffix.rstrip("\n")  # keep e.g. <|im_end|> / <turn|> as a target, not the newline
     else:  # bare tokenizer (tests): plain concatenation
         prompt = "".join(m["content"] + "\n" for m in msgs[:-1])
-        full = prompt + msgs[-1]["content"] + (tok.eos_token or "")
-    ids = tok(full, add_special_tokens=False)["input_ids"]
-    if full.startswith(prompt):
-        n_prompt = len(tok(prompt, add_special_tokens=False)["input_ids"])
-    else:
-        n_prompt = 0
-    # Qwen templates end with "<|im_end|>\n"; keep im_end as a target, drop the newline
-    if tok.chat_template and full.endswith("\n"):
-        ids = ids[:-1]
-    ids = ids[:max_len]
-    labels = [-100] * min(n_prompt, len(ids)) + ids[n_prompt:]
-    return {"input_ids": ids, "labels": labels[: len(ids)]}
+        suffix = tok.eos_token or ""
+    p_ids = tok(prompt, add_special_tokens=False)["input_ids"]
+    a_ids = tok(answer + suffix, add_special_tokens=False)["input_ids"]
+    ids = (p_ids + a_ids)[:max_len]
+    labels = ([-100] * len(p_ids) + a_ids)[:max_len]
+    return {"input_ids": ids, "labels": labels}
