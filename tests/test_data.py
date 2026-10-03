@@ -109,7 +109,7 @@ def test_gemini_written_heldout(job, monkeypatch):
     fake = [f"gemini test input number {i} with enough words" for i in range(25)]
     monkeypatch.setenv("GEMINI_API_KEY", "g-key")
     monkeypatch.setattr(data, "DRY_RUN", False)
-    monkeypatch.setattr(data, "Teacher", lambda path: data.DryRunTeacher(j.spec, random.Random(0)))
+    monkeypatch.setattr(data, "Teacher", lambda path, max_len=None: data.DryRunTeacher(j.spec, random.Random(0)))
     monkeypatch.setattr(testgen, "held_out_inputs", lambda spec, cfg, n, seen, *a, **k: fake[:n])
     data.run_stage(j)
     held, train = read(job / "data/heldout.jsonl"), read(job / "data/train.jsonl")

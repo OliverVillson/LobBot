@@ -29,6 +29,9 @@ class Config:
     # Data
     n_generate: int = 2000
     n_heldout: int = 100
+    # Length limits for long-output tasks (code). None uses the env knob or built-in default:
+    data_answer_max_tokens: int | None = None  # LOBBOT_DATA_ANSWER_MAX_TOKENS or 1536; eval follows it
+    data_max_len: int | None = None  # vLLM context, LOBBOT_DATA_MAX_LEN or 8192
     # Gemini writes the held-out test inputs when GEMINI_API_KEY is set ("" = teacher writes them)
     testgen_model: str = "gemini-3.8-flash"
     # REAP: fraction of experts removed per layer. 0.5 keeps 64 of 128.

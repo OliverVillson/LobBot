@@ -69,3 +69,15 @@ def test_eval_cap_follows_raised_data_cap():
     out = subprocess.run([sys.executable, "-c", code], env={**env, "LOBBOT_EVAL_MAX_TOKENS": "1000"},
                          capture_output=True, text=True, check=True).stdout.split()
     assert int(out[1]) == 1000  # explicit override wins
+
+
+def test_eval_cap_follows_per_job_data_cap(monkeypatch):
+    from stages import data, eval as ev
+    from stages._util import Config
+
+    monkeypatch.delenv("LOBBOT_EVAL_MAX_TOKENS", raising=False)
+    monkeypatch.delenv("LOBBOT_EVAL_CTX", raising=False)
+    cfg = Config(data_answer_max_tokens=6000, data_max_len=16384)
+    assert data.answer_max_tokens(cfg) == 6000 and data.max_model_len(cfg) == 16384
+    assert ev.limits(cfg) == (6000, 6000 + 4096)
+    assert ev.limits(Config())[0] == max(2048, data.ANSWER_MAX_TOKENS)  # no override: env knob / default
