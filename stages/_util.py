@@ -29,6 +29,8 @@ class Config:
     # Data
     n_generate: int = 2000
     n_heldout: int = 100
+    # Gemini writes the held-out test inputs when GEMINI_API_KEY is set ("" = teacher writes them)
+    testgen_model: str = "gemini-3.8-flash"
     # REAP: fraction of experts removed per layer. 0.5 keeps 64 of 128.
     # Raising it frees bytes for more bits per remaining expert.
     reap_sparsity: float = 0.5
@@ -87,7 +89,9 @@ class Job:
             (self.root / ".done" / s).unlink(missing_ok=True)
 
     def save_config(self) -> None:
-        (self.root / "config.json").write_text(json.dumps(asdict(self.config), indent=2))
+        """Record the effective config of this run. config.json stays the user's
+        overrides only, so later default changes still apply on resume."""
+        (self.root / "work" / "config.effective.json").write_text(json.dumps(asdict(self.config), indent=2))
 
 
 def run(cmd: list[str], stage: str, cwd: str | Path | None = None, env: dict | None = None) -> None:

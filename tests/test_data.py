@@ -96,3 +96,23 @@ def test_failing_stage_reports_cause_and_logs(job):
     err = [e for e in map(parse, p.stdout.splitlines()) if e and e["status"] == "error"][0]
     assert "RuntimeError" in err["msg"] and "usable" in err["msg"]
     assert "Traceback" in (job / "logs/data.log").read_text()
+
+
+def test_gemini_written_heldout(job, monkeypatch):
+    """With testgen on, the held-out inputs are Gemini's, answered by the teacher, and never trained on."""
+    import random
+
+    from stages import data, testgen
+    from stages._util import Job
+
+    j = Job(job)
+    fake = [f"gemini test input number {i} with enough words" for i in range(25)]
+    monkeypatch.setenv("GEMINI_API_KEY", "g-key")
+    monkeypatch.setattr(data, "DRY_RUN", False)
+    monkeypatch.setattr(data, "Teacher", lambda path: data.DryRunTeacher(j.spec, random.Random(0)))
+    monkeypatch.setattr(testgen, "held_out_inputs", lambda spec, cfg, n, seen, *a, **k: fake[:n])
+    data.run_stage(j)
+    held, train = read(job / "data/heldout.jsonl"), read(job / "data/train.jsonl")
+    assert {r["input"] for r in held} <= set(fake) and len(held) >= 15
+    assert not set(fake) & {r["messages"][1]["content"] for r in train}
+    assert json.loads((job / "data/stats.json").read_text())["heldout_source"] == "gemini-3.8-flash"

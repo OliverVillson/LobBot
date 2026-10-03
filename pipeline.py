@@ -41,7 +41,7 @@ def main() -> int:
     if not job.path("taskspec.json").exists():
         emit("pipeline", "error", msg=f"missing {job.path('taskspec.json')}")
         return 2
-    job.save_config()  # record the effective config for this run
+    job.save_config()  # work/config.effective.json; config.json is left as overrides
     if args.start:
         job.clear_from(STAGES, args.start)
 

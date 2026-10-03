@@ -79,3 +79,28 @@ def test_full_dry_run_job(client):
 def test_unknown_job(client):
     assert client.get("/jobs/abc123/eval", headers=H).status_code == 404
     assert client.get("/jobs/..%2Fetc/eval", headers=H).status_code == 404
+
+
+def test_job_run_by_hand_reports_disk_state(client, tmp_path):
+    """A job run with pipeline.py directly (no events.jsonl) is not 'queued'."""
+    import os
+    import subprocess
+    import sys
+
+    job = tmp_path / "byhand"
+    job.mkdir()
+    (job / "taskspec.json").write_text(json.dumps(SPEC))
+    env = {**os.environ, "LOBBOT_DRY_RUN": "1"}
+    run = lambda *a: subprocess.run([sys.executable, "pipeline.py", "--job", str(job), *a],
+                                    cwd=ROOT, env=env, capture_output=True, check=True)
+
+    run("--only", "data")
+    os.utime(job / "logs/data.log", (0, 0))  # long finished, nothing running
+    s = client.get("/jobs/byhand", headers=H).json()
+    assert s["stages"]["data"]["status"] == "done" and s["stages"]["reap"]["status"] == "pending"
+    assert s["state"] == "error" and "resume" in s["error"]
+
+    run()
+    s = client.get("/jobs/byhand", headers=H).json()
+    assert s["state"] == "done", s
+    assert all(v["status"] == "done" for v in s["stages"].values())

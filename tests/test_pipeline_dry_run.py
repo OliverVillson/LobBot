@@ -67,3 +67,16 @@ def test_config_accepts_time_caps(tmp_path):
     (tmp_path / "config.json").write_text(json.dumps({"heal_max_minutes": 20, "student_max_minutes": 15}))
     cfg = Job(tmp_path).config
     assert (cfg.heal_max_minutes, cfg.student_max_minutes) == (20, 15)
+
+
+def test_overrides_file_is_not_frozen(tmp_path):
+    job = tmp_path / "job"
+    job.mkdir()
+    shutil.copy(ROOT / "examples/support-tickets.taskspec.json", job / "taskspec.json")
+    (job / "config.json").write_text(json.dumps({"n_generate": 200}))
+
+    p, _ = run(job, "--only", "data")
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert json.loads((job / "config.json").read_text()) == {"n_generate": 200}
+    effective = json.loads((job / "work/config.effective.json").read_text())
+    assert effective["n_generate"] == 200 and "judge_model" in effective

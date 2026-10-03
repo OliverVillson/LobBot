@@ -7,7 +7,8 @@ Reads taskspec.json and uses the teacher (vLLM) to:
 then drops bad answers (empty, truncated, invalid JSON when the output format
 is JSON) and splits off a held-out set. Writes:
   data/train.jsonl    chat-format SFT data (also REAP calibration data); seeds included
-  data/heldout.jsonl  held-out inputs with teacher reference answers
+  data/heldout.jsonl  held-out inputs with teacher reference answers (inputs written
+                      by Gemini when Config.testgen_model and GEMINI_API_KEY are set)
   data/calib.txt      plain text for llama.cpp imatrix
   data/stats.json     counts, drop reasons, timings
   work/data_scenarios.json, work/data_inputs.jsonl   resume cache for a crashed run
@@ -29,6 +30,7 @@ import time
 from dataclasses import dataclass
 
 from common.progress import emit
+from stages import testgen
 from stages._util import DRY_RUN, Job, read_jsonl, write_jsonl
 
 STAGE = "data"
@@ -289,18 +291,24 @@ def run_stage(job: Job) -> None:
                            "check the TaskSpec seeds and the teacher model")
     emit(STAGE, pct=45, msg=f"{len(inputs)} unique inputs")
 
+    # 2b) optional: Gemini writes the held-out test inputs (stages/testgen.py); the teacher answers them
+    ext: list[str] = []
+    if not DRY_RUN and testgen.enabled(cfg):
+        emit(STAGE, pct=45, msg=f"{cfg.testgen_model} writing {n_held} held-out test inputs")
+        ext = testgen.held_out_inputs(spec, cfg, n_held, seen, norm_key, parse_array, MAX_INPUT_CHARS)
+
     # 3) answers
     shots = rng.sample(spec.seed_examples, k=min(FEWSHOT, len(spec.seed_examples)))
-    convs = [answer_messages(spec, shots, s) for s in inputs]
+    convs = [answer_messages(spec, shots, s) for s in inputs + ext]
     gens = chat_batched(teacher, convs, 0.3, ANSWER_MAX_TOKENS, 45, 95, "teacher answering")
     sys = system_prompt(spec)
-    rows, drops = [], {}
-    for s, g in zip(inputs, gens):
+    rows, ext_rows, drops = [], [], {}
+    for i, (s, g) in enumerate(zip(inputs + ext, gens)):
         ans, why = check_answer(g.text, g.finished, want_json)
         if ans is None:
             drops[why] = drops.get(why, 0) + 1
         else:
-            rows.append(_row(sys, s, ans))
+            (ext_rows if i >= len(inputs) else rows).append(_row(sys, s, ans))
     stats.update(answered=len(rows), dropped=drops)
     print(f"[data] kept {len(rows)}/{len(inputs)} answers, dropped {drops}", flush=True)
     if len(rows) < 2 * n_held:
@@ -308,8 +316,13 @@ def run_stage(job: Job) -> None:
 
     # 4) split: held-out from teacher rows only; human seeds always go to train
     rng.shuffle(rows)
-    n_held = min(n_held, len(rows) // 5)
-    heldout, train = rows[:n_held], rows[n_held:n_held + cfg.n_generate]
+    if ext_rows and len(ext_rows) >= n_held // 2:  # Gemini-written tests; all teacher rows can train
+        heldout, train = ext_rows[:n_held], rows[:cfg.n_generate]
+        stats["heldout_source"] = cfg.testgen_model
+    else:
+        n_held = min(n_held, len(rows) // 5)
+        heldout, train = rows[:n_held], rows[n_held:n_held + cfg.n_generate]
+        stats["heldout_source"] = "teacher"
     train += [_row(sys, e.input, e.output) for e in spec.seed_examples] * SEED_REPEAT
     rng.shuffle(train)
     write_jsonl(job.path("data", "train.jsonl"), train)

@@ -64,9 +64,53 @@ def read_events(d: Path) -> list[dict]:
     return events[starts[-1]:] if starts else events
 
 
+def _mtime(p: Path) -> float:
+    return p.stat().st_mtime if p.exists() else 0.0
+
+
+def disk_state(d: Path) -> tuple[str, dict, str | None]:
+    """State of a job run with pipeline.py directly (no events.jsonl from this
+    server): .done markers, plus the last progress line of each stage's log."""
+    stages = {s: {"status": "pending", "pct": 0, "msg": ""} for s in STAGES}
+    error = None
+    for s in STAGES:
+        if (d / ".done" / s).exists():
+            stages[s] = {"status": "done", "pct": 100, "msg": ""}
+            continue
+        log = d / "logs" / f"{s}.log"
+        if not log.exists():
+            continue
+        last = None
+        for line in log.read_text(errors="replace").split("\n===== ")[-1].splitlines():
+            e = parse(line)
+            if e and e.get("stage") == s:
+                last = e
+        if last:
+            stages[s] = {"status": last["status"], "pct": last.get("pct") or 0, "msg": last.get("msg", "")}
+            if last["status"] == "error":
+                error = last.get("msg") or f"{s} failed"
+    statuses = [v["status"] for v in stages.values()]
+    if all(st == "done" for st in statuses) and (d / "out" / "model.gguf").exists():
+        return "done", stages, None
+    if error:
+        return "error", stages, error
+    if not any(st != "pending" for st in statuses):
+        return "queued", stages, None
+    newest_log = max((_mtime(p) for p in (d / "logs").glob("*.log")), default=0.0)
+    if time.time() - newest_log < 300:  # stages log progress at least this often
+        return "running", stages, None
+    return "error", stages, "pipeline stopped before the end; resume to continue"
+
+
 def job_state(job_id: str, d: Path) -> dict:
     stages = {s: {"status": "pending", "pct": 0, "msg": ""} for s in STAGES}
     state, error = "queued", None
+    newest_log = max((_mtime(p) for p in (d / "logs").glob("*.log")), default=0.0)
+    events = d / "events.jsonl"
+    if job_id not in _running and (not events.exists() or newest_log > _mtime(events)):
+        # Last run was pipeline.py started by hand (CLI over SSH), not by this server.
+        state, stages, error = disk_state(d)
+        return _state_dict(job_id, d, state, stages, error)
     for e in read_events(d):
         if e["stage"] == "pipeline":
             if e["status"] == "running":
@@ -83,6 +127,10 @@ def job_state(job_id: str, d: Path) -> dict:
     if state == "running" and job_id not in _running:
         # The pipeline process is gone without a final event (server restart or crash).
         state, error = "error", error or "pipeline stopped unexpectedly; resume to continue"
+    return _state_dict(job_id, d, state, stages, error)
+
+
+def _state_dict(job_id: str, d: Path, state: str, stages: dict, error: str | None) -> dict:
     spec = json.loads((d / "taskspec.json").read_text())
     return {
         "job_id": job_id,
