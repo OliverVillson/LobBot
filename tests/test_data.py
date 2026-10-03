@@ -124,3 +124,14 @@ def test_gemini_written_heldout(job, monkeypatch):
     data.run_stage(j)
     assert [r["input"] for r in read(job / "work/data_testgen.jsonl")] == fake[:20]
     assert {r["input"] for r in read(job / "data/heldout.jsonl")} <= set(fake[:20])
+
+
+def test_answer_max_tokens_env(monkeypatch):
+    import importlib
+
+    from stages import data
+
+    monkeypatch.setenv("LOBBOT_DATA_ANSWER_MAX_TOKENS", "4096")
+    assert importlib.reload(data).ANSWER_MAX_TOKENS == 4096
+    monkeypatch.delenv("LOBBOT_DATA_ANSWER_MAX_TOKENS")
+    assert importlib.reload(data).ANSWER_MAX_TOKENS == 1536
