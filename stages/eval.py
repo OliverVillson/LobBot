@@ -41,6 +41,13 @@ MAX_TOKENS = int(os.environ.get("LOBBOT_EVAL_MAX_TOKENS", max(2048, data.ANSWER_
 CTX_PER_SLOT = int(os.environ.get("LOBBOT_EVAL_CTX", MAX_TOKENS + 4096))
 
 
+def limits(cfg) -> tuple[int, int]:
+    """(max answer tokens, context per slot) for this job: follows the job's
+    data answer cap (Config data_answer_max_tokens) unless LOBBOT_EVAL_* is set."""
+    max_tokens = int(os.environ.get("LOBBOT_EVAL_MAX_TOKENS", max(2048, data.answer_max_tokens(cfg))))
+    return max_tokens, int(os.environ.get("LOBBOT_EVAL_CTX", max_tokens + 4096))
+
+
 def serve(job: Job, gguf: str, name: str) -> subprocess.Popen:
     import httpx
 
@@ -49,7 +56,7 @@ def serve(job: Job, gguf: str, name: str) -> subprocess.Popen:
     log = open(log_path, "w")
     proc = subprocess.Popen(
         [str(binary), "-m", gguf, "-ngl", "999", "--host", "127.0.0.1", "--port", str(PORT),
-         "-c", str(SLOTS * CTX_PER_SLOT), "-np", str(SLOTS), "--jinja"],
+         "-c", str(SLOTS * limits(job.config)[1]), "-np", str(SLOTS), "--jinja"],
         stdout=log, stderr=subprocess.STDOUT)
     for _ in range(600):
         if proc.poll() is not None:
@@ -64,7 +71,7 @@ def serve(job: Job, gguf: str, name: str) -> subprocess.Popen:
     raise RuntimeError(f"llama-server did not become healthy for {name}; see {log_path}")
 
 
-def generate(system: str, inputs: list[str]) -> tuple[list[str], float | None]:
+def generate(system: str, inputs: list[str], max_tokens: int = MAX_TOKENS) -> tuple[list[str], float | None]:
     """Answers plus the median decode speed (tok/s) the server reported."""
     import httpx
 
@@ -75,7 +82,7 @@ def generate(system: str, inputs: list[str]) -> tuple[list[str], float | None]:
             try:
                 r = httpx.post(f"http://127.0.0.1:{PORT}/v1/chat/completions", timeout=600, json={
                     "messages": [{"role": "system", "content": system}, {"role": "user", "content": text}],
-                    "temperature": 0.0, "max_tokens": MAX_TOKENS,
+                    "temperature": 0.0, "max_tokens": max_tokens,
                     "chat_template_kwargs": {"enable_thinking": False},
                 })
                 r.raise_for_status()
@@ -229,7 +236,7 @@ def run_stage(job: Job) -> None:
             emit(STAGE, pct=10 + 85 * i / n, msg=f"running {name} on {len(inputs)} held-out inputs")
             proc = serve(job, c["path"], name)
             try:
-                answers, tps = generate(system, inputs)
+                answers, tps = generate(system, inputs, limits(cfg)[0])
             finally:
                 proc.terminate()
                 try:

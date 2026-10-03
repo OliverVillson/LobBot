@@ -6,9 +6,11 @@ runs on this machine through the same bash scripts the CLI sends over SSH.
 
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -210,6 +212,66 @@ def test_job_run_directly_with_pipeline(cli):
     assert (cli.tmp / "models/support-email-to-ticket-direct/model.gguf").exists()
 
 
+def test_run_long(cli, tmp_path):
+    """--long sets the long-answer limits, --set wins over it, and a long spec without it is warned about."""
+    p = cli("run", "--example", "--long", "--set", "heal_max_len=6144", "--set", "data_max_len=5000",
+            "--name", "longjob", "-d")
+    conf = json.loads((cli.tmp / "jobs/longjob/config.json").read_text())
+    assert conf == {"data_answer_max_tokens": 4096, "data_max_len": 5000, "heal_max_len": 6144}
+    assert "answers up to 4096 tokens" in p.stdout
+    assert "use data_max_len=6144 or more" in p.stderr and "without --long" not in p.stderr
+    cli("watch", "longjob")
+
+    spec = json.loads((ROOT / "examples/support-tickets.taskspec.json").read_text())
+    spec["seed_examples"][0]["output"] = "x" * 4000
+    (tmp_path / "long.json").write_text(json.dumps(spec))
+    p = cli("run", "long.json", "--fast", "--name", "longwarn", "-d")
+    assert "~1000 tokens" in p.stderr and "without --long" in p.stderr
+    cli("watch", "longwarn")
+
+
+def test_run_refuses_keys_the_vm_lacks(cli, tmp_path):
+    """The Mac's Config can be newer than the VM checkout's; the VM's decides."""
+    vm = tmp_path / "oldvm"
+    shutil.copytree(ROOT, vm, ignore=shutil.ignore_patterns(".git", "tests", "__pycache__"))
+    util = vm / "stages/_util.py"
+    util.write_text(util.read_text().replace("    data_max_len: int | None", "    _gone: int | None"))
+    conf = json.loads((cli.tmp / "config.json").read_text())
+    (cli.tmp / "config.json").write_text(json.dumps({**conf, "repo": str(vm)}))
+    p = cli("run", "--example", "--long", "--name", "old", "-d", ok=False)
+    assert "does not know config key(s) data_max_len" in p.stderr and "lobbot pull" in p.stderr
+    assert not (cli.tmp / "jobs/old").exists()
+
+
+def test_run_refused_by_the_api_cleans_up(cli, tmp_path, monkeypatch, capsys):
+    """If a job starts between run's check and its POST, the API's 409 leaves no job dir behind."""
+    from lobbot import app
+
+    cli("up")
+    job = cli.tmp / "jobs/busy"
+    job.mkdir(parents=True)
+    (job / "taskspec.json").write_text((ROOT / "examples/support-tickets.taskspec.json").read_text())
+    fake = tmp_path / "pipeline.py"
+    fake.write_text("import time\ntime.sleep(120)\n")
+    proc = subprocess.Popen([sys.executable, str(fake), "--job", str(job)])
+    # The race: run's check sees nothing running.
+    monkeypatch.setattr(app, "running_pipelines", lambda r: [])
+    real_get = app.Api.get
+    monkeypatch.setattr(app.Api, "get", lambda self, path: [] if path == "/jobs" else real_get(self, path))
+    monkeypatch.setenv("HOME", str(cli.home))
+    monkeypatch.setenv("LOBBOT_CONFIG", str(cli.tmp / "config.json"))
+    try:
+        time.sleep(0.5)
+        with pytest.raises(SystemExit):
+            app.main(["run", "--example", "--name", "raced", "-d"])
+        err = capsys.readouterr().err
+        assert "job busy is running" in err and "Nothing was started" in err
+        assert not (cli.tmp / "jobs/raced").exists()
+    finally:
+        proc.kill()
+        proc.wait()
+
+
 def test_new_drafts_on_vm_with_its_key(cli, tmp_path):
     """No key on the laptop: `new` runs the drafting on the VM, where ~/.lobbot-env has the key."""
     fake = tmp_path / "fakegemini"
@@ -240,3 +302,30 @@ urllib.request.urlopen = _fake
     drafted = json.loads((cli.tmp / "drafted.json").read_text())
     assert drafted["task_name"] == "support-email-to-ticket" and len(drafted["seed_examples"]) == 15
     assert "vm-key" not in p.stdout + p.stderr
+    assert "--fast\n" in p.stdout and "--long" not in p.stdout
+
+    spec["seed_examples"][1]["output"] = "y" * 6000  # ~1500 tokens: suggest --long
+    (fake / "spec.json").write_text(json.dumps(spec))
+    p = cli("new", "write C code", "-o", "long.json")
+    assert "up to ~1500 tokens" in p.stdout and "lobbot run long.json --fast --long" in p.stdout
+
+
+def test_run_refuses_while_busy_and_stop_frees_it(cli):
+    """A second job is refused while one runs (API 409), and lobbot stop ends the running one."""
+    cli("up")
+    job = cli.tmp / "jobs/busy"
+    job.mkdir(parents=True)
+    (job / "taskspec.json").write_text((ROOT / "examples/support-tickets.taskspec.json").read_text())
+    fake = cli.tmp / "pipeline.py"
+    fake.write_text("import time\ntime.sleep(120)\n")
+    proc = subprocess.Popen([sys.executable, str(fake), "--job", str(job)])
+    try:
+        time.sleep(0.5)
+        p = cli("run", "--example", "--name", "second", ok=False)
+        assert p.returncode != 0 and "job busy is running" in p.stderr and "lobbot stop busy" in p.stderr
+        assert not (cli.tmp / "jobs/second").exists()  # refused before anything was written
+        assert "stopped job busy" in cli("stop", "busy", "--yes").stdout
+        assert proc.wait(timeout=10) != 0
+        assert "no running pipeline" in cli("stop", "busy", "--yes").stderr
+    finally:
+        proc.kill()

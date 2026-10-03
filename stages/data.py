@@ -16,6 +16,7 @@ is JSON) and splits off a held-out set. Writes:
 Knobs (env vars, defaults in brackets): LOBBOT_DATA_SCENARIOS [40],
 LOBBOT_DATA_PER_PROMPT [8], LOBBOT_DATA_MAX_LEN [8192], LOBBOT_DATA_GPU_UTIL [0.85],
 LOBBOT_DATA_TP [1], LOBBOT_DATA_BATCH [256], LOBBOT_DATA_ANSWER_MAX_TOKENS [1536]
+(per job: Config data_answer_max_tokens and data_max_len win over the env vars)
 (answers that hit it are dropped as truncated; raise it for code or other long
 outputs, together with LOBBOT_DATA_MAX_LEN and heal's max_len). Sizes come from Config
 (n_generate, n_heldout).
@@ -53,6 +54,15 @@ MAX_INPUT_CHARS = 6000  # keeps every answer prompt well inside MAX_MODEL_LEN
 FEWSHOT = 6          # seed examples shown to the teacher when answering
 SEED_REPEAT = 2      # human-written seeds appear this many times in train
 ANSWER_MAX_TOKENS = int(os.environ.get("LOBBOT_DATA_ANSWER_MAX_TOKENS", 1536))
+
+
+def answer_max_tokens(cfg) -> int:
+    """Per-job Config value first, then the env knob / default above."""
+    return int(getattr(cfg, "data_answer_max_tokens", None) or ANSWER_MAX_TOKENS)
+
+
+def max_model_len(cfg) -> int:
+    return int(getattr(cfg, "data_max_len", None) or MAX_MODEL_LEN)
 
 STYLE_HINTS = [
     "short and terse", "long and detailed", "messy, with typos and informal language",
@@ -180,11 +190,11 @@ class Gen:
 
 
 class Teacher:
-    def __init__(self, model_path: str):
+    def __init__(self, model_path: str, max_len: int = MAX_MODEL_LEN):
         from vllm import LLM, SamplingParams
 
         self.SamplingParams = SamplingParams
-        self.llm = LLM(model=model_path, max_model_len=MAX_MODEL_LEN, gpu_memory_utilization=GPU_UTIL,
+        self.llm = LLM(model=model_path, max_model_len=max_len, gpu_memory_utilization=GPU_UTIL,
                        tensor_parallel_size=TP, seed=0,
                        **({"attention_backend": ATTN_BACKEND} if ATTN_BACKEND else {}))
 
@@ -245,7 +255,7 @@ def run_stage(job: Job) -> None:
     else:
         model = job.model_path(cfg.teacher)
         emit(STAGE, pct=1, msg=f"loading teacher {model}")
-        teacher = Teacher(model)
+        teacher = Teacher(model, max_model_len(cfg))
     stats["load_s"] = round(time.monotonic() - t0, 1)
     emit(STAGE, pct=10, msg="teacher loaded")
 
@@ -311,7 +321,7 @@ def run_stage(job: Job) -> None:
     # 3) answers
     shots = rng.sample(spec.seed_examples, k=min(FEWSHOT, len(spec.seed_examples)))
     convs = [answer_messages(spec, shots, s) for s in inputs + ext]
-    gens = chat_batched(teacher, convs, 0.3, ANSWER_MAX_TOKENS, 45, 95, "teacher answering")
+    gens = chat_batched(teacher, convs, 0.3, answer_max_tokens(cfg), 45, 95, "teacher answering")
     sys = system_prompt(spec)
     rows, ext_rows, drops, ext_drops = [], [], {}, {}
     for i, (s, g) in enumerate(zip(inputs + ext, gens)):

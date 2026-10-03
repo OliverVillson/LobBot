@@ -62,7 +62,10 @@ ssh -L 8700:127.0.0.1:8700 <vm>                     # on the laptop
 `GET /health`, `POST /jobs` (TaskSpec body), `GET /jobs`, `GET /jobs/{id}`,
 `GET /jobs/{id}/events` (SSE progress lines, replayed from the start of the
 latest run), `POST /jobs/{id}/resume`, `GET /jobs/{id}/eval`,
-`GET /jobs/{id}/model` (GGUF, Range supported), `GET /jobs/{id}/modelfile`.
+`GET /jobs/{id}/model` (GGUF, Range supported), `GET /jobs/{id}/modelfile`,
+`POST /jobs/{id}/stop` (frees the GPU; state becomes `stopped`, resume continues).
+One job runs at a time: starting or resuming another returns 409 with
+`{"detail": ..., "running_job": "<id>"}`.
 All but `/health` need `Authorization: Bearer $LOBBOT_TOKEN`.
 
 ## Developer CLI (`lobbot`)
@@ -76,13 +79,23 @@ lobbot init                         # VM host (default evroc-user@194.14.81.33),
 lobbot doctor                       # SSH, checkout, venvs, weights, llama.cpp, GPU, API
 lobbot secret GEMINI_API_KEY        # stored in ~/.lobbot-env on the VM (mode 600) for the eval judge
 lobbot new "turn support emails into JSON tickets"   # drafts a TaskSpec with Gemini (uses the VM's key if this Mac has none)
-lobbot run my.taskspec.json --fast  # or --example; live stage progress, Ctrl-C detaches
+lobbot run my.taskspec.json --fast  # or --example; --long for code; live progress, Ctrl-C detaches
 lobbot results <job>                # judge scores vs teacher, size, tok/s, held-out examples
 lobbot status [job] | watch <job> | logs <job> [-s heal] [-f]
 lobbot resume <job> [--from quantize] | stop <job>
 lobbot save <job> --chat            # keep the model: see below
 lobbot pull [--stash]               # git pull the VM checkout; --stash stashes local edits first
 ```
+
+`lobbot chat <model>` and `lobbot ask <model> "..."` talk to a saved model in
+the local Ollama. When the answer is JSON, short fields are shown as labelled
+lines and multi-line fields as real code under a heading, with a file name
+guessed from the include guard or `#include` (e.g. `observer.h`,
+`observer.c`). `--out DIR` writes those files, and C code is checked with
+`cc -std=c11 -Wall -fsyntax-only` so you see whether it compiles. Answers that
+aren't JSON are shown as they come; `--raw` turns all of this off and
+`chat --plain` runs plain `ollama run`. Each chat message is answered on its
+own, like the model was trained; `--history` sends the whole conversation.
 
 `lobbot save` (alias `install`; `run --save` chains it) copies the job's
 report, spec, Modelfile and, if the small system disk has room, the GGUF to
@@ -102,8 +115,14 @@ who wrote and judged them, time per stage, the expert bit-width mix, and two
 held-out examples compared field by field with the teacher.
 
 `--fast` sets `n_generate=400, n_heldout=30, reap_calib_samples=128,
-heal_max_minutes=20, dense_fallback=false`; `--set key=value` overrides any `Config` field. `run`
-refuses to start while something else is on the GPU unless you add `--force`.
+heal_max_minutes=20, dense_fallback=false`. `--long` is for tasks with long answers
+such as code: it sets `data_answer_max_tokens=4096, data_max_len=16384,
+heal_max_len=8192`, so the teacher's answers aren't cut off and dropped and heal
+trains on whole examples. `lobbot new` suggests it when the drafted seed answers
+run past ~800 tokens, and `run` warns when they do and `--long` is missing.
+`--set key=value` overrides any `Config` field and wins over `--fast` and
+`--long`. `run` refuses to start while another job is running (and writes nothing
+then), or while something else is on the GPU unless you add `--force`, and refuses config keys the VM checkout doesn't know yet.
 The API token lives in `~/.lobbot-token` on the VM (`lobbot token` prints it).
 
 ## Without a GPU

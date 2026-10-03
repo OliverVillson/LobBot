@@ -112,3 +112,57 @@ def test_job_run_by_hand_reports_disk_state(client, tmp_path):
         events = [json.loads(l[6:]) for l in r.iter_lines() if l.startswith("data: ")]
     assert events[-1]["stage"] == "pipeline" and events[-1]["status"] == "done"
     assert all(v["status"] == "done" for v in s["stages"].values())
+
+
+SLOW_PIPELINE = '''import json, sys, time
+print(json.dumps({"stage": "data", "status": "running", "pct": 1, "msg": "", "ts": time.time()}), flush=True)
+time.sleep(120)
+'''
+
+
+def test_one_job_at_a_time_and_stop(client, tmp_path, monkeypatch):
+    import agent.server as server
+
+    fake = tmp_path / "fakeroot"
+    fake.mkdir()
+    (fake / "pipeline.py").write_text(SLOW_PIPELINE)
+    monkeypatch.setattr(server, "ROOT", fake)
+
+    first = client.post("/jobs", headers=H, json=SPEC).json()["job_id"]
+    r = client.post("/jobs", headers=H, json=SPEC)
+    assert r.status_code == 409 and r.json()["running_job"] == first
+    assert sorted(p.name for p in tmp_path.iterdir() if (p / "taskspec.json").exists()) == [first]  # no orphan dir
+    assert client.post(f"/jobs/{first}/resume", headers=H, json={}).status_code == 409
+
+    r = client.post(f"/jobs/{first}/stop", headers=H)
+    assert r.status_code == 200 and r.json()["state"] == "stopped", r.text
+    assert client.get(f"/jobs/{first}", headers=H).json()["state"] == "stopped"
+    with client.stream("GET", f"/jobs/{first}/events", headers=H) as s:
+        events = [json.loads(l[6:]) for l in s.iter_lines() if l.startswith("data: ")]
+    assert events[-1]["stage"] == "pipeline" and events[-1]["status"] == "stopped"
+    assert client.post(f"/jobs/{first}/stop", headers=H).status_code == 409  # nothing left to stop
+
+    second = client.post("/jobs", headers=H, json=SPEC)
+    assert second.status_code == 200
+    client.post(f"/jobs/{second.json()['job_id']}/stop", headers=H)
+
+
+def test_stop_a_job_run_by_hand(client, tmp_path):
+    import subprocess
+    import sys
+
+    job = tmp_path / "byhand2"
+    job.mkdir()
+    (job / "taskspec.json").write_text(json.dumps(SPEC))
+    fake = tmp_path / "pipeline.py"
+    fake.write_text(SLOW_PIPELINE)
+    proc = subprocess.Popen([sys.executable, str(fake), "--job", str(job)])
+    try:
+        time.sleep(0.5)
+        r = client.post("/jobs", headers=H, json=SPEC)
+        assert r.status_code == 409 and r.json()["running_job"] == "byhand2"
+        assert client.post("/jobs/byhand2/stop", headers=H).status_code == 200
+        assert proc.wait(timeout=10) != 0
+        assert client.get("/jobs/byhand2", headers=H).json()["state"] == "stopped"
+    finally:
+        proc.kill()

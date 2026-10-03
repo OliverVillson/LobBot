@@ -29,6 +29,9 @@ class Config:
     # Data
     n_generate: int = 2000
     n_heldout: int = 100
+    # Length limits for long-output tasks (code). None uses the env knob or built-in default:
+    data_answer_max_tokens: int | None = None  # LOBBOT_DATA_ANSWER_MAX_TOKENS or 1536; eval follows it
+    data_max_len: int | None = None  # vLLM context, LOBBOT_DATA_MAX_LEN or 8192
     # Gemini writes the held-out test inputs when GEMINI_API_KEY is set ("" = teacher writes them)
     testgen_model: str = "gemini-3.8-flash"
     # REAP: fraction of experts removed per layer. 0.5 keeps 64 of 128.
@@ -44,6 +47,7 @@ class Config:
     heal_train_experts: bool = True  # also LoRA the experts, not just attention and router
     heal_kd_weight: float = 0.0  # >0 adds logit KL to the unpruned teacher (needs it in GPU memory)
     heal_max_minutes: float | None = None  # wall-clock cap on heal; None uses LOBBOT_HEAL_MAX_MINUTES or 60
+    heal_max_len: int | None = None  # tokens per example for heal and the dense student; None uses LOBBOT_HEAL_MAX_LEN or 2048
     dense_fallback: bool = True
     student_epochs: float = 2.0
     student_max_minutes: float | None = None  # same for the dense student (LOBBOT_STUDENT_MAX_MINUTES)

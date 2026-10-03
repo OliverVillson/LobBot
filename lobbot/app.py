@@ -4,13 +4,15 @@
     lobbot doctor                    check SSH, checkout, venvs, weights, GPU, API
     lobbot up                        start the API on the VM (if needed) and check it
     lobbot new "what it should do"   draft a TaskSpec with Gemini
-    lobbot run spec.json --fast      start a job and watch its stages live
+    lobbot run spec.json --fast      start a job and watch its stages live (--long for code)
     lobbot status [job]              all jobs, or one job's stages
     lobbot results <job>             scores vs the teacher, size, speed, examples
     lobbot watch / logs / resume / stop <job>
     lobbot save <job> --chat         back it up on the VM, download it (resumable,
                                      sha256-checked), import into Ollama, chat
     lobbot pull                      update the VM checkout
+    lobbot chat / ask <model>        talk to a saved model; JSON answers shown as fields
+                                     and code, --out DIR writes the files, C is compiled
 
 Everything talks to agent/server.py on the VM through an SSH tunnel the CLI
 opens itself; logs and job files are read over the same SSH connection.
@@ -44,6 +46,10 @@ PRESETS: dict[str, dict] = {
              "heal_max_minutes": 20, "dense_fallback": False},
     "full": {},
 }
+# --long: room for long answers (code, documents). Without it the teacher's answers
+# are cut at 1536 tokens and dropped as truncated, and heal trains on 2048 tokens.
+LONG: dict[str, int] = {"data_answer_max_tokens": 4096, "data_max_len": 16384, "heal_max_len": 8192}
+LONG_SEED_TOKENS = 800  # `new` and `run` suggest --long when a seed answer is longer (chars/4)
 
 
 GITHUB_URL = "https://github.com/OliverVillson/LobBot"
@@ -86,7 +92,7 @@ def dur(s: float) -> str:
 
 ICON = {"pending": c("·", "2"), "running": c("▸", "36"), "done": c("✓", "32"),
         "skipped": c("↷", "2"), "error": c("✗", "31")}
-STATE_COLOR = {"done": "32", "running": "36", "error": "31", "queued": "2", "partial": "33"}
+STATE_COLOR = {"done": "32", "running": "36", "error": "31", "queued": "2", "partial": "33", "stopped": "33"}
 
 
 class Board:
@@ -238,6 +244,9 @@ def watch(r: Remote, job_id: str) -> str:
         print()
         show_results(r, job_id)
         return "done"
+    if final["status"] == "stopped":
+        warn(f"job {job_id} was stopped; finished stages stay cached. Continue with: lobbot resume {job_id}")
+        return "stopped"
     print(c("✗ pipeline failed: ", "31") + str(final.get("msg", "")))
     print(f"  logs: lobbot logs {job_id}    retry: lobbot resume {job_id}")
     return "error"
@@ -247,6 +256,17 @@ def gpu_processes(r: Remote) -> list[str]:
     out = r.sh("command -v nvidia-smi >/dev/null || exit 0; "
                "nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader", check=False)
     return [l.strip() for l in out.splitlines() if l.strip()]
+
+
+def running_pipelines(r: Remote) -> list[str]:
+    """Job ids (dir names) of pipeline.py processes on the VM, however they were started."""
+    out = r.sh('pgrep -af "[p]ipeline.py --job " || true', check=False)
+    found = []
+    for line in out.splitlines():
+        args = line.split()[1:]
+        if "--job" in args[:-1] and any(a.endswith("pipeline.py") for a in args):
+            found.append(Path(args[args.index("--job") + 1]).name)
+    return found
 
 
 def disk_state(r: Remote, ids: list[str]) -> dict[str, dict]:
@@ -304,6 +324,8 @@ def job_config(a) -> dict:
 
     known = {f.name: f for f in fields(Config)}
     out = dict(PRESETS[a.preset])
+    if getattr(a, "long", False):
+        out.update(LONG)  # checked against the VM's Config when the job is written
     for kv in a.set or []:
         if "=" not in kv:
             raise CliError(f"--set expects key=value, got {kv!r}")
@@ -315,6 +337,11 @@ def job_config(a) -> dict:
         except json.JSONDecodeError:
             out[k] = v
     return out
+
+
+def longest_seed_tokens(spec: dict) -> int:
+    """Rough token count (chars/4) of the longest seed answer."""
+    return max((len(e.get("output", "")) // 4 for e in spec.get("seed_examples", [])), default=0)
 
 
 # ----------------------------------------------------------------- commands
@@ -525,14 +552,21 @@ def cmd_new(a) -> None:
     ok(f"wrote {out}  ({spec['task_name']}, {len(spec['seed_examples'])} seed examples)")
     first = spec["seed_examples"][0]
     print(c("  e.g. ", "2") + first["input"][:100].replace("\n", " ") + c("  →  ", "2") + first["output"][:100].replace("\n", " "))
-    print(f"Edit it if you like, then: lobbot run {out} --fast")
+    longest = longest_seed_tokens(spec)
+    if longest > LONG_SEED_TOKENS:
+        print(f"Its answers are long (up to ~{longest} tokens), so --long gives the teacher and heal room for them.")
+        print(f"Edit it if you like, then: lobbot run {out} --fast --long")
+    else:
+        print(f"Edit it if you like, then: lobbot run {out} --fast")
 
 
 def describe_config(conf: dict) -> str:
     """Config overrides in plain words, e.g. '400 examples, 30 tests, heal at most 20 min'."""
     words = {"n_generate": "{} training examples", "n_heldout": "{} held-out tests",
              "reap_calib_samples": "{} calibration samples", "heal_max_minutes": "heal at most {} min",
-             "heal_epochs": "{} heal epoch(s)", "reap_sparsity": "{:.0%} of experts pruned"}
+             "heal_epochs": "{} heal epoch(s)", "reap_sparsity": "{:.0%} of experts pruned",
+             "data_answer_max_tokens": "answers up to {} tokens", "data_max_len": "{}-token data context",
+             "heal_max_len": "heal on up to {} tokens"}
     out = []
     for k, v in conf.items():
         if k == "dense_fallback":
@@ -544,11 +578,26 @@ def describe_config(conf: dict) -> str:
     return ", ".join(out)
 
 
+def busy_message(job: str) -> str:
+    return (f"job {job} is running, and the VM runs one job at a time. "
+            f"Wait for it (lobbot watch {job}) or stop it (lobbot stop {job}).")
+
+
 def cmd_run(a) -> None:
     s = settings(a)
     r = Remote(s)
     spec = load_spec(a, r)
     conf = job_config(a)
+    if "data_answer_max_tokens" in conf or "data_max_len" in conf:
+        # Defaults as in stages/data.py when only one of the two is set (env vars on the VM aside).
+        cap, ctx = int(conf.get("data_answer_max_tokens") or 1536), int(conf.get("data_max_len") or 8192)
+        if ctx < cap + 2048:
+            warn(f"data_max_len={ctx} leaves under 2048 tokens of prompt room above data_answer_max_tokens={cap}; "
+                 f"use data_max_len={cap + 2048} or more")
+    longest = longest_seed_tokens(spec)
+    if longest > LONG_SEED_TOKENS and "data_answer_max_tokens" not in conf:
+        warn(f"seed answers run to ~{longest} tokens; without --long, teacher answers over 1536 tokens "
+             "are dropped as truncated")
     if not a.force:
         busy = gpu_processes(r)
         if busy:
@@ -556,9 +605,22 @@ def cmd_run(a) -> None:
                            + "\nWait for it (lobbot status), or add --force to start anyway.")
     job_id = check_job_id(a.name) if a.name else secrets.token_hex(5)
     bundle = {"dir": s.jobs.rstrip("/") + "/" + job_id, "files": {"taskspec.json": spec, "config.json": conf}}
-    r.sh("""python3 -c '
+    r.start_server()
+    with r.tunnel() as base:
+        api = Api(base, r.token())
+        # The API runs one job at a time; ask before writing anything so a refused run leaves no job dir.
+        running = running_pipelines(r) or [j["job_id"] for j in api.get("/jobs") if j["state"] == "running"]
+        if running:
+            raise CliError(busy_message(running[0]))
+        r.sh(r.env_prelude() + """python3 -c '
 import json, os, sys
+from dataclasses import fields
+from stages._util import Config
 b = json.load(sys.stdin)
+unknown = sorted(set(b["files"]["config.json"]) - {f.name for f in fields(Config)})
+if unknown:
+    sys.exit("the VM checkout does not know config key(s) " + ", ".join(unknown)
+             + "; update it with: lobbot pull (once no job is running)")
 d = os.path.expanduser(b["dir"])
 if os.path.exists(os.path.join(d, "taskspec.json")):
     sys.exit("job " + d + " already exists")
@@ -567,10 +629,15 @@ for name, body in b["files"].items():
     with open(os.path.join(d, name), "w") as f:
         json.dump(body, f, indent=2, ensure_ascii=False)
 '""", input=json.dumps(bundle))
-    r.start_server()
-    with r.tunnel() as base:
-        api = Api(base, r.token())
-        api.post(f"/jobs/{job_id}/resume", {})  # the API launches pipeline.py on the prepared job dir
+        try:
+            api.post(f"/jobs/{job_id}/resume", {})  # the API launches pipeline.py on the prepared job dir
+        except ApiError as e:
+            if e.status != 409:
+                raise
+            # Lost a race (or a pipeline.py outside the jobs dir holds the GPU): remove the dir just written.
+            r.sh("python3 -c 'import os, shutil, sys; shutil.rmtree(os.path.expanduser(sys.argv[1]), True)' "
+                 + shlex.quote(bundle["dir"]), check=False)
+            raise CliError(e.msg + "\nNothing was started; run it again once the GPU is free.")
         ok(f"started job {c(job_id, '1')} · {spec['task_name']} · preset {a.preset}"
            + (f" ({describe_config(conf)})" if conf else " (default settings)"))
     if a.detach:
@@ -660,7 +727,12 @@ def cmd_resume(a) -> None:
     with r.tunnel() as base:
         api = Api(base, r.token())
         job = check_job_id(a.job)
-        api.post(f"/jobs/{job}/resume", {"from": a.start} if a.start else {})
+        try:
+            api.post(f"/jobs/{job}/resume", {"from": a.start} if a.start else {})
+        except ApiError as e:
+            if e.status == 409:
+                raise CliError(e.msg)
+            raise
         ok(f"resumed {job}" + (f" from {a.start}" if a.start else " (finished stages are skipped)"))
     if not a.detach and watch(r, job) == "error":
         sys.exit(1)
@@ -673,6 +745,19 @@ def cmd_stop(a) -> None:
     if not a.yes and sys.stdin.isatty():
         if input(f"Stop job {job}? Its current stage is lost; finished stages stay cached. [y/N] ").lower() != "y":
             return
+    try:
+        r.start_server()
+        with r.tunnel() as base:
+            Api(base, r.token()).post(f"/jobs/{job}/stop", {}, timeout=90)  # returns once the GPU is free
+        ok(f"stopped job {job}; finished stages stay cached. Continue with: lobbot resume {job}")
+        return
+    except ApiError as e:
+        if e.status == 409:
+            warn(f"no running pipeline found for job {job}")
+            return
+        if e.status not in (404, 405):
+            raise
+    # Older VM checkout without POST /stop, or a job dir the API does not know: signal it directly.
     out = r.sh(f'pkill -TERM -f "[p]ipeline.py --job [^ ]*/{job}( |$)" && echo stopped || echo none', check=False)
     if "stopped" in out:
         ok(f"sent stop to job {job}; it frees the GPU within ~30s. Restart with: lobbot resume {job}")
@@ -900,7 +985,8 @@ def cmd_save(a) -> None:
         raise CliError("ollama create failed (is the Ollama app running?)")
     ok(f"saved in {d} and imported into Ollama. Chat with: lobbot chat {name}")
     if a.chat:
-        os.execvp("ollama", ["ollama", "run", name])
+        cmd_chat(argparse.Namespace(model=name, prompt=[], plain=False, verbose=False, history=False,
+                                    out=None, no_check=False, raw=False))
 
 
 def pull_script(r: Remote, repo: str) -> str:
@@ -960,11 +1046,124 @@ def cmd_pull(a) -> None:
         print("The API code changed; restart it when no job is running: lobbot up --restart")
 
 
+def answer_one(model: str, messages: list[dict], out: str | None, check: bool, raw: bool) -> str:
+    """Ask the local model once and print its answer readably (JSON as fields and code)."""
+    from lobbot import answer
+
+    state = {"mode": None, "n": 0}  # mode: "live" prints tokens as they come, "json" renders at the end
+
+    def on_token(tok: str) -> None:
+        if state["mode"] is None:
+            head = tok.lstrip()
+            if not head:
+                return
+            state["mode"] = "json" if not raw and head[0] in "{[`" else "live"
+        state["n"] += 1
+        if state["mode"] == "live":
+            sys.stdout.write(tok)
+            sys.stdout.flush()
+        elif sys.stderr.isatty():
+            sys.stderr.write(f"\r  {c('writing…', '2')} {state['n']} tokens")
+            sys.stderr.flush()
+
+    try:
+        text, stats = answer.ollama_chat(model, messages, on_token)
+    except answer.OllamaError as e:
+        raise CliError(str(e))
+    if state["mode"] == "json" and sys.stderr.isatty():
+        sys.stderr.write("\r\x1b[K")
+    codes = []
+    if state["mode"] == "live":
+        print()
+    elif state["mode"] == "json":
+        shown, codes = answer.render(text, c, min(shutil.get_terminal_size((100, 24)).columns, 100))
+        print(shown + "\n")
+    if not raw and state["mode"] == "live":
+        codes = answer.code_fields(answer.parse(text) or {})
+    if answer.speed(stats):
+        print(c(answer.speed(stats), "2"))
+    if codes and out:
+        paths = answer.write(codes, Path(out).expanduser())
+        ok(f"wrote {', '.join(p.name for p in paths)} to {Path(out).expanduser()}")
+    if codes and check:
+        res = answer.compile_check(codes)
+        if res is None and any(x.name.endswith((".c", ".h")) for x in codes):
+            warn("no C compiler found (cc, clang or gcc), so the code was not compiled")
+        elif res:
+            good, cmd, output = res
+            warnings = output.count("warning:")
+            if good:
+                ok("compiles" + (f", with {warnings} warning(s)" if warnings else "") + c(f"   {cmd}", "2"))
+            else:
+                print(c("✗ ", "31") + "does not compile" + c(f"   {cmd}", "2"))
+            if output:
+                body = output.splitlines()
+                print("\n".join("  " + l for l in body[:12]) + (f"\n  ... {len(body) - 12} more lines" if len(body) > 12 else ""))
+    return text
+
+
+def cmd_ask(a) -> None:
+    if a.file:
+        prompt = Path(a.file).read_text()
+    elif a.prompt and a.prompt != ["-"]:
+        prompt = " ".join(a.prompt)
+    elif not sys.stdin.isatty():
+        prompt = sys.stdin.read()
+    else:
+        raise CliError(f'give a prompt, e.g. lobbot ask {a.model} "...", or -f FILE, or pipe it in')
+    answer_one(a.model, [{"role": "user", "content": prompt}], a.out, not a.no_check, a.raw)
+
+
+def read_message() -> str | None:
+    """One message from the prompt; \"\"\" opens and closes a multi-line one. None at the end."""
+    try:
+        line = input(c("» ", "1"))
+    except EOFError:
+        print()
+        return None
+    if not line.strip().startswith('"""'):
+        return line
+    lines = [line.strip()[3:]]
+    while True:
+        if lines[-1].rstrip().endswith('"""') and (len(lines) > 1 or len(lines[0].strip()) > 3):
+            lines[-1] = lines[-1].rstrip()[:-3]
+            return "\n".join(lines).strip()
+        try:
+            lines.append(input(c("… ", "2")))
+        except EOFError:
+            return "\n".join(lines).strip()
+
+
 def cmd_chat(a) -> None:
-    if not shutil.which("ollama"):
-        raise CliError("ollama is not installed here; get it from https://ollama.com/download")
-    os.execvp("ollama", ["ollama", "run", "--verbose", a.model, *a.prompt] if a.verbose
-              else ["ollama", "run", a.model, *a.prompt])
+    if a.plain:
+        if not shutil.which("ollama"):
+            raise CliError("ollama is not installed here; get it from https://ollama.com/download")
+        os.execvp("ollama", ["ollama", "run", *(["--verbose"] if a.verbose else []), a.model, *a.prompt])
+    if a.prompt:
+        answer_one(a.model, [{"role": "user", "content": " ".join(a.prompt)}], a.out, not a.no_check, a.raw)
+        return
+    print(f"Chatting with {c(a.model, '1')}. " + ("The model sees the whole conversation. " if a.history else
+          "Each message is answered on its own, as the model was trained (--history keeps the conversation). ")
+          + 'Start and end a multi-line message with """. Quit with /bye or Ctrl-D.')
+    history: list[dict] = []
+    while True:
+        msg = read_message()
+        if msg is None or msg.strip() in ("/bye", "/exit", "/quit"):
+            return
+        if not msg.strip():
+            continue
+        messages = history + [{"role": "user", "content": msg}]
+        try:
+            text = answer_one(a.model, messages, a.out, not a.no_check, a.raw)
+        except KeyboardInterrupt:
+            print(c("\n(stopped)", "2"))
+            continue
+        except CliError as e:
+            print(c("error: ", "31") + str(e), file=sys.stderr)
+            continue
+        if a.history:
+            history = messages + [{"role": "assistant", "content": text}]
+        print()
 
 
 # ----------------------------------------------------------------- argument parsing
@@ -1015,7 +1214,10 @@ def parser() -> argparse.ArgumentParser:
     g = sp.add_mutually_exclusive_group()
     g.add_argument("--preset", choices=sorted(PRESETS), default="full")
     g.add_argument("--fast", dest="preset", action="store_const", const="fast", help="same as --preset fast")
-    sp.add_argument("--set", action="append", metavar="KEY=VALUE", help="override a stages/_util.py Config field")
+    sp.add_argument("--long", action="store_true",
+                    help="room for long answers such as code: " + ", ".join(f"{k}={v}" for k, v in LONG.items()))
+    sp.add_argument("--set", action="append", metavar="KEY=VALUE",
+                    help="override a stages/_util.py Config field (wins over --fast and --long)")
     sp.add_argument("--name", help="job id (letters and digits; default random)")
     sp.add_argument("--force", action="store_true", help="start even if the GPU is busy")
     sp.add_argument("-d", "--detach", action="store_true", help="start and return without watching")
@@ -1069,10 +1271,24 @@ def parser() -> argparse.ArgumentParser:
                     help=f"re-point the VM checkout's origin first (default {GITHUB_URL})")
     sp.add_argument("-y", "--yes", action="store_true", help="don't ask before stashing")
 
-    sp = add("chat", cmd_chat, "chat with an installed model in Ollama")
+    def answer_opts(sp):
+        sp.add_argument("--out", metavar="DIR", help="write the answer's code fields to files in DIR")
+        sp.add_argument("--no-check", action="store_true", help="don't compile C code to check it")
+        sp.add_argument("--raw", action="store_true", help="print answers exactly as the model wrote them")
+
+    sp = add("chat", cmd_chat, "chat with an installed model in Ollama; JSON answers are shown readably")
     sp.add_argument("model")
     sp.add_argument("prompt", nargs="*", help="one-shot prompt (default interactive)")
-    sp.add_argument("-v", "--verbose", action="store_true", help="show tok/s after each answer")
+    sp.add_argument("--history", action="store_true", help="send the whole conversation, not just the last message")
+    sp.add_argument("--plain", action="store_true", help="use plain `ollama run` instead")
+    sp.add_argument("-v", "--verbose", action="store_true", help="with --plain: show tok/s (always shown otherwise)")
+    answer_opts(sp)
+
+    sp = add("ask", cmd_ask, "ask an installed model one question and show the answer readably")
+    sp.add_argument("model")
+    sp.add_argument("prompt", nargs="*", help="the question (or - / a pipe to read it from stdin)")
+    sp.add_argument("-f", "--file", help="read the question from a file")
+    answer_opts(sp)
     return p
 
 
