@@ -95,9 +95,14 @@ def test_job_run_by_hand_reports_disk_state(client, tmp_path):
                                     cwd=ROOT, env=env, capture_output=True, check=True)
 
     run("--only", "data")
-    os.utime(job / "logs/data.log", (0, 0))  # long finished, nothing running
     s = client.get("/jobs/byhand", headers=H).json()
     assert s["stages"]["data"]["status"] == "done" and s["stages"]["reap"]["status"] == "pending"
+    assert s["state"] == "partial" and s["error"] is None
+
+    # A stage that died mid-way (last line "running", no process) is an error.
+    with (job / "logs/reap.log").open("a") as f:
+        f.write('\n===== now\n{"stage": "reap", "status": "running", "pct": 40, "msg": "", "ts": 0}\n')
+    s = client.get("/jobs/byhand", headers=H).json()
     assert s["state"] == "error" and "resume" in s["error"]
 
     run()

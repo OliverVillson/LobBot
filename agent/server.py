@@ -70,7 +70,9 @@ def _mtime(p: Path) -> float:
 
 def disk_state(d: Path) -> tuple[str, dict, str | None]:
     """State of a job run with pipeline.py directly (no events.jsonl from this
-    server): .done markers, plus the last progress line of each stage's log."""
+    server): .done markers, plus the last progress line of each stage's log.
+    Besides the usual states this can be "partial": some stages ran cleanly
+    (--only/--from by hand) and there is no packaged model."""
     stages = {s: {"status": "pending", "pct": 0, "msg": ""} for s in STAGES}
     error = None
     for s in STAGES:
@@ -96,10 +98,22 @@ def disk_state(d: Path) -> tuple[str, dict, str | None]:
         return "error", stages, error
     if not any(st != "pending" for st in statuses):
         return "queued", stages, None
-    newest_log = max((_mtime(p) for p in (d / "logs").glob("*.log")), default=0.0)
-    if time.time() - newest_log < 300:  # stages log progress at least this often
+    if _pipeline_alive(d):
         return "running", stages, None
+    if all(st in ("done", "pending") for st in statuses):
+        # e.g. `pipeline.py --only reap`: what ran finished cleanly, the rest never started
+        return "partial", stages, None
     return "error", stages, "pipeline stopped before the end; resume to continue"
+
+
+def _pipeline_alive(d: Path) -> bool:
+    """Is a pipeline.py started by hand still running on this job dir?"""
+    try:
+        r = subprocess.run(["pgrep", "-f", f"pipeline.py --job [^ ]*{d.name}( |$)"], capture_output=True)
+        return r.returncode == 0
+    except FileNotFoundError:  # no pgrep: a log written recently means it is still going
+        newest = max((_mtime(p) for p in (d / "logs").glob("*.log")), default=0.0)
+        return time.time() - newest < 300
 
 
 def job_state(job_id: str, d: Path) -> dict:

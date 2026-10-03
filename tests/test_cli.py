@@ -188,7 +188,7 @@ def test_job_run_directly_with_pipeline(cli):
     subprocess.run([sys.executable, "pipeline.py", "--job", str(job), "--only", "data"], cwd=ROOT, env=env, check=True,
                    capture_output=True)
     # Newer APIs read the job dir themselves; older ones say "queued" and the CLI reads it.
-    assert any(w in cli("status").stdout for w in ("stopped*:data", "running"))
+    assert any(w in cli("status").stdout for w in ("stopped*:data", "partial"))
     assert "no packaged model" in cli("save", "direct", ok=False).stderr
     subprocess.run([sys.executable, "pipeline.py", "--job", str(job)], cwd=ROOT, env=env, check=True,
                    capture_output=True)

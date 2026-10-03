@@ -85,7 +85,7 @@ def dur(s: float) -> str:
 
 ICON = {"pending": c("·", "2"), "running": c("▸", "36"), "done": c("✓", "32"),
         "skipped": c("↷", "2"), "error": c("✗", "31")}
-STATE_COLOR = {"done": "32", "running": "36", "error": "31", "queued": "2"}
+STATE_COLOR = {"done": "32", "running": "36", "error": "31", "queued": "2", "partial": "33"}
 
 
 class Board:
