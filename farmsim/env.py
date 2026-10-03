@@ -247,6 +247,21 @@ class FarmEnv:
         self.model.vis.map.fogend = (600.0 - 480.0 * wet) / ext
         self._fog = rain > 0.0
 
+    def _sample_weather(self, rng: np.random.Generator) -> dict:
+        """Seeded weather: the site's climate sampler when site.json has one, else the generic one.
+
+        The generic draw always consumes the episode rng, so the rest of the episode
+        (row, offsets, slip) is the same either way; the climate draw uses its own seeded rng.
+        """
+        w = sample_weather(rng)
+        climate = ((getattr(self.site, "summary", None) or {}).get("farm") or {}).get("climate")
+        if climate:
+            from farmsim import weather as wx
+
+            w = wx.sample_weather(np.random.default_rng([int(self.seed) % 2**32, 104729]),
+                                  float(self.site.lat), float(self.site.lon), climate)
+        return w
+
     # ------------------------------------------------------------------- API
     def reset(self, seed: int | None = None) -> dict:
         """Start an episode. seed=None uses the next seed after the last episode's."""
@@ -257,7 +272,7 @@ class FarmEnv:
         self._episodes = getattr(self, "_episodes", 0) + 1
         rng = np.random.default_rng(self.seed)
         self.rng = rng
-        self.weather = dict(self.fixed_weather) if self.fixed_weather else sample_weather(rng)
+        self.weather = dict(self.fixed_weather) if self.fixed_weather else self._sample_weather(rng)
         self.weather.setdefault("rain_mm_h", 0.0)
         self.weather.setdefault("sun_elev_deg", 40.0)
         self.weather.setdefault("sun_azim_deg", 180.0)

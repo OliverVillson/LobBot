@@ -8,8 +8,13 @@ demo_data/cube_to_bowl_5 example, fetched 2026-10):
     videos/chunk-000/observation.images.front/episode_000000.mp4
     farm_tractor_config.py     # GR00T modality config for NEW_EMBODIMENT
 
-meta/stats.json is not written: GR00T computes stats.json and
-relative_stats.json itself on first load.
+meta/stats.json is not written: launch_finetune.py computes stats.json and
+relative_stats.json itself (gr00t/data/dataset/factory.py -> gr00t/data/stats.py).
+
+Checked against Isaac-GR00T main (2026-08) by tests/test_gr00t_compat.py: its
+LeRobotEpisodeLoader / ShardedSingleStepDataset load this export with
+farm_tractor_config.py registered the way launch_finetune.py registers it, and
+a CPU fine-tune of a tiny random GR00T N1.7 runs on it end to end.
 """
 
 from __future__ import annotations
@@ -35,9 +40,10 @@ CHUNKS_SIZE = 1000
 CONFIG_PY = '''"""GR00T modality config for the LobBot farm tractor (NEW_EMBODIMENT).
 
 Modelled on Isaac-GR00T examples/SO100/so100_config.py. Keys must match
-meta/modality.json in the exported dataset. Use it with launch_finetune.py
-(e.g. --modality-config-path farm_tractor_config.py); the exact flag name is
-not verified here, check the Isaac-GR00T README for your checkout.
+meta/modality.json in the exported dataset. launch_finetune.py imports this file
+for --modality-config-path <dataset>/farm_tractor_config.py (with
+--embodiment-tag NEW_EMBODIMENT); importing registers the config, and a second
+registration in the same process raises.
 """
 
 from gr00t.configs.data.embodiment_configs import register_modality_config

@@ -40,6 +40,13 @@
   ul { list-style: none; padding: 0; margin: 0; }
   li { padding: 6px 0; border-bottom: 1px solid var(--line); cursor: pointer; }
   li:hover { color: var(--accent); }
+  .farm { margin-top: 12px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); }
+  .farm h2 { margin-top: 0; }
+  .farm .headline { font-weight: 600; margin-bottom: 6px; }
+  .farm ul li { cursor: default; padding: 4px 0; }
+  .farm ul li:hover { color: inherit; }
+  .bar { display: flex; height: 10px; border-radius: 5px; overflow: hidden; margin: 4px 0 2px; }
+  .bar span { display: block; height: 100%; }
 </style>
 </head>
 <body>
@@ -138,6 +145,26 @@
     sun_noon_elev_jun21_deg: "Noon sun, 21 June (deg)", sun_noon_elev_today_deg: "Noon sun, today (deg)",
   };
 
+  function farmCard(f) {
+    if (!f) return "";
+    const adv = (f.advisories || []).map((a) => `<li>${esc(a)}</li>`).join("");
+    const sc = f.slope_classes || {};
+    const fl = +sc.flat_lt2_pct || 0, ge = +sc.gentle_2to5_pct || 0, st = +sc.steep_gt5_pct || 0;
+    const obs = f.observed ? `<div class="muted">Rain last 3 days ${esc(f.observed.rain_last_3d_mm)} mm,
+      last 30 days ${esc(f.observed.rain_last_30d_mm)} mm (SMHI ${esc(f.observed.station.name)},
+      ${esc(f.observed.station.distance_km)} km away)</div>` : "";
+    const err = f.weather_error ? `<div class="muted">Weather unavailable: ${esc(f.weather_error)}</div>` : "";
+    return `<div class="farm"><h2>For the farmer</h2>
+      <div class="headline">${esc(f.headline || "No forecast right now")}</div>
+      <ul>${adv}</ul>${obs}
+      <label>Slope: ${fl}% flat (&lt;2&deg;), ${ge}% gentle (2&ndash;5&deg;), ${st}% steep (&gt;5&deg;)</label>
+      <div class="bar" role="img" aria-label="slope classes">
+        <span style="width:${fl}%;background:#7cc25f"></span><span style="width:${ge}%;background:#e0a020"></span><span style="width:${st}%;background:#c0503a"></span>
+      </div>
+      <div class="muted">Daylight today: ${esc(f.daylight_h_today ?? "?")} h</div>${err}
+      ${f.attribution ? `<div class="muted">${esc(f.attribution)}</div>` : ""}</div>`;
+  }
+
   async function show(site) {
     const s = site.summary || {};
     let rows = "";
@@ -147,6 +174,7 @@
     for (const k of Object.keys(se)) errs += `<div class="muted">${esc(k)}: ${esc(se[k])}</div>`;
     $("result").innerHTML = `<h2>${esc(site.name || site.id)}</h2>
       <div class="muted">${esc(site.id)} &middot; ${(+site.lat).toFixed(5)}, ${(+site.lon).toFixed(5)} &middot; ${esc(site.size_m)} m</div>
+      ${farmCard(s.farm)}
       <table>${rows}</table>${errs}`;
     siteLayer.clearLayers();
     L.rectangle(bounds(site.lat, site.lon, site.size_m), { color: "#3d7a2a", weight: 2, fillOpacity: 0.05 }).addTo(siteLayer);

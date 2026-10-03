@@ -48,16 +48,17 @@ class TimedPolicy:
 
 
 class DegradedPolicy:
-    """DRY RUN stand-in for a compressed policy: the expert plus steering noise,
-    speed jitter and control lag that grow with the compression severity (0..1)."""
+    """DRY RUN stand-in for a compressed policy: the expert plus a slowly wandering
+    steering error (like a quantised head's drift), per-step jitter and control
+    lag, all growing with the compression severity (0..1)."""
 
     def __init__(self, base, severity: float, name: str, seed: int = 0, latency_ms: float | None = None):
         self.base = base
         self.severity = float(np.clip(severity, 0.0, 1.0))
         self.name = name
-        self.noise_std = 0.02 + 0.22 * self.severity  # rad of steering
-        self.bias = 0.06 * self.severity  # rad: a systematic steering error, like a quantised head
-        self.lag = int(round(4 * self.severity))  # control steps (0.1 s each)
+        self.drift_std = 0.06 * self.severity  # rad per step into an AR(1) drift
+        self.noise_std = 0.05 + 0.2 * self.severity  # rad of per-step steering jitter
+        self.lag = int(round(6 * self.severity))  # control steps (0.1 s each)
         self.seed = seed
         self.episode = 0
         if latency_ms is not None:
@@ -73,12 +74,13 @@ class DegradedPolicy:
         self.base.reset()
         # Seeded per episode so every rerun of the eval sees the same noise.
         self.rng = np.random.default_rng([self.seed, self.episode])
-        self.episode += 1
+        self.drift = 0.0
         self.queue: deque = deque()
 
     def act(self, obs: dict) -> np.ndarray:
         a = np.asarray(self.base.act(obs), dtype=np.float32).copy()
-        a[0] += self.bias + self.rng.normal(0.0, self.noise_std)
+        self.drift = 0.97 * self.drift + self.rng.normal(0.0, self.drift_std)
+        a[0] += self.drift + self.rng.normal(0.0, self.noise_std)
         a[1] *= 1.0 + self.rng.normal(0.0, 0.1 * self.severity)
         if not self.queue:  # until the lag has passed, the wheels stay straight
             self.queue.extend([np.array([0.0, a[1]], np.float32)] * self.lag)
@@ -93,7 +95,7 @@ def severity(cand: dict, teacher: dict) -> float:
     size = 1.0 - cand["footprint"]["size_gb"] / t_size
     steps = 1.0 - cand.get("denoise_steps", 4) / max(teacher.get("denoise_steps", 4), 1)
     blocks = len(cand.get("drop_dit_blocks") or []) / 16
-    return float(np.clip(0.7 * size + 0.25 * steps + 0.4 * blocks, 0.0, 1.0))
+    return float(np.clip(1.05 * size + 0.4 * steps + 0.6 * blocks, 0.0, 1.0))
 
 
 def dry_latency_ms(cand: dict) -> float:

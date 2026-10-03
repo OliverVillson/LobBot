@@ -167,6 +167,16 @@ def _write_preview(dem: np.ndarray, ortho: np.ndarray, res_m: float, path: Path)
     Image.fromarray(np.clip(out, 0, 255).astype(np.uint8)).save(path)
 
 
+def _farm(dem: np.ndarray, res_m: float, lat: float, lon: float) -> dict:
+    """Farmer summary (forecast, advisories, slope classes, climate). Never fails the build."""
+    try:
+        from farmsim import weather
+
+        return weather.farm_summary(dem, res_m, lat, lon)
+    except Exception as e:  # noqa: BLE001 - weather is optional
+        return {"weather_error": f"{type(e).__name__}: {e}", "advisories": []}
+
+
 def build_site(lat: float, lon: float, size_m: float = 300.0, name: str = "", source: str = "auto",
                sites_dir=None) -> Site:
     """Fetch (or synthesize) a square site centred on lat/lon and write it to disk."""
@@ -188,9 +198,11 @@ def build_site(lat: float, lon: float, size_m: float = 300.0, name: str = "", so
     Image.fromarray(ortho).save(d / "ortho.png")
     _write_preview(dem, ortho, res, d / "preview.png")
 
+    summary = summarize(dem, res, lat, lon, size_m, winner)
+    summary["farm"] = _farm(dem, res, lat, lon)
     site = Site(id=sid, name=name or sid, lat=float(lat), lon=float(lon), size_m=float(size_m),
                 crs=geo.SWEREF99TM, origin_e=float(box.west), origin_n=float(box.north), res_m=float(res),
-                source=winner, summary=summarize(dem, res, lat, lon, size_m, winner), dir=d)
+                source=winner, summary=summary, dir=d)
     meta = site.to_json()
     meta.pop("dir")
     meta["source_requested"] = source

@@ -121,7 +121,7 @@ def _label_points(fig, ax, cands) -> None:
     offsets = [(12, 8), (12, -40), (-12, 8), (-12, -40), (12, 44), (12, -76), (-12, 44), (-12, -76)]
     for c in cands:
         text = f"{c['name']}\n{c['success_rate']:.0%} · CTE {c.get('cte_mean_m', 0):.2f} m"
-        w, h = 7.2 * max(len(l) for l in text.splitlines()), 34.0
+        w, h = 8.5 * max(len(l) for l in text.splitlines()) + 6, 36.0
         px, py = to_px((c["size_gb"], c["success_rate"] * 100))
         for dx, dy in offsets:
             x0 = px + dx if dx > 0 else px + dx - w
