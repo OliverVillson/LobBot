@@ -7,10 +7,8 @@ crash there cannot take down the main path. Writes:
   work/healed/   pruned + healed MoE (merged HF model)
   work/dense/    dense student (merged HF model), if enabled
 
-Extra knobs beyond Config (env vars): LOBBOT_KD_WEIGHT (default 0; >0 adds
-logit KL to the unpruned teacher, which then sits in GPU memory too),
-LOBBOT_HEAL_EXPERTS (default 1; 0 trains attention and router only),
-LOBBOT_STUDENT_EPOCHS (default 2), LOBBOT_HEAL_MAX_MINUTES and
+Knobs: heal_* and student_epochs in <job>/config.json (Config). The
+wall-clock caps are env vars, LOBBOT_HEAL_MAX_MINUTES and
 LOBBOT_STUDENT_MAX_MINUTES (default 60 each: training stops early at the cap
 and still merges and saves; 0 means no cap).
 """
