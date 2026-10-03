@@ -1,0 +1,22 @@
+[project]
+name = "lobbot"
+version = "0.1.0"
+description = "Compress a large LLM into a small task-specialised model you own."
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+# Laptop side (frontend): TUI, SSH, planner, download.
+tui = ["textual", "asyncssh", "httpx", "anthropic"]
+# VM side: installed by scripts/setup_vm.sh into its own venvs.
+dev = ["pytest"]
+
+[project.scripts]
+lobbot = "lobbot.app:main"
+
+[tool.setuptools.packages.find]
+include = ["lobbot*", "common*", "stages*"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
