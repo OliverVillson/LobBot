@@ -140,10 +140,11 @@ def gguf_report(job: Job, path: Path) -> dict:
 
     n_exp, n_used = kv("expert_count", 0), kv("expert_used_count", 0)
     frac = n_used / n_exp if n_exp else 1.0
+    tied = not any(t.name == "output.weight" for t in r.tensors)  # Gemma: embeddings double as the LM head
     per_token, widths = 0, []
     for t in r.tensors:
-        if t.name.startswith("token_embd"):
-            continue  # one row per token, negligible
+        if "token_embd" in t.name and not (tied and t.name == "token_embd.weight"):
+            continue  # one row per token, negligible (also Gemma 4's per-layer embeddings)
         per_token += t.n_bytes * (frac if "_exps" in t.name else 1.0)
         parts = t.name.split(".")
         if len(parts) == 4 and parts[2] in EXPERT_PROJ:
