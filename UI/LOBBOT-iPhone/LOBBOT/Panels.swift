@@ -35,20 +35,8 @@ struct IntakePanel: View {
             case .target: target
             }
 
-            HStack(spacing: 10) {
-                Button { session.back() } label: {
-                    Image(systemName: "chevron.left")
-                        .font(.headline)
-                        .frame(width: 54, height: 54)
-                        .foregroundStyle(Brand.ink)
-                        .background(Brand.tile, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-                        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(Brand.line))
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel(step == .job ? "Home" : "Back")
-                PrimaryButton(title: step == .target ? "Start surgery" : "Continue",
-                              symbol: step == .target ? "scissors" : "arrow.right") { session.next() }
-            }
+            PrimaryButton(title: step == .target ? "Start surgery" : "Continue",
+                          symbol: step == .target ? "scissors" : "arrow.right") { session.next() }
         }
         .card()
     }

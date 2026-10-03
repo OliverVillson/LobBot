@@ -13,6 +13,18 @@ struct Composer: View {
     var body: some View {
         let voice = session.voice
         HStack(spacing: 10) {
+            if case .intake(let step) = session.phase {   // back is always in reach, no scrolling
+                Button { session.back() } label: {
+                    Image(systemName: "chevron.left")
+                        .font(.headline)
+                        .frame(width: 48, height: 48)
+                        .foregroundStyle(Brand.ink)
+                        .background(Brand.surface, in: Circle())
+                        .overlay(Circle().stroke(Brand.line))
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(step == .job ? "Home" : "Back")
+            }
             HStack(spacing: 6) {
                 TextField("Message Dr. Lobbot…", text: $draft)
                     .focused($focused)
