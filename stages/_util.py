@@ -50,6 +50,7 @@ class Config:
     heal_max_len: int | None = None  # tokens per example for heal and the dense student; None uses LOBBOT_HEAL_MAX_LEN or 2048
     dense_fallback: bool = True
     student_epochs: float = 2.0
+    student_lr: float | None = None  # dense student LoRA lr; None uses LOBBOT_STUDENT_LR or 1e-4
     student_max_minutes: float | None = None  # same for the dense student (LOBBOT_STUDENT_MAX_MINUTES)
     # Quantize: aim below the TaskSpec max size by this margin.
     size_margin_gb: float = 0.5

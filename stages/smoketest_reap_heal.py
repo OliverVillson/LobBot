@@ -176,6 +176,58 @@ def check_dense_trained(root: Path):
     print(f"ok: dense student updated {len(changed)} text-decoder tensors, towers untouched")
 
 
+def check_nonfinite_guard(root: Path):
+    """A NaN loss or NaN gradient on one batch skips that update instead of
+    poisoning the weights; training that keeps producing NaN saves nothing."""
+    from stages import sft
+    from stages.taskdata import load_examples
+    examples = load_examples(root / "job" / "data" / "train.jsonl")
+    load = sft.load_causal_lm
+
+    def with_nan(calls):
+        def loader(path):
+            model, n = load(path), [0]
+
+            def hook(_mod, _inp, out):
+                n[0] += 1
+                kind = calls(n[0])
+                if kind == "loss":
+                    return out * float("nan")
+                if kind == "grad" and out.requires_grad:
+                    out.register_hook(lambda g: g * float("nan"))
+            model.get_output_embeddings().register_forward_hook(hook)
+            return model
+        return loader
+
+    out = root / "nan-guard"
+    try:
+        sft.load_causal_lm = with_nan(lambda i: {2: "loss", 4: "grad"}.get(i))
+        sft.train_sft(str(root / "student"), examples, out, epochs=1.0, max_tokens=256)
+        base = _load_weights(root / "student")
+        bad = [k for k, v in _load_weights(out).items() if not torch.isfinite(v).all() and torch.isfinite(base[k]).all()]
+        if bad:
+            raise SystemExit(f"FAIL: NaN batch poisoned the weights ({bad[:3]})")
+        sft.load_causal_lm = with_nan(lambda i: "loss")
+        try:
+            sft.train_sft(str(root / "student"), examples, root / "nan-always", epochs=1.0, max_tokens=256)
+            raise SystemExit("FAIL: training that only produces NaN was saved")
+        except sft.NonFiniteTraining:
+            pass
+        if (root / "nan-always").exists():
+            raise SystemExit("FAIL: diverged training left an output dir")
+    finally:
+        sft.load_causal_lm = load
+    print("ok: NaN loss/gradient batches are skipped, diverged training saves nothing")
+
+
+def _load_weights(d: Path) -> dict:
+    from safetensors.torch import load_file
+    w = {}
+    for f in d.glob("*.safetensors"):
+        w.update(load_file(f))
+    return w
+
+
 def gguf_check(root: Path, llama: Path):
     for name in ("reaped", "healed", "dense"):
         src = root / "job" / "work" / name
@@ -207,6 +259,7 @@ def main():
         run_stage("stages.heal", root)
         check_heal_trained(root)
         check_dense_trained(root)
+        check_nonfinite_guard(root)
         if a.llama_cpp:
             gguf_check(root, Path(a.llama_cpp).expanduser())
     print("SMOKE TEST PASSED")

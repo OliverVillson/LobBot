@@ -251,21 +251,28 @@ def run_stage(job: Job) -> None:
 
     dense_dir = job.path("work", "dense")
     has_dense = dense_dir.exists() if DRY_RUN else (dense_dir / "config.json").exists()
+    heal_info = job.root / ".done" / "heal"
+    if has_dense and heal_info.exists() and not json.loads(heal_info.read_text() or "{}").get("dense", True):
+        has_dense = False  # heal reported the dense student as failed
     if cfg.dense_fallback and has_dense:
         dout = cand_dir / "dense.gguf"
         emit(STAGE, pct=80, msg="quantizing dense student")
-        if DRY_RUN:
-            dout.write_bytes(b"GGUF dry run")
-            d = {"size_gb": 2.5, "bytes_per_token_gb": 2.5}
-        else:
-            d_bf16, d_imatrix = to_gguf(job, dense_dir, "dense")
-            quantize(job, d_bf16, d_imatrix, dout, [])
-            d = gguf_report(job, dout)
-        report["candidates"]["dense"] = {
-            "path": str(dout), "size_gb": round(d["size_gb"], 2),
-            "tok_s_est": tok_s(cfg, d["bytes_per_token_gb"]),
-            "bytes_per_token_gb": round(d["bytes_per_token_gb"], 3),
-        }
+        try:
+            if DRY_RUN:
+                dout.write_bytes(b"GGUF dry run")
+                d = {"size_gb": 2.5, "bytes_per_token_gb": 2.5}
+            else:
+                d_bf16, d_imatrix = to_gguf(job, dense_dir, "dense")
+                quantize(job, d_bf16, d_imatrix, dout, [])
+                d = gguf_report(job, dout)
+            report["candidates"]["dense"] = {
+                "path": str(dout), "size_gb": round(d["size_gb"], 2),
+                "tok_s_est": tok_s(cfg, d["bytes_per_token_gb"]),
+                "bytes_per_token_gb": round(d["bytes_per_token_gb"], 3),
+            }
+        except Exception as e:  # the dense student is a fallback: never fail the job over it
+            dout.unlink(missing_ok=True)
+            emit(STAGE, pct=90, msg=f"dense student skipped, quantizing it failed ({e}); continuing with the MoE")
 
     job.path("work", "allocation.json").write_text(json.dumps(report, indent=2))
     job.mark_done(STAGE, {k: v["size_gb"] for k, v in report["candidates"].items()})
