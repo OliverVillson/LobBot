@@ -78,7 +78,7 @@ lobbot run my.taskspec.json --fast  # or --example; live stage progress, Ctrl-C 
 lobbot status [job] | watch <job> | logs <job> [-s heal] [-f] | eval <job>
 lobbot resume <job> [--from quantize] | stop <job>
 lobbot save <job> --chat            # keep the model: see below
-lobbot pull                         # git pull the VM checkout (refuses while the GPU is busy)
+lobbot pull [--stash]               # git pull the VM checkout; --stash stashes local edits first
 ```
 
 `lobbot save` (alias `install`; `run --save` chains it) copies the job's

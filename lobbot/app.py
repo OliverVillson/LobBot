@@ -688,9 +688,9 @@ else echo "gguf=skipped $dst $((size / 1000000)) $((free / 1000000))"; fi""", ti
         ok(f"VM backup: {parts[1]} (system disk, survives a pause)")
     else:
         ok(f"VM backup: report, spec and Modelfile in {parts[1]}")
-        warn(f"the system disk has only {int(parts[3]) / 1000:.1f} GB free, too little for the "
-             f"{int(parts[2]) / 1000:.1f} GB model, so the VM's only copy of it is on /mnt/nvme. "
-             "Your laptop copy is the safe one.")
+        warn(f"the model ({int(parts[2]) / 1000:.1f} GB) does not fit on the VM's system disk "
+             f"({int(parts[3]) / 1000:.1f} GB free), so it was not backed up there. Its only VM copy is on "
+             "/mnt/nvme, which a pause or stop wipes. The download to this Mac is the real save.")
 
 
 def cmd_download(a) -> None:
@@ -737,8 +737,22 @@ def cmd_pull(a) -> None:
     if not a.force and gpu_processes(r):
         raise CliError("a job is using the GPU; its next stage would pick up the new code. "
                        "Wait for it, or add --force.")
+    repo = rpath(s.repo)
+    dirty = [l for l in r.sh(f"cd {repo} && git status --porcelain --untracked-files=no").splitlines() if l.strip()]
+    if dirty:
+        files = "\n  ".join(l[3:] for l in dirty)
+        if not a.stash:
+            raise CliError(f"the VM checkout has local changes, so git pull would refuse:\n  {files}\n"
+                           "If they are hotfixes that are now upstream, run: lobbot pull --stash "
+                           "(stashes them with git stash, so nothing is lost).")
+        if not a.yes and sys.stdin.isatty():
+            if input(f"Stash these changes on the VM and pull?\n  {files}\n[y/N] ").lower() != "y":
+                return
+        label = "lobbot pull " + time.strftime("%Y-%m-%d %H:%M:%S")
+        r.sh(f"cd {repo} && git stash push -q -m {shlex.quote(label)}")
+        ok(f'stashed {len(dirty)} file(s) on the VM as "{label}" (get them back with: git stash pop)')
     out = r.sh(f"""set -e
-cd {rpath(s.repo)}
+cd {repo}
 before=$(git rev-parse HEAD)
 git pull -q --ff-only
 echo "head=$(git log -1 --format='%h %s')"
@@ -850,6 +864,8 @@ def parser() -> argparse.ArgumentParser:
 
     sp = add("pull", cmd_pull, "update the LobBot checkout on the VM (git pull --ff-only)")
     sp.add_argument("--force", action="store_true", help="pull even while the GPU is busy")
+    sp.add_argument("--stash", action="store_true", help="git stash local changes on the VM first")
+    sp.add_argument("-y", "--yes", action="store_true", help="don't ask before stashing")
 
     sp = add("chat", cmd_chat, "chat with an installed model in Ollama")
     sp.add_argument("model")

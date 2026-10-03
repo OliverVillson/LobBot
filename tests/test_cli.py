@@ -143,3 +143,33 @@ def test_init_keeps_remote_tilde(cli):
     conf = json.loads((cli.tmp / "config.json").read_text())
     assert conf["repo"] == "~/LobBot" and conf["jobs"] == "/mnt/nvme/jobs"
     assert "~/LobBot" in p.stdout
+
+
+def test_pull_dirty_checkout(cli, tmp_path):
+    def git(*args, cwd):
+        subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", *args], cwd=cwd, check=True,
+                       capture_output=True)
+
+    origin, vm, dev = tmp_path / "origin.git", tmp_path / "vm", tmp_path / "dev"
+    git("init", "-q", "--bare", "-b", "main", str(origin), cwd=tmp_path)
+    git("clone", "-q", str(origin), str(dev), cwd=tmp_path)
+    (dev / "data.py").write_text("v1\n")
+    git("add", ".", cwd=dev)
+    git("commit", "-qm", "v1", cwd=dev)
+    git("push", "-q", "origin", "HEAD:main", cwd=dev)
+    git("clone", "-q", str(origin), str(vm), cwd=tmp_path)
+    (dev / "data.py").write_text("v2 upstream\n")
+    git("commit", "-qam", "v2", cwd=dev)
+    git("push", "-q", "origin", "HEAD:main", cwd=dev)
+    (vm / "data.py").write_text("hotfix on the vm\n")
+
+    conf = json.loads((cli.tmp / "config.json").read_text())
+    (cli.tmp / "config.json").write_text(json.dumps({**conf, "repo": str(vm)}))
+    p = cli("pull", ok=False)
+    assert "local changes" in p.stderr and "data.py" in p.stderr and "--stash" in p.stderr
+    assert (vm / "data.py").read_text() == "hotfix on the vm\n"  # nothing touched
+
+    p = cli("pull", "--stash", "-y")
+    assert "stashed 1 file" in p.stdout and "v2" in p.stdout
+    assert (vm / "data.py").read_text() == "v2 upstream\n"
+    assert "lobbot pull" in subprocess.run(["git", "stash", "list"], cwd=vm, capture_output=True, text=True).stdout
