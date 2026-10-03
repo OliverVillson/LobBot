@@ -91,8 +91,17 @@ def run_stage(mod: str, root: Path):
 
 def check_equivalence(root: Path):
     from transformers import AutoModelForCausalLM
-    t = AutoModelForCausalLM.from_pretrained(root / "teacher").eval()
-    p = AutoModelForCausalLM.from_pretrained(root / "job" / "work" / "reaped").eval()
+    # On a GPU box the reap stage loads and saves in bf16. Round the original's
+    # weights the same way and compare both in fp32 on CPU, so only pruning
+    # can make them differ.
+    reaped = root / "job" / "work" / "reaped"
+    saved = json.loads((reaped / "config.json").read_text())
+    saved_dtype = getattr(torch, saved.get("dtype") or saved.get("torch_dtype") or "float32")
+    t = AutoModelForCausalLM.from_pretrained(root / "teacher", dtype=torch.float32).eval()
+    p = AutoModelForCausalLM.from_pretrained(reaped, dtype=torch.float32).eval()
+    with torch.no_grad():
+        for w in t.parameters():
+            w.copy_(w.to(saved_dtype).float())
     sal = json.loads((root / "job" / "work" / "reap_saliency.json").read_text())
     for (_, blk), L in zip(mu.find_moe_blocks(t), sal["layers"]):
         drop = torch.ones(mu.num_experts(blk), dtype=torch.bool)
