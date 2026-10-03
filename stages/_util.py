@@ -44,6 +44,7 @@ class Config:
     heal_train_experts: bool = True  # also LoRA the experts, not just attention and router
     heal_kd_weight: float = 0.0  # >0 adds logit KL to the unpruned teacher (needs it in GPU memory)
     heal_max_minutes: float | None = None  # wall-clock cap on heal; None uses LOBBOT_HEAL_MAX_MINUTES or 60
+    heal_max_len: int | None = None  # tokens per example for heal and the dense student; None uses LOBBOT_HEAL_MAX_LEN or 2048
     dense_fallback: bool = True
     student_epochs: float = 2.0
     student_max_minutes: float | None = None  # same for the dense student (LOBBOT_STUDENT_MAX_MINUTES)
