@@ -32,7 +32,11 @@ def cli(tmp_path):
     (home / ".lobbot-env").write_text("export LOBBOT_DRY_RUN=1\n")  # the API inherits this, so jobs dry-run
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    (bin_dir / "ollama").write_text('#!/bin/sh\necho "ollama $*" >> "$HOME/ollama.calls"\n')
+    (bin_dir / "ollama").write_text(
+        '#!/bin/sh\n'
+        'if [ "$1" = list ]; then echo "NAME ID SIZE MODIFIED"; '
+        'grep "^ollama create" "$HOME/ollama.calls" 2>/dev/null | awk \'{print $3 ":latest x 6GB now"}\'; exit 0; fi\n'
+        'echo "ollama $*" >> "$HOME/ollama.calls"\n')
     (bin_dir / "ollama").chmod(0o755)
     conf = tmp_path / "config.json"
     conf.write_text(json.dumps({"host": "local", "repo": str(ROOT), "jobs": str(tmp_path / "jobs"),
@@ -103,6 +107,9 @@ def test_full_flow(cli):
     assert (saved / "model.gguf").read_bytes() == model
     assert {"taskspec.json", "config.json", "eval.json", "Modelfile"} <= {f.name for f in saved.iterdir()}
     cli("install", "demo", "--no-ollama")  # alias, and a second save reuses the backup and download
+    p = cli("results", "demo")
+    assert "Saved" in p.stdout and "lobbot chat lobbot-support-email-to-ticket" in p.stdout
+    assert "lobbot save demo" not in p.stdout
 
     p = cli("resume", "demo", "--from", "eval")
     assert "pipeline finished" in p.stdout
