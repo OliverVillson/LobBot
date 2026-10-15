@@ -1,0 +1,344 @@
+LobBot (Mugge): project history
+================================
+
+A record of the hackathon build: what we set out to do, what we got, what
+went well, what went wrong, and what to do better next time.
+
+Event:     12-hour hackathon, 2026-10-03, about 09:15 to 21:15 UTC
+Team:      Oliver Villson (backend pipeline, API, CLI)
+           derka1385 (iPhone app, landing page, motion ad design)
+Repo:      https://github.com/OliverVillson/LobBot
+All times below are UTC on 2026-10-03 unless stated otherwise.
+
+Sources: the run outputs on the VM (eval.json, data/stats.json, stage
+logs), the PR #12 A/B write-up, the CLI results screens, the merged PRs
+and the project's chat threads. Where something is a judgement rather
+than a measured number, it says so.
+
+
+1. What we set out to build
+---------------------------
+
+Mugge (renamed LobBot in the morning) takes a large open model and turns it
+into a small model that does one job well and runs offline on a 16 GB
+laptop. The user describes the job, the pipeline builds the model on a GPU
+in the cloud, and the user downloads it and owns it.
+
+Target set by Oliver: a 5 to 7 GB file that runs at 40 to 60 tokens per
+second on a new 16 GB laptop (M4/M5). Footprint mattered, not parameter
+count.
+
+The pipeline, as built:
+
+  data      The teacher (Qwen3-30B-A3B-Instruct-2507, 61.1 GB) writes about
+            2,000 task examples from 10 to 20 seed examples. Gemini writes
+            the held-out test inputs, so the tests are not the teacher's.
+  reap      REAP expert pruning, calibrated on the task data: 64 of 128
+            experts kept in each of the 48 layers.
+  heal      LoRA fine-tune of the pruned model on the teacher's answers. A
+            dense Gemma 4 E4B student trains at the same time as a backup.
+  quantize  Per-layer bit widths from REAP saliency and an imatrix, then
+            GGUF quantization with llama.cpp.
+  eval      Gemini grades each held-out answer 0 to 10 against the task's
+            criteria. The teacher's own answers get the same grading.
+  package   GGUF plus an Ollama Modelfile.
+
+Heavy work ran on one NVIDIA B200 VM from evroc. The `lobbot` CLI on
+Oliver's Mac drives it over SSH. Models run locally in Ollama.
+
+
+2. Results
+----------
+
+2.1 Models built
+
+All MoE models are 6.52 GB, about 9x smaller than the 61.1 GB teacher.
+"Score" is the Gemini judge's average divided by 10.
+
+  Job       Task                         Train/test  Model   Teacher  Share
+  --------  ---------------------------  ----------  ------  -------  -----
+  fast      support email to JSON ticket   430 / 30   0.953   0.987    97%
+  quality   support email to JSON ticket  2030 / 100  0.974   0.981    99%
+  demo1     same, Oliver's own --fast run   (fast)    0.947   0.983    96%
+  arch1     system architecture to C99    1731 / 67   0.482   0.548    88%
+  shell1    plain English to shell cmd    2024 / 100  0.77    0.84     91%
+
+Speed:
+  - 56.7 tok/s measured on Oliver's Apple M5 MacBook (16 GB) in Ollama for
+    the email model; 51 tok/s measured for arch1.
+  - About 49 tok/s estimated for a 16 GB M4 MacBook Air (eval's estimate).
+  - 54 to 63 tok/s on the B200 itself.
+
+Time on the GPU: the quality job took 25m26s end to end (data 2m29s, REAP
+8m39s, heal 3m53s, quantize 9m09s, eval 1m11s, package 5s). Oliver's demo1
+fast run took about 12 minutes. Downloading a 6.5 GB model to the Mac took
+roughly 10 more minutes on the event network.
+
+The dense Gemma 4 E4B backup scored 0.982 on the quality job, slightly above
+the MoE, but its estimated laptop speed was about 26 tok/s, under the 40
+tok/s target. The pipeline picks the MoE when it is within 0.02 of the best
+score, so the pruned MoE won.
+
+Bits: on the quality job the expert weights averaged 3.00 bits per weight
+(q2_k 77%, q4_k 12%, q3_k 8%, q5_k 2%).
+
+2.2 What the scores do and do not mean
+
+  - The judge grades against the task's criteria, with no reference answer,
+    on Gemini-written inputs that resemble the training data. 0.974 means
+    the model does this one structured task well. It is not a general
+    model and is much weaker than the teacher outside its task.
+  - Judge noise is real: re-running the judge moved the teacher from 0.981
+    to 0.984 on the same answers, so differences of about 0.003 mean
+    nothing.
+  - The code task is hard for the teacher too (0.548). Hand testing with
+    gcc and sanitizers showed the arch1 model writes correct small
+    components (an add calculator compiled with zero warnings under
+    -Wall -Wextra -Wpedantic; a linked-list reverser was correct and O(n),
+    10 million nodes in 60 ms). A full A* pathfinder failed: missing
+    headers, no parent tracking so every path came back wrong, a buffer
+    overflow, and O(n^2) list scans. It should not be pitched as writing
+    whole programs.
+
+2.3 Code and documents delivered
+
+  - 26 pull requests merged (#1 to #18 and #20 to #27), all on main.
+  - PR #19, derka's iPhone app (SwiftUI, Dr. Lobbot mascot, Gemini Live
+    voice), was reviewed but is still open and not merged into main.
+  - Backend: pipeline.py and six stages, an HTTP API on the VM (one job at a
+    time, stop endpoint, live progress stream), VM setup script.
+  - CLI: lobbot init/doctor/up/pull, new (Gemini drafts a task spec from one
+    line), run/watch/status/results/stop/resume, save (resumable,
+    checksum-verified download plus Ollama import), chat and ask (formats
+    JSON and code, writes .h/.c files, compile-checks C).
+  - Docs: docs/ad/motion-ad-brief.md (50-second ad script and sourced fact
+    sheet), docs/derka-prompt.txt (wiring the app to the backend),
+    docs/tech-providers.txt (why and how each provider is used).
+  - About 98 unit tests passing at the last count during the event. The
+    repo has no CI, so they were run by hand.
+
+2.4 Sponsor integrations
+
+  - Google DeepMind (main sponsor): Gemini writes the test inputs, judges
+    every answer and drafts task specs; Gemma 4 E4B is the dense backup
+    student.
+  - condense.chat: one /v1/compress call per run shrinks the seed examples
+    Gemini sees when it writes tests (for example 118 to 70 words on arch1).
+    Its Gemini proxy only forwards to Vertex AI, which an AI Studio key
+    cannot use, so all other Gemini calls go direct. This is a small,
+    working integration, by design.
+  - Matrix OS: looked at and not used.
+
+
+3. Timeline
+-----------
+
+  08:41  Project and planning thread started.
+  09:09  Name changed from Mugge to LobBot.
+  09:26  Plan done. Three backend threads start in parallel: data and
+         orchestrator, REAP and heal, compression and eval.
+  09:30  Direction change: the CLI is Oliver's own tool; derka builds the
+         landing page and the user-facing app around Ollama.
+  09:39  A Claude session starts on Oliver's Mac to drive the VM over SSH.
+  09:41  VM unreachable: IPv6-only address, Mac network had no IPv6.
+  09:50  Public IPv4 attached; SSH opened to Oliver's IP only (09:54).
+  10:05  VM stops answering after evroc's first-boot driver install.
+  10:07  Oliver pauses the VM to retry. The pause wipes the 3.6 TB NVMe
+         disk and the downloaded weights.
+  10:09  GitHub access fixed; code moves from git bundles to the repo.
+  10:12  VM back; setup script re-run and weights re-downloaded.
+  10:26  First real job ("fast") starts on the B200.
+  10:51  First end-to-end model: 6.52 GB, Gemini score 0.953.
+  11:01  Running in Ollama on Oliver's Mac at 56.7 tok/s.
+  11:22  Full-quality job done: 0.974 vs teacher 0.981.
+  11:39  Oliver runs the pipeline himself from the CLI (demo1).
+  12:02  Oliver's own task, architecture to C (arch1), starts.
+  12:13  arch1 loses 37% of training answers and a third of its tests to
+         length caps; caps raised and arch1 re-scored from 0.364 to 0.482.
+  12:23  Everything merged into main for the first time.
+  12:48  Ad brief on main; review of derka's iPhone app PR posted.
+  13:16  Bit allocator fix (PR #12) merged after an A/B tie.
+  13:23  Oliver starts shell1 (plain English to shell command).
+  13:48  shell1 fails in quantize: the Gemma backup student had diverged to
+         NaN. Resumed from quantize without the backup; finished 13:54 at
+         0.77 vs 0.84.
+  13:58  Live watch reconnect fix merged (PR #25).
+  14:10  Heal NaN guard merged (PR #26) and verified on the VM.
+  15:25  Oliver's Mac: lobbot install broken and disk nearly full (8.3 GB
+         free); shell1 could not be imported into Ollama.
+  15:31  Tech providers write-up merged (PR #27). Last merge of the day.
+  16:41  Oliver asks whether he can shut down the B200; told it would wipe
+         the data disk and to save models and reports first.
+
+
+4. What went well
+-----------------
+
+  - The core idea worked on the first real run. A 61 GB teacher became a
+    6.52 GB model that keeps about 99% of the teacher's score on a narrow
+    task and runs above the 40 tok/s target on a 16 GB laptop. It was
+    running in Ollama on Oliver's Mac about an hour after first SSH access
+    to the VM (09:54 to 11:01).
+  - The main risks in the plan did not bite. REAP on the real 30B worked,
+    llama.cpp accepted the pruned expert count, and per-layer bit widths
+    worked in GGUF.
+  - Building REAP and heal directly on torch/transformers/peft instead of
+    waiting on llm-compressor or TRL support kept us unblocked.
+  - Parallel threads with clear file ownership. Three backend threads built
+    stages at the same time against a shared contract, and one planning
+    thread owned the shared files and did all merges. There were very few
+    conflicts.
+  - Having a Claude session on Oliver's Mac drive the real VM turned bugs
+    into fixes fast: real failures went straight to the thread that owned
+    the code, and most were fixed and merged within the hour.
+  - Stage caching and resume. shell1's crash cost only a re-run of quantize
+    and eval, not the 15 minutes of data, REAP and heal before it.
+  - An independent judge. Gemini writing the tests and grading both the
+    model and the teacher gave a score we could explain, and reporting it
+    as a share of the teacher's score made it honest for hard tasks.
+  - The CLI let Oliver run his own tasks end to end from his Mac without
+    logging in to the VM, including a task he wrote himself.
+  - Keeping secrets out of chat. API keys went into a mode-600 file on the
+    VM and were never printed.
+  - Every PR was checked with real numbers before merge, for example the
+    bit allocator A/B on the quality job.
+
+
+5. What went wrong, and lessons learned
+---------------------------------------
+
+5.1 Infrastructure
+
+  - Pausing the VM wiped its local NVMe disk. evroc's local NVMe does not
+    survive a pause or stop. It cost a re-download and rebuild. Lesson:
+    treat local NVMe as scratch, write that rule down before day one, and
+    keep the setup script fast and idempotent (ours was, which is why this
+    only cost minutes).
+  - Getting SSH in took about 15 minutes: IPv6-only by default, then a
+    firewall rule, then the first-boot driver install closed the
+    connection. Lesson: check network access and the first-boot behaviour
+    of a new VM before the event.
+  - Setup bugs only showed on the real VM: a CPU-only torch wheel in the
+    training environment, vLLM kernels that failed to JIT-build (FlashInfer
+    sampler, attention backend), and the disk mount. Lesson: a dry run of
+    setup on the actual GPU image is worth more than local tests.
+  - GitHub pushes were blocked for the first hour because the Claude app
+    was not installed on the repo. Threads handed code over as git bundles
+    in the shared folder, which worked but added friction. Lesson: connect
+    GitHub and install the app before starting.
+
+5.2 Pipeline
+
+  - Length caps silently hurt the code task. arch1's data stage dropped
+    37% of the teacher's answers for running past 1,536 tokens, and eval
+    cut answers at 1,024 tokens, so the first score was 0.364 instead of
+    0.482. Lesson: size limits must follow the task. We added `--long` and
+    made eval's cap follow the data cap, but a run should warn loudly when
+    a large share of answers is dropped.
+  - The Gemma backup student diverged to NaN at step 108 of 254 on shell1
+    and crashed quantize, even though the main model was fine. Lesson: an
+    optional candidate must never be able to fail the whole job. PR #26
+    now skips NaN steps, never saves a diverged student, and carries on
+    with the MoE alone.
+  - The first bit allocator counted depth twice and left 111 of 144 expert
+    tensors at q2_k. The fix spread bits across more layers at the same
+    size, but on the easy email task the score did not change (0.976 vs
+    0.974, within judge noise). Lesson: the email task is too easy to show
+    differences between compression settings. A harder benchmark task is
+    needed to tune them.
+  - A smoke test reported a false failure because it compared a bf16 saved
+    model with the fp32 original. Lesson: tests should compare at the
+    precision actually saved.
+  - The first fast job ran before the Gemini key was on the VM, so its first
+    score was teacher agreement (76%) rather than a judge score and had to
+    be re-run.
+
+5.3 Tools and workflow
+
+  - The live progress view dropped during long stages and gave up. Fixed in
+    PR #25 so `lobbot run` and `lobbot watch` reconnect.
+  - Oliver's Mac ran out of disk because each model was kept twice: once
+    as a downloaded GGUF and once inside Ollama. shell1 never made it into
+    Ollama for that reason. Lesson: `lobbot save` should delete or offer to
+    delete the GGUF copy once Ollama has imported it, and check free space
+    before downloading.
+  - The `lobbot` uv tool install broke on the Mac late in the day (its
+    private Python disappeared). Reinstalling with `--force` fixed it.
+  - Typing `lobbot` commands inside Ollama's `>>>` prompt sent them to the
+    model as text. A small thing, but it confused a demo session.
+  - condense.chat: its Gemini proxy only works with Vertex AI, keys are
+    only issued after an onboarding call, and its compression is
+    extractive and can drop details (it dropped "EUR" from an invoice
+    email). We kept it to one low-risk call per run. Lesson: read a
+    sponsor's API limits before planning an integration around it.
+  - The session on Oliver's Mac started out answering in a pirate voice,
+    from a local output setting. Plain English was then written into the
+    project instructions.
+
+5.4 Scope and team
+
+  - The plan changed several times in the first hour (TUI, then desktop
+    app, then iPhone app; Claude planner, then Gemini for task drafting).
+    Each change was cheap because the backend contract stayed fixed, but
+    the frontend brief had to be rewritten.
+  - The frontend and backend were never joined in the repo. derka's iPhone
+    app PR (#19) is still open, and the question of how the phone talks to
+    the model (it cannot run Ollama, so it has to reach Oliver's Mac over
+    the network) was left open. This is the biggest gap in the end-to-end
+    story. (Inferred from the open PR and the project record; the app may
+    have been wired up outside the repo.)
+  - arch2, the code task re-run with `--long`, was never trained; Oliver
+    decided to use arch1 as it was. So the benefit of `--long` on a full
+    run is still unmeasured.
+
+
+6. What to improve next time
+----------------------------
+
+Product and quality
+  - Join the app and the backend: merge or rework PR #19 and settle how the
+    phone reaches the model (local network to the Mac, or a desktop app).
+  - Pick harder benchmark tasks to tune pruning ratio and bit allocation;
+    the email task is saturated.
+  - For code tasks, run arch2 with `--long`, try a stronger teacher, and
+    add an automatic compile-and-test check to eval instead of relying only
+    on the judge.
+  - Average the judge over several runs, or report a noise band, so small
+    differences are not over-read.
+  - Measure real tok/s on more laptops instead of an estimate.
+
+Pipeline robustness
+  - Warn or stop when the data stage drops more than about 20% of answers.
+  - Keep every optional candidate isolated so it can only remove itself.
+  - Add CI so the unit tests run on every PR, not only by hand.
+  - Back job outputs up off the VM's local disk, since a pause or stop wipes
+    it.
+
+Tooling
+  - `lobbot save`: check free disk space first, and remove the duplicate
+    GGUF after a verified Ollama import.
+  - `lobbot doctor` on the Mac: detect a broken tool install and print the
+    fix.
+  - Cache the teacher weights somewhere that survives a VM restart, to
+    make a fresh VM usable in minutes.
+
+Process
+  - Before the event: GitHub app installed, VM reachable, keys in place,
+    setup script run once on the real GPU image.
+  - Keep the one-owner rule for shared files and merges; it worked.
+  - Keep a short runbook for the demo machine (which models are in Ollama,
+    disk space, the commands to run), since most late-day problems were on
+    the laptop, not the GPU.
+
+
+7. State at the end
+-------------------
+
+  - main holds the full backend, CLI and docs (last merge 15:31, PR #27).
+  - On Oliver's Mac in Ollama: at least lobbot-support-email-to-ticket
+    (fast), lobbot-support-email-to-ticket-quality and
+    lobbot-system-architecture-to-c (arch1); demo1 was saved too. shell1
+    was downloaded but not imported because the disk was full.
+  - The B200 VM was idle on the final code at 15:27. Whether it was shut
+    down afterwards is not recorded here.
+  - Open: PR #19 (iPhone app).
