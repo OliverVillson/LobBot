@@ -27,7 +27,7 @@ reaper                       # or: python -m reaper_tui
 | `/compute evroc <token> [n]` | set compute inline, `n` = GPU preset 1..5 |
 | `/model <name>`, `/prune <pct>` | choose a model, share of experts to drop (default 50) |
 
-The logo grows to the large reaper when the terminal is at least 140x64.
+The logo grows to the large reaper when the terminal is at least 150x66.
 
 ## Pipeline (mocked)
 

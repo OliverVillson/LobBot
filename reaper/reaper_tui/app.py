@@ -165,7 +165,7 @@ class Reaper(App):
     #banner { color: #ffffff; text-style: bold; padding: 0 1; height: auto; }
     #main { border: round #ffffff; border-title-align: right; border-title-style: bold;
             border-subtitle-align: left; height: auto; padding: 0 1; }
-    #left { width: 48; height: auto; }
+    #left { width: 52; height: auto; }
     #art { height: auto; }
     #who { height: auto; }
     #right { width: 1fr; height: auto; padding-left: 2; }
@@ -241,9 +241,9 @@ class Reaper(App):
         self.fit_art()
 
     def fit_art(self) -> None:
-        large = self.size.height >= 64 and self.size.width >= 140
+        large = self.size.height >= 66 and self.size.width >= 150
         self.query_one("#art", Static).update(REAPER_LARGE if large else REAPER)
-        self.query_one("#left").styles.width = 58 if large else 48
+        self.query_one("#left").styles.width = 64 if large else 52
 
     def say(self, msg: str, bold: bool = False) -> None:
         self.query_one("#log", RichLog).write(Text(msg, style="bold" if bold else ""))
