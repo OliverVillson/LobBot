@@ -11,8 +11,13 @@ or cloud providers to set up.
 ## Run
 
 ```bash
-# on the VM, once
-pip install -e reaper                          # from the LobBot checkout
+# on the VM, once (B200 / Blackwell needs a torch built for CUDA 12.8)
+git clone -b claude/project-thread-7e6em9 https://github.com/OliverVillson/LobBot.git && cd LobBot
+python3 -m venv ~/reaper-venv && . ~/reaper-venv/bin/activate
+pip install 'torch>=2.7' --index-url https://download.pytorch.org/whl/cu128
+pip install -e 'reaper[pipeline]'
+pip install vllm                               # optional: a much faster teacher
+reaper hw Qwen/Qwen3-30B-A3B-Instruct-2507     # check: GPU, driver, torch kernels and the run plan
 
 # from your laptop
 ssh -t user@vm reaper                                       # open the TUI

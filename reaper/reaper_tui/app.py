@@ -436,6 +436,9 @@ class Reaper(App):
             pipe.append(f"{bar(pct)} {pct:>3.0f}%  ")
             msg = (ev or {}).get("msg") or ("cached" if status == "skipped" else "")
             pipe.append(msg[:60], style="" if status in ("running", "error") else "dim")
+        metrics = backend.eval_line(s.stages.get("eval"))
+        if metrics:
+            pipe.append(f"\n  eval vs teacher: {metrics}")
         if s.result:
             pipe.append(f"\n☠ {s.result}", style="bold")
         self.query_one("#pipeline", Static).update(pipe)

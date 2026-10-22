@@ -34,12 +34,15 @@ async def run_pipeline(model: MoeModel, ratio: float) -> AsyncIterator[dict]:
             msg = {
                 "plan": "reading model config",
                 "weights": f"{model.id} shard {i}/{steps}",
-                "teacher": f"{i * 48} calibration answers",
-                "reap": f"layer {i * 3}/{steps * 3}" if i < steps else f"{model.experts} → {keep} experts / layer",
-                "verify": f"{i * 2} sample answers from the pruned model",
-                "package": "writing safetensors",
+                "calibrate": f"teacher: {i * 40} answers",
+                "score": f"layer {i * 3}/{steps * 3}",
+                "prune": f"{model.experts} → {keep} experts / layer" if i == steps else f"rewriting shard {i}/{steps}",
+                "eval": f"held-out {i * 2}/{steps * 2}",
+                "package": "writing model card",
             }[stage]
             yield {"stage": stage, "status": "running", "pct": round(100 * i / steps), "msg": msg}
-        yield {"stage": stage, "status": "done", "pct": 100, "msg": ""}
+        extra = ({"top1_agreement": 0.91, "kl": 0.084, "ppl_teacher": 4.12, "ppl_pruned": 4.57}
+                 if stage == "eval" else {})
+        yield {"stage": stage, "status": "done", "pct": 100, "msg": "", **extra}
     yield {"stage": "pipeline", "status": "done", "pct": 100,
            "model": f"~/.reaper/jobs/{model.id.split('/')[-1]}-prune{round(ratio * 100)}/out (demo)"}

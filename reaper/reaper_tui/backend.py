@@ -26,7 +26,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-DEFAULT_STAGES = ["plan", "weights", "teacher", "reap", "verify", "package"]
+DEFAULT_STAGES = ["plan", "weights", "calibrate", "score", "prune", "eval", "package"]
 
 
 def _module(*names: str):
@@ -237,6 +237,18 @@ def pipeline_stages() -> list[str]:
     mod = _module(name) if name else None
     stages = getattr(mod, "STAGES", None)
     return list(stages) if stages else list(DEFAULT_STAGES)
+
+
+def eval_line(ev: dict | None) -> str:
+    """The eval stage's comparison of the pruned model with the teacher, or ""."""
+    if not ev or ev.get("top1_agreement") is None:
+        return ""
+    out = f"top-1 agreement {float(ev['top1_agreement']):.0%}"
+    if ev.get("kl") is not None:
+        out += f" · KL {float(ev['kl']):.3f}"
+    if ev.get("ppl_teacher") is not None and ev.get("ppl_pruned") is not None:
+        out += f" · ppl {float(ev['ppl_teacher']):.2f} → {float(ev['ppl_pruned']):.2f}"
+    return out
 
 
 def parse_event(line: str) -> dict | None:

@@ -13,7 +13,7 @@ from reaper_tui.app import Reaper
 FAKE_PIPELINE = textwrap.dedent('''
     """Stand-in for the real reaper_pipeline: emits the progress protocol."""
     import argparse, json, pathlib, sys, time
-    STAGES = ["plan", "weights", "teacher", "reap", "verify", "package"]
+    STAGES = ["plan", "weights", "calibrate", "score", "prune", "eval", "package"]
     if __name__ == "__main__":
         ap = argparse.ArgumentParser(); ap.add_argument("--job"); job = pathlib.Path(ap.parse_args().job)
         cfg = json.loads((job / "config.json").read_text())
@@ -22,7 +22,8 @@ FAKE_PIPELINE = textwrap.dedent('''
                 print(json.dumps({"stage": st, "status": "running", "pct": pct, "msg": cfg["purpose"]}), flush=True)
                 time.sleep(0.05)
             print("some log line", flush=True)
-            print(json.dumps({"stage": st, "status": "done", "pct": 100}), flush=True)
+            extra = {"top1_agreement": 0.9, "kl": 0.05, "ppl_teacher": 4.0, "ppl_pruned": 4.4} if st == "eval" else {}
+            print(json.dumps({"stage": st, "status": "done", "pct": 100, **extra}), flush=True)
         print(json.dumps({"stage": "pipeline", "status": "done", "pct": 100, "model": str(job / "out")}), flush=True)
 ''')
 
@@ -48,6 +49,7 @@ def test_demo_cli_launch():
             assert s.model.id == "Qwen/Qwen3-30B-A3B-Instruct-2507"
             assert s.purpose == "Debugging only"
             assert all(s.stages[n]["status"] == "done" for n in s.stage_names)
+            assert backend.eval_line(s.stages["eval"]).startswith("top-1 agreement 91%")
 
     asyncio.run(run())
 
@@ -70,11 +72,12 @@ def test_settings_commands():
 def test_real_backend_run_and_reattach(tmp_path, monkeypatch):
     """Starts a (fake) pipeline module detached, tails its events, reattaches."""
     (tmp_path / "pkg" / "reaper_pipeline").mkdir(parents=True)
-    (tmp_path / "pkg" / "reaper_pipeline" / "__init__.py").write_text("STAGES = ['plan', 'weights', 'teacher', 'reap', 'verify', 'package']\n")
+    (tmp_path / "pkg" / "reaper_pipeline" / "__init__.py").write_text("STAGES = ['plan', 'weights', 'calibrate', 'score', 'prune', 'eval', 'package']\n")
     (tmp_path / "pkg" / "reaper_pipeline" / "__main__.py").write_text(FAKE_PIPELINE)
     monkeypatch.syspath_prepend(str(tmp_path / "pkg"))
     monkeypatch.setenv("PYTHONPATH", str(tmp_path / "pkg") + os.pathsep + os.environ.get("PYTHONPATH", ""))
     monkeypatch.setenv("REAPER_HOME", str(tmp_path / "home"))
+    monkeypatch.chdir(tmp_path)  # `python -m` puts the cwd first; keep the real reaper_pipeline out of the way
     monkeypatch.setattr(backend, "_nvidia_smi", lambda: [backend.Gpu("NVIDIA B200", 179.1, 10.0)])
     real_module = backend._module
     monkeypatch.setattr(backend, "_module", lambda *n: None if "reaper_hw" in n else real_module(*n))
@@ -89,6 +92,7 @@ def test_real_backend_run_and_reattach(tmp_path, monkeypatch):
                     break
             assert s.result.endswith("/out"), s.result
             assert all(s.stages[n]["status"] == "done" for n in s.stage_names)
+            assert backend.eval_line(s.stages["eval"]) == "top-1 agreement 90% · KL 0.050 · ppl 4.00 → 4.40"
             cfg = json.loads((s.run.root / "config.json").read_text())
             assert cfg["purpose"] == "Debugging only" and cfg["model"] == "Qwen/Qwen3-30B-A3B-Instruct-2507"
         # a fresh TUI picks the finished job back up
