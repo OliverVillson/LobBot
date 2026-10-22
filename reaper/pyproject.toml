@@ -5,11 +5,17 @@ description = "REAPer: prune experts out of any MoE model with REAP, from a term
 requires-python = ">=3.11"
 dependencies = ["textual>=1.0", "huggingface_hub>=0.30"]
 
+[project.optional-dependencies]
+# The pipeline that runs on the GPU machine. vLLM (for a fast teacher) is optional and
+# best installed in the same venv after torch: pip install vllm
+pipeline = ["torch>=2.7", "transformers>=4.56", "accelerate>=1.0", "safetensors>=0.4", "datasets>=3.0"]
+
 [project.scripts]
 reaper = "reaper_tui.app:main"
+reaper-pipeline = "reaper_pipeline.__main__:main"
 
 [tool.setuptools.packages.find]
-include = ["reaper_tui*"]
+include = ["reaper_tui*", "reaper_pipeline*"]
 
 [build-system]
 requires = ["setuptools>=68"]
