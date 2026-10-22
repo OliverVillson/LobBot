@@ -1,8 +1,5 @@
-"""Mocked provider calls and pipeline run. Nothing here touches the network.
-
-The pipeline yields the same progress events as LobBot's pipeline.py
-({"stage", "status", "pct", "msg"}) so the real VM pipeline can replace it later.
-"""
+"""--demo mode: a simulated B200 machine and pipeline run, for trying the TUI
+on a laptop. Events use the same protocol as the real pipeline."""
 
 from __future__ import annotations
 
@@ -10,48 +7,39 @@ import asyncio
 import random
 from typing import AsyncIterator
 
+from reaper_tui.backend import DEFAULT_STAGES, Gpu, Hardware, Plan
 from reaper_tui.catalog import MoeModel
 
-STAGES = [
-    ("provision", "start the GPU VM"),
-    ("weights", "download model weights"),
-    ("calibrate", "generate calibration data"),
-    ("score", "REAP saliency per expert"),
-    ("prune", "drop low-saliency experts"),
-    ("eval", "compare against the original"),
-    ("package", "safetensors + GGUF"),
-]
+DEMO_HW = Hardware([Gpu("NVIDIA B200", 179.1, 10.0)], 32, 256.0, 1800.0, source="demo")
 
 
-async def check_inference_key(provider_id: str, key: str) -> tuple[bool, str]:
-    await asyncio.sleep(0.6)
-    if len(key) < 12:
-        return False, "key looks too short"
-    return True, f"{provider_id}: key accepted (mock), 42 models visible"
-
-
-async def check_compute(provider_id: str, key: str, gpu: str) -> tuple[bool, str]:
-    await asyncio.sleep(0.6)
-    if len(key) < 12:
-        return False, "token looks too short"
-    return True, f"{provider_id}: {gpu} available in eu-north (mock)"
+def demo_plan(m: MoeModel | None) -> Plan:
+    if m is None:
+        return Plan(True)
+    gb = m.total_b * 2
+    if gb > 179 * 0.9:
+        return Plan(True, [f"teacher: {gb:.0f} GB bf16 does not fit, serving with fp8 (demo)",
+                           f"REAP: {gb - 165:.0f} GB of weights spill to CPU RAM (demo)"])
+    return Plan(True, ["teacher: vLLM on 1 GPU, bf16 (demo)", "REAP: weights on GPU, 8 sequences per pass (demo)",
+                       "Blackwell: prebuilt FLASH_ATTN kernels (demo)"])
 
 
 async def run_pipeline(model: MoeModel, ratio: float) -> AsyncIterator[dict]:
     keep = round(model.experts * (1 - ratio))
-    for stage, _ in STAGES:
+    for stage in DEFAULT_STAGES:
         yield {"stage": stage, "status": "running", "pct": 0, "msg": ""}
         steps = random.randint(8, 14)
         for i in range(1, steps + 1):
             await asyncio.sleep(0.12)
             msg = {
-                "provision": "booting vm",
+                "plan": "reading model config",
                 "weights": f"{model.id} shard {i}/{steps}",
-                "calibrate": f"{i * 64} samples",
-                "score": f"layer {i * 3}/{steps * 3}",
-                "prune": f"{model.experts} → {keep} experts / layer",
-                "eval": f"held-out {i * 10} answers",
-                "package": "writing tensors",
+                "teacher": f"{i * 48} calibration answers",
+                "reap": f"layer {i * 3}/{steps * 3}" if i < steps else f"{model.experts} → {keep} experts / layer",
+                "verify": f"{i * 2} sample answers from the pruned model",
+                "package": "writing safetensors",
             }[stage]
             yield {"stage": stage, "status": "running", "pct": round(100 * i / steps), "msg": msg}
         yield {"stage": stage, "status": "done", "pct": 100, "msg": ""}
+    yield {"stage": "pipeline", "status": "done", "pct": 100,
+           "model": f"~/.reaper/jobs/{model.id.split('/')[-1]}-prune{round(ratio * 100)}/out (demo)"}
