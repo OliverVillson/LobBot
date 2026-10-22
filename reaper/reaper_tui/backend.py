@@ -61,6 +61,7 @@ class Hardware:
     disk_free_gb: float
     raw: object = None  # the hardware module's own object, passed back to its plan()
     source: str = ""
+    warnings: list[str] = field(default_factory=list)
 
     @property
     def total_gpu_gb(self) -> float:
@@ -129,7 +130,8 @@ def detect_hardware() -> Hardware:
                     for g in _get(raw, "gpus", []) or []]
             cpus, ram, disk = _host()
             return Hardware(gpus, int(_get(raw, "cpus", cpus) or cpus), float(_get(raw, "ram_gb", ram) or ram),
-                            float(_get(raw, "disk_free_gb", disk) or disk), raw, mod.__name__)
+                            float(_get(raw, "disk_free_gb", disk) or disk), raw, mod.__name__,
+                            [str(w) for w in _get(raw, "warnings", []) or []])
         except Exception as e:  # a broken backend must not take the TUI down
             hw = Hardware(_nvidia_smi(), *_host(), source="nvidia-smi")
             hw.source = f"nvidia-smi ({mod.__name__} failed: {e})"
@@ -137,22 +139,75 @@ def detect_hardware() -> Hardware:
     return Hardware(_nvidia_smi(), *_host(), source="nvidia-smi")
 
 
-def plan_for(hw: Hardware, model_id: str, prune: float) -> Plan | None:
-    """The hardware module's plan for this model, or None when there is no planner."""
+def _planner():
     mod = _module("reaper_hw", "hw")
-    fn = getattr(mod, "plan", None) or getattr(mod, "make_plan", None) if mod else None
-    if fn is None:
+    fn = (getattr(mod, "plan", None) or getattr(mod, "make_plan", None)) if mod else None
+    return mod, fn
+
+
+def _sizes(mod, model_id: str):
+    """The marketplace's headline sizes as the planner's ModelInfo (no network), or None."""
+    from reaper_tui.catalog import MARKET
+    m = next((m for m in MARKET if m.id == model_id), None)
+    info = getattr(mod, "ModelInfo", None)
+    if m is None or not m.total_b or info is None or not hasattr(info, "from_sizes"):
         return None
-    try:
-        p = fn(hw.raw, model_id, prune)
-    except Exception as e:
-        return Plan(False, [], [f"planner failed: {e}"])
+    return info.from_sizes(m.id, m.total_b, m.active_b, m.experts, m.top_k)
+
+
+def _to_plan(p) -> Plan:
     return Plan(bool(_get(p, "ok", True)), list(_get(p, "notes", []) or []), list(_get(p, "problems", []) or []))
 
 
-def fits(hw: Hardware, total_b: float) -> str:
-    """Rough fit of a model's bf16 weights on this machine, for the marketplace
-    (the hardware module's plan is the real answer once a model is chosen)."""
+def plan_for(hw: Hardware, model_id: str, prune: float) -> Plan | None:
+    """The hardware module's plan for this model, or None when there is no planner.
+    Reads the model's config from the Hub; when that fails (no network, gated
+    repo) a marketplace model is planned from its headline sizes instead."""
+    mod, fn = _planner()
+    if fn is None or hw.raw is None:
+        return None
+    try:
+        p = _to_plan(fn(hw.raw, model_id, prune))
+    except Exception as e:
+        return Plan(False, [], [f"planner failed: {e}"])
+    if not p.ok and (sizes := _sizes(mod, model_id)) is not None:
+        try:
+            q = _to_plan(fn(hw.raw, sizes, prune))
+        except Exception:
+            return p
+        if q.ok or len(q.problems) < len(p.problems):
+            q.notes.insert(0, "planned from marketplace sizes (could not read the model's config.json)")
+            return q
+    return p
+
+
+def fits(hw: Hardware, total_b: float, model_id: str = "") -> str:
+    """Whether a marketplace model runs here: the hardware planner's verdict from
+    the model's headline sizes, or a rough bf16 estimate without the planner."""
+    if not hw.gpus:
+        return "no GPU"
+    mod, fn = _planner()
+    sizes = _sizes(mod, model_id) if fn and hw.raw is not None and model_id else None
+    if sizes is not None:
+        try:
+            p = fn(hw.raw, sizes, 0.5)
+        except Exception:
+            p = None
+        if p is not None:
+            if not _get(p, "ok", False):
+                return "✗"
+            reap = _get(p, "reap", {}) or {}
+            teacher = _get(p, "teacher", {}) or {}
+            if str(reap.get("placement", "")).endswith("offload"):
+                return "✓ offload"
+            if teacher.get("quantization") == "fp8":
+                return "✓ fp8"
+            n = max(len(reap.get("gpus") or []), int(teacher.get("tensor_parallel_size") or 1))
+            return f"✓ {n} GPU" + ("s" if n > 1 else "")
+    return _rough_fit(hw, total_b)
+
+
+def _rough_fit(hw: Hardware, total_b: float) -> str:
     if not hw.gpus:
         return "no GPU"
     need = total_b * 2 * 1.1

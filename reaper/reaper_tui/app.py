@@ -3,6 +3,7 @@ Run it on the GPU machine itself, over SSH:
 
     reaper                                    open the TUI
     reaper "qwen3.8-27B-A3B" "Debugging only"  find the model, prune it for that purpose, show progress
+    reaper hw [model]                         hardware report and run plan, no TUI
     reaper --demo                             simulate a B200 (no GPU needed)
 
     F2 / /setup              model, share of experts to prune, calibration set
@@ -190,7 +191,7 @@ class MarketScreen(ModalScreen[MoeModel | None]):
         t = self.query_one(DataTable)
         t.add_columns("Model", "Org", "Size", "Experts", "Released", "Fits here", "Repo")
         for m in MARKET:
-            fit = backend.fits(self.hw, m.total_b) if self.hw else "?"
+            fit = backend.fits(self.hw, m.total_b, m.id) if self.hw else "?"
             t.add_row(m.name, m.org, m.size, f"{m.experts} top-{m.top_k}", m.released, fit, m.id, key=m.id)
         t.focus()
 
@@ -389,6 +390,8 @@ class Reaper(App):
             mach.append_text(row("gpu", s.hw.gpu_line(), "✓" if s.hw.gpus else "✗"))
             mach.append("\n")
             mach.append_text(row("host", s.hw.host_line()))
+            for w in s.hw.warnings[:2]:
+                mach.append(f"\n! {w}", style="bold")
         if s.plan:
             for n in s.plan.notes[:4]:
                 mach.append(f"\n↳ {n}", style="dim")
@@ -442,7 +445,7 @@ class Reaper(App):
             mk.add_column()
         for m in MARKET[:5]:
             chosen = s.model is not None and s.model.id == m.id
-            fit = backend.fits(s.hw, m.total_b) if s.hw else ""
+            fit = backend.fits(s.hw, m.total_b, m.id) if s.hw else ""
             mk.add_row("●" if chosen else "·", Text(m.name, style="bold" if chosen else ""),
                        m.size, f"{m.experts}x{m.top_k}", fit)
         head = Text("Marketplace", style="bold underline")
@@ -564,7 +567,7 @@ class Reaper(App):
     def choose(self, m: MoeModel) -> None:
         self.state.model = m
         shape = f"{m.size}, {m.experts} experts top-{m.top_k}" if m.total_b else "not in the marketplace; shape read at plan stage"
-        fit = f", here: {backend.fits(self.state.hw, m.total_b)}" if self.state.hw and m.total_b else ""
+        fit = f", here: {backend.fits(self.state.hw, m.total_b, m.id)}" if self.state.hw and m.total_b else ""
         self.say(f"✓ model: {m.id}  ({shape}{fit})")
         self.replan()
         self.refresh_panels()
@@ -678,6 +681,13 @@ class Reaper(App):
 
 
 def main() -> None:
+    import sys
+    if sys.argv[1:2] == ["hw"]:  # `reaper hw [model] [--prune 0.5] [--json]`: the hardware report
+        try:
+            import reaper_hw
+        except ImportError:
+            sys.exit("reaper hw needs the reaper_hw package")
+        sys.exit(reaper_hw.main(sys.argv[2:]))
     ap = argparse.ArgumentParser(prog="reaper", description="REAP expert pruning for MoE models, on this machine.")
     ap.add_argument("model", nargs="?", help='model to prune, fuzzy is fine: "qwen3-30b-a3b" or org/name')
     ap.add_argument("purpose", nargs="?", default="", help='what the pruned model is for: "Debugging only"')

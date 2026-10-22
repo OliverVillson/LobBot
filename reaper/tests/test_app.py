@@ -5,6 +5,8 @@ import sys
 import textwrap
 import time
 
+import pytest
+
 from reaper_tui import backend
 from reaper_tui.app import Reaper
 
@@ -73,7 +75,8 @@ def test_real_backend_run_and_reattach(tmp_path, monkeypatch):
     monkeypatch.syspath_prepend(str(tmp_path / "pkg"))
     monkeypatch.setenv("PYTHONPATH", str(tmp_path / "pkg") + os.pathsep + os.environ.get("PYTHONPATH", ""))
     monkeypatch.setenv("REAPER_HOME", str(tmp_path / "home"))
-    monkeypatch.setattr(backend, "_nvidia_smi", lambda: [backend.Gpu("NVIDIA B200", 179.1, 10.0)])
+    monkeypatch.setattr(backend, "detect_hardware",
+                        lambda: backend.Hardware([backend.Gpu("NVIDIA B200", 179.1, 10.0)], 32, 256.0, 1800.0))
 
     async def run():
         app = Reaper(model="Qwen/Qwen3-30B-A3B-Instruct-2507", purpose="Debugging only")
@@ -110,3 +113,34 @@ def test_resolve_ranking():
     rid, others = backend.resolve_model("qwen3.8-27B-A3B", Api())
     assert rid == "Qwen/Qwen3.8-27B-A3B-Instruct"
     assert backend.resolve_model("glm 4.5 air", Api())[0] == "zai-org/GLM-4.5-Air"
+
+
+def test_machine_panel_with_reaper_hw(monkeypatch, tmp_path):
+    """With the hardware package installed: a 1x B200 is detected and planned."""
+    det = pytest.importorskip("reaper_hw.hardware")
+    smi = "0, NVIDIA B200, 183359, 182900, 10.0, GPU-b200-0, 570.124.06"
+    head = "| NVIDIA-SMI 570.124.06   Driver Version: 570.124.06   CUDA Version: 12.8 |"
+    monkeypatch.setattr(det, "_run", lambda cmd, timeout=20: head if cmd == ["nvidia-smi"] else
+                        ("" if cmd[:2] == ["nvidia-smi", "topo"] else smi))
+    monkeypatch.setattr(det, "_torch", lambda hw, probe: (setattr(hw, "torch", "2.8.0"), setattr(hw, "torch_cuda", "12.8"),
+                                                       setattr(hw, "torch_arches", ["sm_100"]), [])[-1])
+    monkeypatch.setattr(det, "_meminfo", lambda: (256.0, 240.0))
+    monkeypatch.setattr(det, "_disk_free", lambda path: 1800.0)
+    monkeypatch.setenv("REAPER_HOME", str(tmp_path))
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")  # config lookups fail fast; marketplace sizes are used
+
+    async def run():
+        app = Reaper()
+        async with app.run_test(size=(150, 52)) as pilot:
+            await _type(pilot, "/model qwen3-30b-a3b")
+            for _ in range(50):
+                await pilot.pause(0.1)
+                if app.state.plan:
+                    break
+            s = app.state
+            assert s.hw.gpus[0].cc == 10.0 and "B200" in s.hw.gpu_line()
+            assert s.plan is not None and s.plan.ok, s.plan
+            assert any("marketplace" in n for n in s.plan.notes)
+            assert backend.fits(s.hw, 30.5, "Qwen/Qwen3-30B-A3B-Instruct-2507").startswith("✓")
+
+    asyncio.run(run())
