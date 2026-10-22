@@ -74,6 +74,8 @@ def test_real_backend_run_and_reattach(tmp_path, monkeypatch):
     monkeypatch.setenv("PYTHONPATH", str(tmp_path / "pkg") + os.pathsep + os.environ.get("PYTHONPATH", ""))
     monkeypatch.setenv("REAPER_HOME", str(tmp_path / "home"))
     monkeypatch.setattr(backend, "_nvidia_smi", lambda: [backend.Gpu("NVIDIA B200", 179.1, 10.0)])
+    real_module = backend._module
+    monkeypatch.setattr(backend, "_module", lambda *n: None if "reaper_hw" in n else real_module(*n))
 
     async def run():
         app = Reaper(model="Qwen/Qwen3-30B-A3B-Instruct-2507", purpose="Debugging only")
