@@ -1,9 +1,9 @@
 [project]
 name = "reaper-tui"
-version = "0.1.0"
-description = "REAPer: prune experts out of MoE models with REAP, from a terminal UI."
+version = "0.2.0"
+description = "REAPer: prune experts out of any MoE model with REAP, from a terminal UI on the GPU machine."
 requires-python = ">=3.11"
-dependencies = ["textual>=1.0"]
+dependencies = ["textual>=1.0", "huggingface_hub>=0.30"]
 
 [project.scripts]
 reaper = "reaper_tui.app:main"
