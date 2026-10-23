@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import torch
 
-GRID = {"int8_g128": (8, 128), "int4_g128": (4, 128), "int3_g64": (3, 64), "int2_g64": (2, 64)}
+GRID = {"int8_g128": (8, 128), "int7_g128": (7, 128), "int6_g128": (6, 128), "int5_g128": (5, 128),
+        "int4_g128": (4, 128), "int3_g64": (3, 64), "int2_g64": (2, 64)}
 
 
 def _scale(w: torch.Tensor, bits: int) -> torch.Tensor:
@@ -30,12 +31,8 @@ def gptq(w: torch.Tensor, H: torch.Tensor, fmt: str, damp: float = 0.01, block: 
     return gptq_batched(w[None], H[None], fmt, damp, block)[0]
 
 
-@torch.no_grad()
-def gptq_batched(w: torch.Tensor, H: torch.Tensor, fmt: str, damp: float = 0.01, block: int = 128) -> torch.Tensor:
-    """Independent GPTQ problems in one pass, e.g. all experts of a layer: w [B, out, in],
-    H [B, in, in]. Returns the dequantized weights [B, out, in] (fp32)."""
-    bits, g = GRID[fmt]
-    assert block % g == 0
+def _prep(w: torch.Tensor, H: torch.Tensor, damp: float):
+    """Dead columns, damping and the upper Cholesky factor of H^-1 for a batch of problems."""
     W = w.float().clone()
     H = H.double().clone()
     B, _, n = W.shape
@@ -61,9 +58,13 @@ def gptq_batched(w: torch.Tensor, H: torch.Tensor, fmt: str, damp: float = 0.01,
         d = torch.where(bad, d * 3, d)
     else:
         raise RuntimeError("GPTQ: Hessian not positive definite even with heavy damping")
-    Hinv = U.float()
+    return W, U.float(), dead
+
+
+def _solve(W, Hinv, quant_col, block: int, on_col=None):
+    """The GPTQ column sweep with lazy block updates; quant_col(Wb_col, col) -> q."""
+    n = W.shape[-1]
     Q = torch.zeros_like(W)
-    s = None
     for b0 in range(0, n, block):
         b1 = min(b0 + block, n)
         Wb = W[..., b0:b1].clone()
@@ -71,12 +72,54 @@ def gptq_batched(w: torch.Tensor, H: torch.Tensor, fmt: str, damp: float = 0.01,
         Hb = Hinv[:, b0:b1, b0:b1]
         for j in range(b1 - b0):
             col = b0 + j
-            if col % g == 0:
-                s = _scale(Wb[..., j:j + g], bits)
-            q = _round(Wb[..., j:j + 1], s, bits)
+            if on_col is not None:
+                on_col(Wb, j, col)
+            q = quant_col(Wb[..., j:j + 1], col)
             Q[..., col:col + 1] = q
             e = (Wb[..., j:j + 1] - q) / Hb[:, j, j][:, None, None]
             Wb[..., j:] -= e @ Hb[:, j:j + 1, j:]
             Eb[..., j:j + 1] = e
         W[..., b1:] -= Eb @ Hinv[:, b0:b1, b1:]
+    return Q
+
+
+@torch.no_grad()
+def gptq_batched(w: torch.Tensor, H: torch.Tensor, fmt: str, damp: float = 0.01, block: int = 128) -> torch.Tensor:
+    """Independent GPTQ problems in one pass, e.g. all experts of a layer: w [B, out, in],
+    H [B, in, in]. Returns the dequantized weights [B, out, in] (fp32)."""
+    bits, g = GRID[fmt]
+    assert block % g == 0
+    W, Hinv, dead = _prep(w, H, damp)
+    st = {}
+
+    def on_col(Wb, j, col):
+        if col % g == 0:
+            st["s"] = _scale(Wb[..., j:j + g], bits)
+    Q = _solve(W, Hinv, lambda c, col: _round(c, st["s"], bits), block, on_col)
+    return Q * (~dead)[:, None, :]
+
+
+@torch.no_grad()
+def gptq_mixed(w: torch.Tensor, H: torch.Tensor, col_fmt: list[str], damp: float = 0.01,
+               block: int = 128) -> torch.Tensor:
+    """GPTQ with a format per input column (columns of one format contiguous, groups counted from
+    the start of each run). Group scales are static, taken from the weights before the sweep.
+    w [B, out, in], H [B, in, in]; the col_fmt pattern is shared by the whole batch."""
+    W, Hinv, dead = _prep(w, H, damp)
+    n = W.shape[-1]
+    assert len(col_fmt) == n
+    bits = [GRID[f][0] for f in col_fmt]
+    S = torch.empty_like(W)
+    c = 0
+    while c < n:
+        f = col_fmt[c]
+        e = c
+        while e < n and col_fmt[e] == f:
+            e += 1
+        g = GRID[f][1]
+        for a in range(c, e, g):
+            b = min(a + g, e)
+            S[..., a:b] = _scale(W[..., a:b], GRID[f][0])
+        c = e
+    Q = _solve(W, Hinv, lambda x, col: _round(x, S[..., col:col + 1], bits[col]), block)
     return Q * (~dead)[:, None, :]

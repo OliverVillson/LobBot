@@ -21,7 +21,8 @@ E2M1 = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
 FP8_MAX = 448.0
 
 BPW = {"bf16": 16.0, "fp8_block": 8.0 + 32 / 16384, "int8_g128": 8.125, "int4_g128": 4.125,
-       "mxfp4": 4.25, "nvfp4": 4.5, "int3_g64": 3.25, "int2_g64": 2.25, "drop": 0.0}
+       "mxfp4": 4.25, "nvfp4": 4.5, "int3_g64": 3.25, "int2_g64": 2.25, "drop": 0.0,
+       "int7_g128": 7.125, "int6_g128": 6.125, "int5_g128": 5.125}
 
 
 def _groups(w: torch.Tensor, g: int) -> tuple[torch.Tensor, int]:
@@ -93,5 +94,6 @@ def fake_quant(w: torch.Tensor, fmt: str) -> torch.Tensor:
         return nvfp4(w)
     if fmt == "mxfp4":
         return mxfp4(w)
-    bits, g = {"int8_g128": (8, 128), "int4_g128": (4, 128), "int3_g64": (3, 64), "int2_g64": (2, 64)}[fmt]
+    bits, g = {"int8_g128": (8, 128), "int7_g128": (7, 128), "int6_g128": (6, 128), "int5_g128": (5, 128),
+               "int4_g128": (4, 128), "int3_g64": (3, 64), "int2_g64": (2, 64)}[fmt]
     return int_sym(w, bits, g)
