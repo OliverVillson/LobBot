@@ -84,19 +84,23 @@ def _solve(W, Hinv, quant_col, block: int, on_col=None):
 
 
 @torch.no_grad()
-def gptq_batched(w: torch.Tensor, H: torch.Tensor, fmt: str, damp: float = 0.01, block: int = 128) -> torch.Tensor:
+def gptq_batched(w: torch.Tensor, H: torch.Tensor, fmt: str, damp: float = 0.01, block: int = 128,
+                 return_scales: bool = False):
     """Independent GPTQ problems in one pass, e.g. all experts of a layer: w [B, out, in],
-    H [B, in, in]. Returns the dequantized weights [B, out, in] (fp32)."""
+    H [B, in, in]. Returns the dequantized weights [B, out, in] (fp32); with return_scales also
+    the group scales [B, out, in / g], so Q / scale gives the integer codes for packing."""
     bits, g = GRID[fmt]
     assert block % g == 0
     W, Hinv, dead = _prep(w, H, damp)
-    st = {}
+    st, scales = {}, []
 
     def on_col(Wb, j, col):
         if col % g == 0:
             st["s"] = _scale(Wb[..., j:j + g], bits)
+            scales.append(st["s"])
     Q = _solve(W, Hinv, lambda c, col: _round(c, st["s"], bits), block, on_col)
-    return Q * (~dead)[:, None, :]
+    Q = Q * (~dead)[:, None, :]
+    return (Q, torch.cat(scales, -1)) if return_scales else Q
 
 
 @torch.no_grad()

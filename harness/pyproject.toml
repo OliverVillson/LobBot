@@ -1,0 +1,20 @@
+[project]
+name = "blackhole-harness"
+version = "0.1.0"
+description = "BlackHole: shrink a big open model to fit your own machine, from a terminal UI on the GPU VM."
+requires-python = ">=3.11"
+dependencies = ["textual>=1.0"]
+
+# The real pipeline (blackhole_pipeline) drives REAPer: install LobBot's reaper[pipeline] into the
+# same venv first (pip install -e ../reaper[pipeline]; vLLM optional for a fast teacher).
+
+[project.scripts]
+blackhole = "blackhole_tui.app:main"
+blackhole-pipeline = "blackhole_pipeline.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["blackhole_tui*", "blackhole_pipeline*"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
