@@ -83,28 +83,39 @@ def fit_levels(xn: torch.Tensor, wt: torch.Tensor | None, L: int, iters: int = 2
 
 
 @torch.no_grad()
-def header_quant(W: torch.Tensor, table: str, L: int = 16, block: int = 16, col_weight: torch.Tensor | None = None,
-                 shared_scale: bool = False, levels: torch.Tensor | None = None) -> torch.Tensor:
-    """W [E, out, in]. table: "e2m1" | "int" | "layer" | "expert". col_weight [E, in] (activation
-    energy per input channel) weights the k-means. Returns dequantized [E, out, in] fp32."""
+def header_parts(W: torch.Tensor, table: str, L: int = 16, block: int = 16, col_weight: torch.Tensor | None = None,
+                 shared_scale: bool = False):
+    """Per-element dequant block scales [E, out, in] and level tables [E, L] for W [E, out, in]."""
     E, o, n = W.shape
     xn, blk, pad = _blocks(W, block, shared_scale)
     dev = W.device
-    if levels is None:
-        if table == "e2m1":
-            levels = E2M1.to(dev)[None].expand(E, -1)
-        elif table == "int":
-            levels = int_levels(int(round(math.log2(L)))).to(dev)[None].expand(E, -1)
+    if table == "e2m1":
+        levels = E2M1.to(dev)[None].expand(E, -1)
+    elif table == "int":
+        levels = int_levels(int(round(math.log2(L)))).to(dev)[None].expand(E, -1)
+    else:
+        wt = None
+        if col_weight is not None:
+            cw = torch.nn.functional.pad(col_weight.float(), (0, pad)).view(E, 1, -1, block)
+            wt = (cw.expand(E, o, -1, -1) * blk.pow(2)).reshape(E, -1)    # error in weight units
+        flat = xn.reshape(E, -1)
+        if table == "layer":
+            levels = fit_levels(flat.reshape(1, -1), wt.reshape(1, -1) if wt is not None else None, L).expand(E, -1)
         else:
-            wt = None
-            if col_weight is not None:
-                cw = torch.nn.functional.pad(col_weight.float(), (0, pad)).view(E, 1, -1, block)
-                wt = (cw.expand(E, o, -1, -1) * blk.pow(2)).reshape(E, -1)    # error in weight units
-            flat = xn.reshape(E, -1)
-            if table == "layer":
-                lev = fit_levels(flat.reshape(1, -1), wt.reshape(1, -1) if wt is not None else None, L)
-                levels = lev.expand(E, -1)
-            else:
-                levels = fit_levels(flat, wt, L)
-    q = _nearest(xn, levels.contiguous().float()) * blk
-    return q.view(E, o, -1)[..., :n]
+            levels = fit_levels(flat, wt, L)
+    scales = blk.expand(-1, -1, -1, block).reshape(E, o, -1)[..., :n]
+    return scales, levels.contiguous().float()
+
+
+@torch.no_grad()
+def header_quant(W: torch.Tensor, table: str, L: int = 16, block: int = 16, col_weight: torch.Tensor | None = None,
+                 shared_scale: bool = False) -> torch.Tensor:
+    """W [E, out, in]. table: "e2m1" | "int" | "layer" | "expert". col_weight [E, in] (activation
+    energy per input channel) weights the k-means. Returns dequantized [E, out, in] fp32."""
+    scales, levels = header_parts(W, table, L, block, col_weight, shared_scale)
+    return round_to_table(W.float(), scales, levels)
+
+
+def round_to_table(W: torch.Tensor, scales: torch.Tensor, levels: torch.Tensor) -> torch.Tensor:
+    """Nearest table level per element: W, scales [E, ...], levels [E, L] sorted."""
+    return _nearest((W / scales).clamp(-1, 1), levels) * scales

@@ -123,3 +123,15 @@ def gptq_mixed(w: torch.Tensor, H: torch.Tensor, col_fmt: list[str], damp: float
         c = e
     Q = _solve(W, Hinv, lambda x, col: _round(x, S[..., col:col + 1], bits[col]), block)
     return Q * (~dead)[:, None, :]
+
+
+@torch.no_grad()
+def gptq_table(w: torch.Tensor, H: torch.Tensor, scales: torch.Tensor, levels: torch.Tensor, damp: float = 0.01,
+               block: int = 128) -> torch.Tensor:
+    """GPTQ rounding to a per-problem level table with static per-element scales (headers.py):
+    w, scales [B, out, in], H [B, in, in], levels [B, L]."""
+    from headers import round_to_table
+    W, Hinv, dead = _prep(w, H, damp)
+    S = scales.float()
+    Q = _solve(W, Hinv, lambda x, col: round_to_table(x, S[..., col:col + 1], levels), block)
+    return Q * (~dead)[:, None, :]

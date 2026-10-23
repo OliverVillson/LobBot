@@ -521,7 +521,7 @@ def expert_hessians(model, blocks, batches, H: int, diag: bool = False) -> dict:
     return out
 
 
-def headers(job: Job, pr: float, calib: int = 64) -> None:
+def headers(job: Job, pr: float, calib: int = 64, gptq: bool = False, layer_chunk: int = 12) -> None:
     """Per-expert header formats (headers.py) and REAQ on top, on the REAP-pruned model."""
     import random as _random
     import shutil
@@ -529,7 +529,8 @@ def headers(job: Job, pr: float, calib: int = 64) -> None:
     import torch
 
     import fast_prune
-    from headers import bpw, header_quant
+    from gptq import gptq_table
+    from headers import bpw, header_parts, header_quant
     from reaper_pipeline import moe
     from reaper_pipeline.load import free, input_device, load_model, load_tokenizer
     from reaper_pipeline.stages._common import batches, encode, pad_batch, profile, read_jsonl
@@ -590,6 +591,43 @@ def headers(job: Job, pr: float, calib: int = 64) -> None:
                         v["down"].copy_(qd[i].to(v["down"].dtype))
                     del gu, dn, qg, qd
 
+    def apply_gptq(spec_of):
+        """Sequential GPTQ rounding to each expert's table: Hessians per chunk of layers, each
+        chunk seeing the already-quantized earlier layers."""
+        with torch.no_grad():
+            for v_, o_ in ((views[L], orig[L]) for L in views):
+                for v, o in zip(v_, o_):
+                    for nm, w in v.items():
+                        w.copy_(o[nm].to(w.device))
+            for c0 in range(0, len(blocks), layer_chunk):
+                chunk = blocks[c0:c0 + layer_chunk]
+                hs = expert_hessians(model, chunk, cb, H)
+                for blk in chunk:
+                    Hin, Hdn = hs.pop(blk.layer)
+                    vs, os_ = views[blk.layer], orig[blk.layer]
+                    ein, edn = energy[blk.layer]
+                    groups = {}
+                    for j in range(len(vs)):
+                        groups.setdefault(tuple(sorted(spec_of(blk.layer, j).items())), []).append(j)
+                    for key, js in groups.items():
+                        sp = dict(key)
+                        jj = torch.tensor(js, device=ein.device)
+                        gu = torch.stack([torch.cat([os_[j]["gate"], os_[j]["up"]]) for j in js]).to(ein.device)
+                        dn = torch.stack([os_[j]["down"] for j in js]).to(ein.device)
+                        I = os_[js[0]]["gate"].shape[0]
+                        S, Lv = header_parts(gu, sp["table"], sp["L"], sp["block"], ein[jj], sp["shared"])
+                        qg = gptq_table(gu, Hin[jj], S, Lv)
+                        S, Lv = header_parts(dn, sp["table"], sp["L"], sp["block"], edn[jj], sp["shared"])
+                        qd = gptq_table(dn, Hdn[jj], S, Lv)
+                        for i, j in enumerate(js):
+                            v = vs[j]
+                            v["gate"].copy_(qg[i, :I].to(v["gate"].dtype))
+                            v["up"].copy_(qg[i, I:].to(v["up"].dtype))
+                            v["down"].copy_(qd[i].to(v["down"].dtype))
+                        del gu, dn, qg, qd, S, Lv
+                    del Hin, Hdn
+                del hs
+
     def spec(table, L, block=16, shared=False):
         return {"table": table, "L": L, "block": block, "shared": shared}
 
@@ -613,11 +651,24 @@ def headers(job: Job, pr: float, calib: int = 64) -> None:
     cut = n // 2
     configs.append(("random 50% 16-level, rest 8-level (control)",
                     lambda L, j: spec("expert", 16 if rrank[L][j] < cut else 8)))
+    if gptq:
+        configs = []
+        for blk_ in (32, 16):
+            configs.append((f"GPTQ + 8-level table per expert, b{blk_}", lambda L, j, b=blk_: spec("expert", 8, b)))
+            configs.append((f"GPTQ + 16-level table per expert, b{blk_}", lambda L, j, b=blk_: spec("expert", 16, b)))
+        for frac in (0.125, 0.25, 0.5):
+            cut = int(round(n * frac))
+            for meth in ("GPTQ", "RTN"):
+                configs.append((f"{meth} REAQ: top {frac:.1%} 16-level, rest 8-level, b32",
+                                lambda L, j, cut=cut: spec("expert", 16 if rank[L][j] < cut else 8, 32)))
+        cut = n // 4
+        configs.append(("GPTQ random 25% 16-level, rest 8-level, b32 (control)",
+                        lambda L, j: spec("expert", 16 if rrank[L][j] < cut else 8, 32)))
     for name, fn in configs:
         if name in out:
             continue
         t1 = time.time()
-        apply(fn)
+        (apply_gptq if name.startswith("GPTQ") else apply)(fn)
         quant_s = time.time() - t1
         r = compare(model, refs)
         any_layer = blocks[0].layer
@@ -778,6 +829,7 @@ def main() -> None:
     ap.add_argument("--frontier-only", action="store_true", help="skip every phase except the frontier")
     ap.add_argument("--headers-only", action="store_true", help="only the per-expert header formats test")
     ap.add_argument("--headers-prune", type=float, default=0.25)
+    ap.add_argument("--headers-gptq", action="store_true", help="GPTQ rounding to per-expert tables + REAQ mixes")
     ap.add_argument("--_teacher_ab", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--_teacher_variant", default=None, help=argparse.SUPPRESS)
     a = ap.parse_args()
@@ -795,7 +847,7 @@ def main() -> None:
                                 quant="none", out_name="gpu-perf-reference"))
     print(f"[gpu_perf] job {job.root}", flush=True)
     if a.headers_only:
-        headers(job, a.headers_prune)
+        headers(job, a.headers_prune, gptq=a.headers_gptq)
         summary(job)
         return
     if a.frontier_only:
