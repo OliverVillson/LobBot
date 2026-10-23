@@ -511,9 +511,10 @@ def expert_hessians(model, blocks, batches, H: int, diag: bool = False) -> dict:
                     Hdn[j].addmm_(h.T, h)
         handles.append(blk.router.register_forward_hook(hook, with_kwargs=True))
     try:
-        for ids, mask in batches:
-            state["mask"] = mask.reshape(-1).bool()
-            model(input_ids=ids, attention_mask=mask, use_cache=False, logits_to_keep=1)
+        with torch.no_grad():
+            for ids, mask in batches:
+                state["mask"] = mask.reshape(-1).bool()
+                model(input_ids=ids, attention_mask=mask, use_cache=False, logits_to_keep=1)
     finally:
         for h in handles:
             h.remove()
