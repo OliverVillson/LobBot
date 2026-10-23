@@ -13,8 +13,10 @@ KL / top-1 / ppl against the unmodified model and the real model size in GB.
             (the compensation step of FLAP / SparseGPT-style pruning)
   depth     skip the n decoder layers whose output is closest to their input
             (angular distance, Gromov et al. 2024); first and last layer are never dropped
-  quant     RTN fake quant of every decoder-layer Linear (attention + FFN): bf16, int8, int4, int3;
-            embeddings / lm_head stay bf16
+  quant     fake quant of every decoder-layer Linear (attention + FFN): bf16, int8, int4, int3 by
+            round-to-nearest (RTN), and int4 / int3 by GPTQ on the same grid (gptq.py, Hessians
+            from the dense model's calibration activations); embeddings / lm_head stay bf16
+Configs already in the results file are skipped (--redo to rerun), so a rerun only adds new rows.
 
 Quality only, nothing is timed. Results: <job>/work/dense_<model>.json and a table at the end.
 """
@@ -34,6 +36,7 @@ sys.path[:0] = [str(HERE), str(HERE.parent)]
 import torch  # noqa: E402
 
 from fakequant import BPW, fake_quant  # noqa: E402
+from gptq import gptq  # noqa: E402
 from moefy_bench import collect, find_mlps  # noqa: E402
 from reaper_pipeline.job import home  # noqa: E402
 
@@ -69,6 +72,39 @@ def layer_angles(layers, model, batches) -> list[float]:
     for h in hooks:
         h.remove()
     return [a / max(c, 1) for a, c in zip(acc, cnt)]
+
+
+SHARED = {"k_proj": "q_proj", "v_proj": "q_proj", "up_proj": "gate_proj"}   # same input, one Hessian
+
+
+def hkey(name: str) -> str:
+    head, _, leaf = name.rpartition(".")
+    return f"{head}.{SHARED.get(leaf, leaf)}"
+
+
+@torch.no_grad()
+def hessians(lin: dict, model, batches) -> dict:
+    """H = sum x x^T of each Linear's input over non-padding calibration tokens (fp32, on device)."""
+    H = {}
+    state = {"mask": None}
+    hooks = []
+    for n, m in lin.items():
+        k = hkey(n)
+        if k != n and k in lin:
+            continue
+
+        def hook(mod, args, k=k):
+            x = args[0].reshape(-1, args[0].shape[-1])[state["mask"].to(args[0].device)].float()
+            if k not in H:
+                H[k] = torch.zeros(x.shape[1], x.shape[1], device=x.device)
+            H[k].addmm_(x.T, x)
+        hooks.append(m.register_forward_pre_hook(hook))
+    for ids, mask in batches:
+        state["mask"] = mask.reshape(-1).bool()
+        model(input_ids=ids, attention_mask=mask, use_cache=False, logits_to_keep=1)
+    for h in hooks:
+        h.remove()
+    return H
 
 
 class Skip:
@@ -118,6 +154,9 @@ def main() -> None:
     ap.add_argument("--depths", default="4,8", help="numbers of decoder layers to drop")
     ap.add_argument("--formats", default="bf16,int8_g128,int4_g128,int3_g64")
     ap.add_argument("--depth-formats", default="bf16,int4_g128")
+    ap.add_argument("--gptq-formats", default="int4_g128,int3_g64")
+    ap.add_argument("--heal", action="store_true", help="also run the closed-form down_proj heal")
+    ap.add_argument("--redo", action="store_true")
     ap.add_argument("--calib", type=int, default=64)
     ap.add_argument("--tokens", type=int, default=16384, help="sampled tokens per layer for scores / heal")
     ap.add_argument("--max-seq", type=int, default=2048)
@@ -188,12 +227,23 @@ def main() -> None:
     skip = Skip(layers)
     runs = results.get("runs", {})
 
-    def run(name, base: dict, fmt: str, drop: set, width: float):
+    H = hessians(lin, model, batches) if a.gptq_formats else {}
+
+    def run(name, base: dict, fmt: str, drop: set, width: float, method: str = "rtn"):
+        if name in runs and not a.redo:
+            return
+        t1 = time.time()
         for n, m in lin.items():
             w = base.get(n, orig[n])
-            m.weight.data.copy_(w if fmt == "bf16" else fake_quant(w.float(), fmt).to(w.dtype))
+            if fmt == "bf16":
+                q = w
+            elif method == "gptq":
+                q = gptq(w, H[hkey(n)], fmt)
+            else:
+                q = fake_quant(w.float(), fmt)
+            m.weight.data.copy_(q.to(w.dtype))
+        quant_s = time.time() - t1
         skip.off = drop
-        t1 = time.time()
         r = compare(model, refs)
         kept = 0.0
         for n, w in orig.items():
@@ -203,7 +253,7 @@ def main() -> None:
         gb = kept * BPW[fmt] / 8 / 1e9 + other_gb
         runs[name] = {"top1": round(r["top1_agreement"], 4), "kl": round(r["kl"], 4), "ppl": round(r["ppl_pruned"], 3),
                       "gb": round(gb, 2), "params_kept": round((kept + total_params - lin_params) / total_params, 3),
-                      "eval_s": round(time.time() - t1, 1)}
+                      "quant_s": round(quant_s, 1), "eval_s": round(time.time() - t1 - quant_s, 1)}
         save("runs", runs, show={name: runs[name]})
 
     def width_base(frac: float, heal: bool) -> dict:
@@ -219,14 +269,20 @@ def main() -> None:
             base[f"{name}.down_proj"] = (heal_down(hs[name], Wd, keep).to(Wd.dtype) if heal else Wd * mask[None, :])
         return base
 
-    fmts = a.formats.split(",")
+    fmts = [f for f in a.formats.split(",") if f]
+    gfmts = [f for f in a.gptq_formats.split(",") if f]
     for f in fmts:
         run(f"dense {f}", {}, f, set(), 0.0)
+    for f in gfmts:
+        run(f"dense gptq-{f}", {}, f, set(), 0.0, "gptq")
     for w in [float(v) for v in a.widths.split(",") if v]:
-        for heal in (False, True):
+        for heal in ((False, True) if a.heal else (False,)):
             base = width_base(w, heal)
+            tag = f"width -{w:.1%}{' +heal' if heal else ''}"
             for f in fmts:
-                run(f"width -{w:.1%}{' +heal' if heal else ''} {f}", base, f, set(), w)
+                run(f"{tag} {f}", base, f, set(), w)
+            for f in gfmts:
+                run(f"{tag} gptq-{f}", base, f, set(), w, "gptq")
             del base
     for d in [int(v) for v in a.depths.split(",") if v]:
         for f in a.depth_formats.split(","):
@@ -239,9 +295,9 @@ def main() -> None:
     s = dict(results["setup"])
     s.pop("layer_angles")
     print(json.dumps(s))
-    print(f"{'config':40s} top1    KL      ppl      GB     params kept")
+    print(f"{'config':44s} top1    KL      ppl      GB     params kept")
     for name, r in sorted(runs.items(), key=lambda kv: kv[1]["gb"]):
-        print(f"{name:40s} {r['top1']:.3f}  {r['kl']:.4f}  {r['ppl']:7.3f}  {r['gb']:6.2f}  {r['params_kept']:9.3f}")
+        print(f"{name:44s} {r['top1']:.3f}  {r['kl']:.4f}  {r['ppl']:7.3f}  {r['gb']:6.2f}  {r['params_kept']:9.3f}")
     print(f"\nall results: {out_path}")
 
 

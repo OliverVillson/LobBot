@@ -191,3 +191,16 @@ def test_probe_and_allocator_on_a_scored_model(models):
         per_layer.setdefault(L, set()).add(f)
     assert all(len(v - {"drop"}) <= 2 for v in per_layer.values())
     print({f: sum(1 for v in alloc.choice.values() if v == f) for f in fmts})
+
+
+def test_gptq_matches_rtn_on_identity_and_beats_it_on_correlated_inputs():
+    from fakequant import fake_quant
+    from gptq import gptq
+    torch.manual_seed(0)
+    W = torch.randn(32, 256)
+    assert torch.allclose(gptq(W, torch.eye(256), "int4_g128", damp=0), fake_quant(W, "int4_g128"), atol=1e-6)
+    X = torch.randn(2048, 256) @ torch.randn(256, 256) * 0.3
+    W[:, 5:9] = 0
+    Q = gptq(W, X.T @ X, "int3_g64")
+    assert Q[:, 5:9].abs().max() == 0
+    assert ((W - Q) @ X.T).norm() < 0.9 * ((W - fake_quant(W, "int3_g64")) @ X.T).norm()
