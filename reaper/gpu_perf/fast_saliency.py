@@ -58,6 +58,9 @@ class FastSaliency:
         self.sample_gates: dict[int, list[list[torch.Tensor]]] = {}
         self._order: dict[int, str] = {}
         self._manual_ok: dict[int, bool] = {}
+        self._grouped_ok: dict[int, bool] = {}
+        self._res_batches: dict[int, int] = {}
+        self.reservoir_batches = 8  # forwards per layer that fill the reservoir through the loop path
         self._fallback = moe.Saliency.__new__(moe.Saliency)  # reuse the reference hook for odd blocks
         self._fallback.config, self._fallback.mask = self.config, None
         self._fallback.sum, self._fallback.freq, self._fallback.routed_from = {}, {}, {}
@@ -243,6 +246,8 @@ class FastSaliency:
             me._route[blk.layer] = (rx, idx, w, m)
             state["inside"] = True  # expert_forward may call the module itself (call_topk/dense)
             try:
+                if me._use_grouped(blk, x_full, idx, w):
+                    return me._grouped(blk, x_full, idx, w, record=True).reshape(hidden_states.shape)
                 out = torch.zeros_like(x_full)
                 k = idx.shape[1]
                 flat = idx.reshape(-1)
@@ -265,6 +270,77 @@ class FastSaliency:
 
         ex.forward = forward
         self._restore.append((ex, orig))
+
+    # ------------------------------------------------------------------ grouped GEMM path
+
+    def _grouped_weights(self, blk):
+        """(gate_up [E, H, 2I], down [E, I, H]) views for torch._grouped_mm, or None."""
+        ex = blk.experts
+        gu, dn = getattr(ex, "gate_up_proj", None), getattr(ex, "down_proj", None)
+        if not (isinstance(gu, torch.Tensor) and isinstance(dn, torch.Tensor) and gu.dim() == 3 and dn.dim() == 3):
+            return None
+        if any(isinstance(getattr(ex, b, None), torch.Tensor) for b in ("gate_up_proj_bias", "down_proj_bias")):
+            return None
+        H = blk.router.weight.shape[1]
+        gu = gu.transpose(1, 2) if gu.shape[-1] == H else gu      # stored [E, 2I, H] (F.linear style)
+        dn = dn.transpose(1, 2) if dn.shape[1] == H else dn       # stored [E, H, I]
+        return (gu, dn) if gu.shape[1] == H and dn.shape[-1] == H else None
+
+    def _grouped(self, blk, x, idx, w, record: bool):
+        """All routed (token, expert) pairs of the layer in two grouped GEMMs: no per-expert
+        Python loop and no host sync. Same maths as moe._manual."""
+        gu, dn = self._grouped_weights(blk)
+        E, k = blk.num_experts, idx.shape[1]
+        flat = idx.reshape(-1)
+        order = torch.argsort(flat, stable=True)
+        e_sorted = flat[order]
+        tok = order // k
+        offs = torch.cumsum(torch.bincount(flat, minlength=E), 0).to(torch.int32)
+        xs = x[tok].to(gu.dtype)
+        h = torch._grouped_mm(xs, gu, offs=offs)
+        g, u = h.chunk(2, dim=-1)
+        y = torch._grouped_mm((moe._act(blk.experts, self.config)(g) * u).to(dn.dtype), dn, offs=offs)
+        ws = w.reshape(-1)[order]
+        out = torch.zeros_like(x)
+        out.index_add_(0, tok, (ws[:, None].to(y.dtype) * y).to(out.dtype))
+        if record:
+            _, _, _, m = self._route[blk.layer]
+            a = self._acc(blk, y.device)
+            contrib = ws.float() * y.float().norm(dim=-1)
+            keep = m[tok].float() if m is not None else torch.ones_like(contrib)
+            a["sum"].index_add_(0, e_sorted, contrib * keep)
+            a["freq"].index_add_(0, e_sorted, keep)
+            if self.act_stats:
+                acc = self._acc_act(blk, "in_sq", x.shape[-1], x.device)
+                acc.index_add_(0, e_sorted, xs.float().pow(2) * keep[:, None])
+        return out
+
+    def _use_grouped(self, blk, x, idx, w) -> bool:
+        """Grouped path when torch has it, the weights fit it, the per-expert maths is proven
+        (_manual_ok) and the grouped answer matches the loop once; while the reservoir is
+        still filling, the loop path runs so it can keep samples."""
+        if self.reservoir and self._res_batches.get(blk.layer, 0) < self.reservoir_batches:
+            self._res_batches[blk.layer] = self._res_batches.get(blk.layer, 0) + 1
+            return False
+        ok = self._grouped_ok.get(blk.layer)
+        if ok is not None:
+            return ok
+        ok = False
+        if hasattr(torch, "_grouped_mm") and self._grouped_weights(blk) is not None:
+            try:
+                n = min(64, x.shape[0])
+                xi, ii, wi = x[:n], idx[:n], w[:n]
+                if self._expert(blk, int(ii[0, 0]), xi[:4]) is not None and self._manual_ok.get(blk.layer):
+                    got = self._grouped(blk, xi, ii, wi, record=False).float()
+                    ref = torch.zeros_like(xi, dtype=torch.float32)
+                    for t in range(n):
+                        for sl in range(ii.shape[1]):
+                            ref[t] += wi[t, sl].float() * moe._manual(blk, self.config, int(ii[t, sl]), xi[t:t + 1])[0].float()
+                    ok = torch.allclose(got, ref, rtol=2e-2, atol=2e-2 * (ref.abs().max().item() + 1e-6))
+            except Exception:
+                ok = False
+        self._grouped_ok[blk.layer] = ok
+        return ok
 
     def _expert(self, blk, j, x):
         """Expert j on x. The stacked-weight maths (_manual: two matmuls, no dispatch) is much

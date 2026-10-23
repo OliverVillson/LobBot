@@ -55,8 +55,9 @@ def run(model, col, ids, mask):
     return out
 
 
+@pytest.mark.parametrize("reservoir", [4, 0])  # 4: per-expert loop path, 0: grouped-GEMM path
 @pytest.mark.parametrize("arch", ARCH_LIST)
-def test_fast_saliency_matches_reference_and_keeps_outputs(models, arch):
+def test_fast_saliency_matches_reference_and_keeps_outputs(models, arch, reservoir):
     model = load(models[arch])
     ids, mask = batch()
     with torch.no_grad():
@@ -68,7 +69,7 @@ def test_fast_saliency_matches_reference_and_keeps_outputs(models, arch):
     ref.remove()
     want = ref.results()
 
-    fast = FastSaliency(model, act_stats=True, reservoir=4)
+    fast = FastSaliency(model, act_stats=True, reservoir=reservoir)
     out = run(model, fast, ids, mask)
     run(model, fast, *batch(2))
     fast.remove()
@@ -85,8 +86,9 @@ def test_fast_saliency_matches_reference_and_keeps_outputs(models, arch):
         if fast.mode[li] != "recompute":
             assert got[li]["in_sq"].shape[0] == moe.find_blocks(model)[0].num_experts
             routed = sum(1 for f in got[li]["freq"] if f > 0)
-            assert sum(1 for b in fast.samples[li] if b) == routed
-    print(arch, fast.mode, fast._order)
+            if reservoir:
+                assert sum(1 for b in fast.samples[li] if b) == routed
+    print(arch, reservoir, fast.mode, fast._grouped_ok)
 
 
 def _tensors(d):

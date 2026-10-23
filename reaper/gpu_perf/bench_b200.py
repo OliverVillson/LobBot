@@ -163,24 +163,38 @@ def score(job: Job, ref_batches: int, reservoir: int) -> None:
     ref = moe.Saliency(model, blocks)
     ref_s, _ = run(ref, pick)
     ref.remove()
+    ref2 = moe.Saliency(model, blocks)  # the same batches again: how much bf16 run-to-run noise is there?
+    run(ref2, pick)
+    ref2.remove()
     fast = FastSaliency(model, blocks)
     fast_s, _ = run(fast, pick)
     fast.remove()
-    a, b = ref.results(), fast.results()
-    max_rel = max(abs(x - y) / max(abs(x), 1e-9) for li in a for x, y in zip(a[li]["saliency"], b[li]["saliency"]) if x)
-    same_freq = all(a[li]["freq"] == b[li]["freq"] for li in a)
-    keep_overlap = sum(len(set(moe.choose_keep(a[li]["saliency"], a[li]["freq"], n_keep))
-                           & set(moe.choose_keep(b[li]["saliency"], b[li]["freq"], n_keep))) for li in a) / (n_keep * len(a))
+
+    def agree(a, b):
+        tot = sum(sum(a[li]["freq"]) for li in a)
+        return {"max_rel_saliency_diff": round(max(abs(x - y) / max(abs(x), 1e-9) for li in a
+                                                   for x, y in zip(a[li]["saliency"], b[li]["saliency"]) if x), 4),
+                "routed_pairs_moved": round(sum(abs(x - y) for li in a for x, y in zip(a[li]["freq"], b[li]["freq"]))
+                                            / 2 / max(tot, 1), 6),
+                "keep_overlap": round(sum(len(set(moe.choose_keep(a[li]["saliency"], a[li]["freq"], n_keep))
+                                              & set(moe.choose_keep(b[li]["saliency"], b[li]["freq"], n_keep)))
+                                          for li in a) / (n_keep * len(a)), 4)}
+
+    a = ref.results()
     save(job, "score_ab", {"batches": len(pick), "tokens": ntok, "batch_seqs": bs, "load_s": round(load_s, 1),
                            "no_hooks_s": round(plain_s, 2), "reference_s": round(ref_s, 2), "fast_s": round(fast_s, 2),
                            "speedup": round(ref_s / fast_s, 2), "fast_overhead_vs_plain": round(fast_s / plain_s, 2),
-                           "max_rel_saliency_diff": max_rel, "same_freq": same_freq, "keep_overlap": keep_overlap,
+                           "fast_vs_ref": agree(a, fast.results()), "ref_vs_ref": agree(a, ref2.results()),
+                           "grouped_layers": sum(1 for v in fast._grouped_ok.values() if v),
                            "modes": sorted(set(fast.mode.values()))})
-    del ref, a
+    del ref, ref2, a
 
     # full pass with the fast scorer and a reservoir for the bit probe
     full = FastSaliency(model, blocks, reservoir=reservoir)
-    full_s, full_tok = run(full, groups)
+    import random
+    order = groups[:]
+    random.Random(0).shuffle(order)  # reservoir samples from every length, not only the shortest batches
+    full_s, full_tok = run(full, order)
     full.remove()
     res = full.results()
     layers = []
@@ -243,7 +257,7 @@ def expert_views(blk, j: int, H: int) -> dict:
     return {"gate": gu[:I], "up": gu[I:], "down": dn}
 
 
-def quality(job: Job, tiers: list[int]) -> None:
+def quality(job: Job, tiers: list[int], menu: list[str], bases: list[str]) -> None:
     import torch
 
     import expert_bits as xb
@@ -253,7 +267,7 @@ def quality(job: Job, tiers: list[int]) -> None:
     from reaper_pipeline.stages._common import profile
     from reaper_pipeline.stages.eval import compare
 
-    menu = ["int2_g64", "int3_g64", "int4_g128", "int8_g128"]
+    tag = "/".join(f.split("_")[0].replace("int", "") for f in menu)
     s = job.read("work/gpu_perf_saliency.json")
     resv = torch.load(job.path("work", "gpu_perf_reservoir.pt"), weights_only=False)
     refs = torch.load(job.path("work", "teacher_ref.pt"), weights_only=False)
@@ -305,16 +319,19 @@ def quality(job: Job, tiers: list[int]) -> None:
         out["runs"][name] = r
         save(job, "quality", out)
 
-    run("pruned bf16", None)
-    for base in ("int4_g128", "int3_g64"):
+    done = (load_results(job).get("quality") or {}).get("runs", {})
+    if "pruned bf16" not in done:
+        run("pruned bf16", None)
+    for base in bases:
         uni = {(e.layer, e.j): base for e in experts}
         ua = xb._evaluate(experts, uni)
-        run(f"uniform {base}", uni, ua)
+        if f"uniform {base}" not in done:
+            run(f"uniform {base}", uni, ua)
         for nt in tiers:
             a = xb.allocate(experts, menu, ua.storage, max_tiers=nt)
-            run(f"per-expert @ {base} bytes, {nt} formats", a.choice, a)
+            run(f"per-expert [{tag}] @ {base} bytes, {nt} formats", a.choice, a)
             a = xb.allocate(experts, menu, ua.storage, traffic_bytes=ua.traffic, max_tiers=nt)
-            run(f"per-expert @ {base} bytes + traffic cap, {nt} formats", a.choice, a)
+            run(f"per-expert [{tag}] @ {base} bytes + traffic cap, {nt} formats", a.choice, a)
     apply(None)
     del model
     free()
@@ -333,7 +350,7 @@ def summary(job: Job) -> None:
     if q:
         print(f"\nquality (probe {q.get('probe_s')}s)   top1     KL      ppl     expert GB  GB/token")
         for name, x in q["runs"].items():
-            print(f"  {name:52s} {x.get('top1_agreement', 0):.3f}  {x.get('kl', 0):.4f}  {x.get('ppl_pruned', 0):6.3f}"
+            print(f"  {name:62s} {x.get('top1_agreement', 0):.3f}  {x.get('kl', 0):.4f}  {x.get('ppl_pruned', 0):6.3f}"
                   f"  {x.get('expert_gb', ''):>8}  {x.get('traffic_gb_per_tok', '')}")
     print(f"\nall results: {job.path(*RESULTS.split('/'))}")
 
@@ -348,6 +365,8 @@ def main() -> None:
     ap.add_argument("--ref-batches", type=int, default=6)
     ap.add_argument("--reservoir", type=int, default=32)
     ap.add_argument("--tiers", default="2,3")
+    ap.add_argument("--menu", default="int3_g64,int4_g128,int8_g128", help="formats the allocator may use")
+    ap.add_argument("--bases", default="int4_g128", help="uniform formats whose size budgets are compared")
     ap.add_argument("--skip", default="", help="comma list of phases to skip: teacher,score,prune,quality")
     ap.add_argument("--redo", default="", help="comma list of phases to rerun even if measured")
     ap.add_argument("--_teacher_ab", action="store_true", help=argparse.SUPPRESS)
@@ -375,7 +394,7 @@ def main() -> None:
     if "prune" not in skip and not have("prune"):
         prune(job)
     if "quality" not in skip and not have("quality"):
-        quality(job, [int(x) for x in a.tiers.split(",")])
+        quality(job, [int(x) for x in a.tiers.split(",")], a.menu.split(","), a.bases.split(","))
     summary(job)
 
 
