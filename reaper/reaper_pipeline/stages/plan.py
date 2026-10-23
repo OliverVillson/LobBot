@@ -33,6 +33,19 @@ def moe_shape(cfg: dict) -> dict:
             "quantization": (cfg.get("quantization_config") or {}).get("quant_method")}
 
 
+def adapt_to_model(prof: dict, shape: dict) -> None:
+    """Model-specific limits of the serving stack, on top of the hardware plan."""
+    if shape["model_type"] == "flint":
+        # vLLM's Flint asserts FlashInfer attention and bf16 weights and KV cache. The teacher has
+        # the GPU to itself (calibrate is its own process), and its answers need no 262k context.
+        prof.setdefault("env", {}).update({"VLLM_ATTENTION_BACKEND": "FLASHINFER", "VLLM_USE_RUST_FRONTEND": "0"})
+        t = prof.setdefault("teacher", {})
+        t.update({"quantization": None, "kv_cache_dtype": "auto", "gpu_memory_utilization": 0.9,
+                  "max_model_len": 16384})
+        prof.setdefault("notes", []).append("Flint: vLLM teacher with FlashInfer attention, bf16 weights and KV "
+                                            "cache; REAP runs REAPer's PyTorch Flint")
+
+
 def run(job: Job) -> None:
     cfg = job.config
     if not 0 < cfg.prune < 1:
@@ -47,6 +60,7 @@ def run(job: Job) -> None:
     emit(STAGE, pct=40, msg="detecting hardware")
     src = str(job.model_dir) if job.model_dir.exists() else cfg.model
     hw, prof = hardware.profile(src, cfg.prune, cfg.max_seq)
+    adapt_to_model(prof, shape)
     job.write("hardware.json", hw)
     job.write("plan.json", prof)
     log(f"hardware ({prof['source']}): {prof.get('summary', '')}")

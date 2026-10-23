@@ -20,7 +20,7 @@ python -m reaper_pipeline --job DIR --from score    # redo from a stage; finishe
 - **Events:** one JSON line per event on stdout, LobBot's protocol:
   `{"stage", "status": "running|done|error|skipped", "pct", "msg", "ts"}`.
   Every other line is a log line. Stage names are `reaper_pipeline.STAGES`:
-  `plan, weights, calibrate, score, prune, eval, package`.
+  `plan, weights, calibrate, score, prune, eval, quant, package`.
   The `eval` done event also carries `top1_agreement`, `kl`, `ppl_teacher` and `ppl_pruned`.
 - **End:** `{"stage": "pipeline", "status": "done", "model": "<output dir>"}` and
   exit code 0, or `{"stage": "pipeline", "status": "error", "msg": ...}` and exit 1.
@@ -39,6 +39,7 @@ python -m reaper_pipeline --job DIR --from score    # redo from a stage; finishe
 | score | reap | forward the calibration set through the unpruned model with REAP hooks on every router |
 | prune | reap | keep the top-n experts per layer, rewrite the checkpoint shard by shard in its own format |
 | eval | eval | pruned model vs the teacher's held-out answers: top-1 agreement, KL, perplexity, samples |
+| quant | quant | routed experts to fp8 with 128x128 block scales (`quant: "fp8-experts"`, the default), attention, routers, shared experts and the head stay bf16; written to `out/<name>-FP8/`. `quant: "none"` skips it |
 | package | package | model card, `reap_saliency.json`, `reap_eval.json` next to the weights |
 
 Each process frees the GPU when it exits, so the teacher and the REAP pass each
@@ -57,6 +58,16 @@ decides what survives. With a purpose ("Debugging only"):
 
 Without a purpose, `calib` picks a preset (`mix` = chat + code + math). Offline,
 a built-in prompt set is used and the run says so.
+
+## Flint
+
+transformers has no Flint (RecursiveSI/flint) yet, so `models/flint.py` is a
+plain PyTorch version of it (sliding/full attention with sinks, sigmoid top-6
+routing, shared expert), registered for `model_type: flint` when transformers
+does not know it. It has no KV cache, so the teacher should be vLLM (nightly
+has Flint): with the HF teacher, generation recomputes the whole sequence per
+token. Eval's `ppl_teacher` is this port's perplexity on vLLM's answers, so a
+value near 2-5 also checks the port.
 
 ## Any MoE
 

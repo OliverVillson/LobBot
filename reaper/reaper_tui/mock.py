@@ -38,6 +38,7 @@ async def run_pipeline(model: MoeModel, ratio: float) -> AsyncIterator[dict]:
                 "score": f"layer {i * 3}/{steps * 3}",
                 "prune": f"{model.experts} → {keep} experts / layer" if i == steps else f"rewriting shard {i}/{steps}",
                 "eval": f"held-out {i * 2}/{steps * 2}",
+                "quant": f"experts to fp8: shard {i}/{steps}",
                 "package": "writing model card",
             }[stage]
             yield {"stage": stage, "status": "running", "pct": round(100 * i / steps), "msg": msg}
@@ -45,4 +46,4 @@ async def run_pipeline(model: MoeModel, ratio: float) -> AsyncIterator[dict]:
                  if stage == "eval" else {})
         yield {"stage": stage, "status": "done", "pct": 100, "msg": "", **extra}
     yield {"stage": "pipeline", "status": "done", "pct": 100,
-           "model": f"~/.reaper/jobs/{model.id.split('/')[-1]}-prune{round(ratio * 100)}/out (demo)"}
+           "model": f"~/.reaper/jobs/{model.id.split('/')[-1]}-prune{round(ratio * 100)}/out/{model.id.split('/')[-1]}-REAP-{keep}e-FP8 (demo)"}

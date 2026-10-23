@@ -31,6 +31,7 @@ class MoeModel:
 
 
 MARKET = [
+    MoeModel("RecursiveSI/flint", "Flint", "Recursive", 39.8, 2.5, 256, 6, "2026-10", True),
     MoeModel("Qwen/Qwen3-30B-A3B-Instruct-2507", "Qwen3 30B A3B", "Qwen", 30.5, 3.3, 128, 8, "2025-07", True),
     MoeModel("Qwen/Qwen3-Coder-30B-A3B-Instruct", "Qwen3 Coder 30B", "Qwen", 30.5, 3.3, 128, 8, "2025-07", True),
     MoeModel("Qwen/Qwen3-Next-80B-A3B-Instruct", "Qwen3 Next 80B", "Qwen", 80, 3, 512, 10, "2025-09", True),

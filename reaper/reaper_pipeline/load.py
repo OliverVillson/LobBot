@@ -15,6 +15,9 @@ def checkpoint_config(path: str | Path) -> dict:
 
 def load_tokenizer(path, trust_remote_code: bool = False):
     from transformers import AutoTokenizer
+
+    from reaper_pipeline.models import register_all
+    register_all()
     tok = AutoTokenizer.from_pretrained(path, trust_remote_code=trust_remote_code)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
@@ -25,6 +28,9 @@ def load_model(path, prof: dict, trust_remote_code: bool = False):
     """bf16/fp16 spread over the GPUs (spilling to RAM if the plan says so), or CPU."""
     import transformers
     from transformers import AutoModelForCausalLM
+
+    from reaper_pipeline.models import register_all
+    register_all()  # Flint and other architectures transformers does not ship yet
 
     kw: dict = {"trust_remote_code": trust_remote_code}
     dkey = "dtype" if int(transformers.__version__.split(".")[0]) >= 5 else "torch_dtype"

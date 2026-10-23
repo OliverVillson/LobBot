@@ -26,6 +26,10 @@ def card(job: Job) -> str:
         f"- Size: {size(r.get('bytes_before', 0))} → {size(r.get('bytes_after', 0))}",
         "- Same tensor layout and quantization as the original, so it loads wherever the original does.",
     ]
+    q = job.read("work/quant.json")
+    if q:
+        lines += [f"- `{job.quant_dir.name}`: the routed experts in fp8 (128x128 blocks), everything else bf16: "
+                  f"{size(q['bytes_before'])} → {size(q['bytes_after'])}. Loads in vLLM, SGLang and transformers."]
     if t.get("topics"):
         lines += ["", "Sub-tasks the teacher derived from the purpose:", ""] + [f"- {x}" for x in t["topics"]]
     if "top1_agreement" in e:
@@ -45,8 +49,13 @@ def run(job: Job) -> None:
     shutil.copy2(job.path("work", "saliency.json"), out / "reap_saliency.json")
     if job.path("work", "eval.json").exists():
         shutil.copy2(job.path("work", "eval.json"), out / "reap_eval.json")
-    job.mark_done(STAGE, {"out": str(out)})
-    emit(STAGE, "done", 100, f"{out} ({size(sum(p.stat().st_size for p in out.glob('*.safetensors')))})")
+    final = job.final_dir
+    if final != out:
+        for f in ("README.md", "reap_saliency.json", "reap_eval.json"):
+            if (out / f).exists():
+                shutil.copy2(out / f, final / f)
+    job.mark_done(STAGE, {"out": str(final)})
+    emit(STAGE, "done", 100, f"{final} ({size(sum(p.stat().st_size for p in final.glob('*.safetensors')))})")
 
 
 if __name__ == "__main__":

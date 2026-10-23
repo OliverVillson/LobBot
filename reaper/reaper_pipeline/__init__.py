@@ -7,9 +7,10 @@ the unpruned model as teacher on the same machine.
 See README.md in this directory for stages, files and events.
 """
 
-STAGES = ["plan", "weights", "calibrate", "score", "prune", "eval", "package"]
+STAGES = ["plan", "weights", "calibrate", "score", "prune", "eval", "quant", "package"]
 
 # Stages that share one process (score and prune: the scored model's keep lists
 # go straight into the checkpoint rewrite). Each process frees its GPU memory on exit.
 PROCESSES = [("plan", ["plan"]), ("weights", ["weights"]), ("calibrate", ["calibrate"]),
-             ("reap", ["score", "prune"]), ("eval", ["eval"]), ("package", ["package"])]
+             ("reap", ["score", "prune"]), ("eval", ["eval"]), ("quant", ["quant"]),
+             ("package", ["package"])]

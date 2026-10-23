@@ -28,6 +28,11 @@ ARCHS = {
                      n_group=1, topk_group=1, first_k_dense_replace=1, norm_topk_prob=True,
                      routed_scaling_factor=2.5, num_hidden_layers=3),
     "minimax_m2": dict(num_local_experts=8, num_experts_per_tok=2, use_routing_bias=True),
+    # REAPer's own PyTorch Flint (reaper_pipeline.models.flint): a dense first layer, sliding
+    # layers with RoPE, a full layer without, attention sinks, sigmoid routing, shared expert
+    "flint": dict(num_experts=8, num_experts_per_tok=2, moe_intermediate_size=32, shared_expert_intermediate_size=32,
+                  num_hidden_layers=3, mlp_only_layers=[0], sliding_window=4, no_rope_layer_indices=[2],
+                  layer_types=["sliding_attention", "sliding_attention", "full_attention"]),
 }
 
 
@@ -53,6 +58,9 @@ def build(arch: str, path: Path, seed: int = 0, **over) -> Path:
     import torch
     from transformers import AutoModelForCausalLM
     from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+    from reaper_pipeline.models import register_all
+    register_all()
     torch.manual_seed(seed)
     kw = {**COMMON, **ARCHS[arch], **over}
     cfg = CONFIG_MAPPING[arch](**kw)
@@ -61,6 +69,8 @@ def build(arch: str, path: Path, seed: int = 0, **over) -> Path:
         for n, p in model.named_parameters():
             if "bias" in n and ("gate" in n or "router" in n or "correction" in n):
                 p.normal_(0, 0.5)
+            if "softmax_offset" in n or "norm" in n:  # attention sinks, norm scales
+                p.normal_(1.0 if "norm" in n else 0.0, 0.5)
         for n, b in model.named_buffers():
             if "correction_bias" in n:
                 b.normal_(0, 0.5)

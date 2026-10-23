@@ -189,12 +189,12 @@ def requests_prompt(purpose: str, topic: str, style: str, k: int) -> list[dict]:
 
 
 def purpose_prompts(teacher, purpose: str, n: int, seed: int = 0, n_topics: int = 24,
-                    per_request: int = 6, on_progress=None) -> tuple[list[str], list[str]]:
+                    per_request: int = 6, on_progress=None, max_tokens: int = 4096) -> tuple[list[str], list[str]]:
     """(prompts written by the teacher for the purpose, the sub-tasks it listed)."""
     rng = random.Random(seed)
     topics: list[str] = []
     for _ in range(3):
-        topics = [t for t in parse_list(teacher.chat([topics_prompt(purpose, n_topics)], 1024, 0.7)[0])
+        topics = [t for t in parse_list(teacher.chat([topics_prompt(purpose, n_topics)], max_tokens, 0.7)[0])
                   if len(t) < 200]
         if len(topics) >= 4:
             break
@@ -208,7 +208,7 @@ def purpose_prompts(teacher, purpose: str, n: int, seed: int = 0, n_topics: int 
         jobs = max(1, -(-int(need * 1.3) // per_request))
         convs = [requests_prompt(purpose, topics[(rnd * jobs + i) % len(topics)], rng.choice(STYLES), per_request)
                  for i in range(jobs)]
-        for text in teacher.chat(convs, 2048, 1.0):
+        for text in teacher.chat(convs, max_tokens * 3 // 2, 1.0):
             for p in parse_list(text):
                 key = _norm(p)
                 if len(p) >= 15 and key and key not in seen:
@@ -221,7 +221,7 @@ def purpose_prompts(teacher, purpose: str, n: int, seed: int = 0, n_topics: int 
 
 
 def build_prompts(teacher, purpose: str, calib: str, n: int, mix: float = 0.25, seed: int = 0,
-                  on_progress=None) -> tuple[list[dict], dict]:
+                  on_progress=None, max_tokens: int = 4096) -> tuple[list[dict], dict]:
     """Rows {"prompt", "source"} and a summary of where they came from."""
     if not purpose.strip():
         ps, note = load_prompts(calib, n, seed)
@@ -231,7 +231,8 @@ def build_prompts(teacher, purpose: str, calib: str, n: int, mix: float = 0.25, 
     n_preset = int(round(n * mix)) if preset else 0
     generated, topics = ([], [])
     if teacher is not None:
-        generated, topics = purpose_prompts(teacher, purpose, n - n_preset, seed, on_progress=on_progress)
+        generated, topics = purpose_prompts(teacher, purpose, n - n_preset, seed, on_progress=on_progress,
+                                            max_tokens=max_tokens)
     if not generated:
         topics = []  # the teacher wrote nothing usable; do not report its fallback topic
     rows = [{"prompt": p, "source": "teacher"} for p in generated]

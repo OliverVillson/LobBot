@@ -13,7 +13,7 @@ from reaper_tui.app import Reaper
 FAKE_PIPELINE = textwrap.dedent('''
     """Stand-in for the real reaper_pipeline: emits the progress protocol."""
     import argparse, json, pathlib, sys, time
-    STAGES = ["plan", "weights", "calibrate", "score", "prune", "eval", "package"]
+    STAGES = ["plan", "weights", "calibrate", "score", "prune", "eval", "quant", "package"]
     if __name__ == "__main__":
         ap = argparse.ArgumentParser(); ap.add_argument("--job"); job = pathlib.Path(ap.parse_args().job)
         cfg = json.loads((job / "config.json").read_text())
@@ -58,10 +58,10 @@ def test_settings_commands():
     async def run():
         app = Reaper(demo=True)
         async with app.run_test(size=(150, 52)) as pilot:
-            for cmd in ["/model gpt-oss 20b", "/prune 25", "/purpose SQL only", "/samples 256"]:
+            for cmd in ["/model gpt-oss 20b", "/prune 25", "/purpose SQL only", "/samples 256", "/quant none"]:
                 await _type(pilot, cmd)
             s = app.state
-            assert s.model.id == "openai/gpt-oss-20b" and s.ratio == 0.25
+            assert s.model.id == "openai/gpt-oss-20b" and s.ratio == 0.25 and s.quant == "none"
             assert s.purpose == "SQL only" and s.samples == 256
             await _type(pilot, "/model someorg/Some-New-MoE")
             assert s.model.id == "someorg/Some-New-MoE"
@@ -72,7 +72,7 @@ def test_settings_commands():
 def test_real_backend_run_and_reattach(tmp_path, monkeypatch):
     """Starts a (fake) pipeline module detached, tails its events, reattaches."""
     (tmp_path / "pkg" / "reaper_pipeline").mkdir(parents=True)
-    (tmp_path / "pkg" / "reaper_pipeline" / "__init__.py").write_text("STAGES = ['plan', 'weights', 'calibrate', 'score', 'prune', 'eval', 'package']\n")
+    (tmp_path / "pkg" / "reaper_pipeline" / "__init__.py").write_text("STAGES = ['plan', 'weights', 'calibrate', 'score', 'prune', 'eval', 'quant', 'package']\n")
     (tmp_path / "pkg" / "reaper_pipeline" / "__main__.py").write_text(FAKE_PIPELINE)
     monkeypatch.syspath_prepend(str(tmp_path / "pkg"))
     monkeypatch.setenv("PYTHONPATH", str(tmp_path / "pkg") + os.pathsep + os.environ.get("PYTHONPATH", ""))

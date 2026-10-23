@@ -76,6 +76,7 @@ class State:
     purpose: str = ""
     calib: str = "mix"
     samples: int = 512
+    quant: str = "fp8-experts"
     stage_names: list[str] = field(default_factory=lambda: list(backend.DEFAULT_STAGES))
     stages: dict[str, dict] = field(default_factory=dict)
     run: Run | None = None
@@ -86,7 +87,7 @@ class State:
 
     def settings(self) -> dict:
         return {"model": self.model.id, "purpose": self.purpose, "prune": self.ratio, "calib": self.calib,
-                "calib_samples": self.samples}
+                "calib_samples": self.samples, "quant": self.quant}
 
 
 def bar(pct: float, width: int = 12) -> str:
@@ -247,13 +248,15 @@ class Reaper(App):
     ]
 
     def __init__(self, demo: bool = False, model: str | None = None, purpose: str = "",
-                 prune: float | None = None, samples: int | None = None):
+                 prune: float | None = None, samples: int | None = None, quant: str | None = None):
         super().__init__()
         self.state = State(demo=demo, purpose=purpose)
         if prune is not None:
             self.state.ratio = prune
         if samples is not None:
             self.state.samples = samples
+        if quant is not None:
+            self.state.quant = quant
         self.launch_query = model  # `reaper "<model>" "<purpose>"`: resolve, then start
         self.launch_ready = {"hw": demo, "model": False}
         self.session = datetime.now().strftime("%Y%m%d_%H%M%S_") + secrets.token_hex(3)
@@ -418,6 +421,8 @@ class Reaper(App):
             setup.append("\n")
         calib = "built from the purpose" if s.purpose else s.calib
         setup.append_text(row("calibration", f"{calib} · {s.samples} samples · teacher on this GPU"))
+        setup.append("\n")
+        setup.append_text(row("quant", "routed experts to fp8, the rest bf16" if s.quant == "fp8-experts" else "none (bf16)"))
         self.query_one("#setup", Static).update(setup)
 
         pipe = Text()
@@ -487,6 +492,7 @@ class Reaper(App):
             s.calib = cfg.get("calib", s.calib)
             s.purpose = cfg.get("purpose", s.purpose) or ""
             s.samples = int(cfg.get("calib_samples", s.samples))
+            s.quant = cfg.get("quant", s.quant)
         for ev, line in run.replay():
             self.apply(ev, line, quiet=True)
         s.running = run.running()
@@ -677,6 +683,10 @@ class Reaper(App):
             case "/samples" if args and args[0].isdigit():
                 s.samples = int(args[0])
                 self.refresh_panels()
+            case "/quant" if args and args[0] in ("fp8-experts", "fp8", "none", "off"):
+                s.quant = "none" if args[0] in ("none", "off") else "fp8-experts"
+                self.say(f"✓ quant: {s.quant}")
+                self.refresh_panels()
             case "/quit" | "/exit":
                 self.exit()
             case _:
@@ -696,9 +706,10 @@ def main() -> None:
     ap.add_argument("purpose", nargs="?", default="", help='what the pruned model is for: "Debugging only"')
     ap.add_argument("--prune", type=parse_pct, help="share of experts to drop, e.g. 50 or 0.5 (default 50)")
     ap.add_argument("--samples", type=int, help="calibration samples (default 512)")
+    ap.add_argument("--quant", choices=["fp8-experts", "none"], help="after pruning: routed experts to fp8 (default) or none")
     ap.add_argument("--demo", action="store_true", help="simulate a B200 and a run (no GPU needed)")
     a = ap.parse_args()
-    Reaper(demo=a.demo, model=a.model, purpose=a.purpose, prune=a.prune, samples=a.samples).run()
+    Reaper(demo=a.demo, model=a.model, purpose=a.purpose, prune=a.prune, samples=a.samples, quant=a.quant).run()
 
 
 if __name__ == "__main__":

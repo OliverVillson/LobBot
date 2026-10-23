@@ -41,7 +41,7 @@ def test_routing_and_expert_outputs_rebuild_the_moe_output(models, arch):
     model = load(models[arch])
     blocks = moe.find_blocks(model)
     cfg = json.loads((models[arch] / "config.json").read_text())
-    dense_first = cfg.get("first_k_dense_replace", 0)
+    dense_first = cfg.get("first_k_dense_replace", 0) + len(cfg.get("mlp_only_layers") or [])
     assert len(blocks) == cfg["num_hidden_layers"] - dense_first
     assert all(b.num_experts == 8 for b in blocks)
 
@@ -299,3 +299,54 @@ def test_modulelist_experts_and_tuple_or_logit_routers(kimi, tmp_path):
     with torch.no_grad():
         torch.testing.assert_close(small.eval()(h), ref)
     assert json.loads((tmp_path / "out" / "config.json").read_text())["n_routed_experts"] == 3
+
+
+def test_flint_attention_padding_window_and_sinks(models):
+    """REAPer's Flint: left padding changes nothing, the window cuts off old tokens,
+    and a large sink logit soaks up the attention."""
+    from reaper_pipeline.models.flint import FlintAttention
+    model = load(models["flint"])
+    x = ids(10)
+    with torch.no_grad():
+        ref = model(input_ids=x).logits
+        pad = torch.cat([torch.zeros(2, 3, dtype=torch.long), x], 1)
+        mask = torch.cat([torch.zeros(2, 3, dtype=torch.long), torch.ones_like(x)], 1)
+        got = model(input_ids=pad, attention_mask=mask).logits[:, 3:]
+    torch.testing.assert_close(got, ref, rtol=1e-4, atol=1e-4)
+
+    attn = next(m for m in model.modules() if isinstance(m, FlintAttention) and m.window)
+    h = torch.randn(1, 9, model.config.hidden_size)
+    pos, keys = torch.arange(9)[None], torch.ones(1, 9, dtype=torch.bool)
+    with torch.no_grad():
+        full = attn(h, pos, keys)
+        h2 = h.clone()
+        h2[:, 0] += 5.0  # token 0 is outside the last query's window (4)
+        assert torch.allclose(attn(h2, pos, keys)[:, -1], full[:, -1], atol=1e-5)
+        assert not torch.allclose(attn(h2, pos, keys)[:, 1], full[:, 1], atol=1e-5)
+        attn.softmax_offset.fill_(80.0)
+        assert attn(h, pos, keys).abs().max() < 1e-6
+
+
+def test_expert_fp8_quant(models, tmp_path):
+    """Only the routed experts become block fp8, the scales dequantize them back closely,
+    and the config lists every other linear layer as kept in bf16."""
+    from safetensors.torch import load_file
+
+    from reaper_pipeline import quant
+    src = models["qwen3_moe"]
+    info = quant.quantize_experts(src, tmp_path / "q")
+    assert info["bytes_after"] < info["bytes_before"] and info["expert_weights"] == 2 * 8 * 3
+    orig, got = {}, {}
+    for f in src.glob("*.safetensors"):
+        orig.update(load_file(f))
+    for f in (tmp_path / "q").glob("*.safetensors"):
+        got.update(load_file(f))
+    k = "model.layers.1.mlp.experts.5.down_proj.weight"
+    assert got[k].dtype == torch.float8_e4m3fn
+    back = quant.dequantize_block_fp8(got[k], got[k[:-6] + "weight_scale_inv"])
+    assert (back - orig[k].float()).abs().max() <= orig[k].float().abs().max() * 0.07
+    assert got["model.layers.1.self_attn.q_proj.weight"].dtype == orig["model.layers.1.self_attn.q_proj.weight"].dtype
+    q = json.loads((tmp_path / "q" / "config.json").read_text())["quantization_config"]
+    assert q["quant_method"] == "fp8" and q["weight_block_size"] == [128, 128]
+    assert "model.layers.1.mlp.gate" in q["ignored_layers"] and "lm_head" in q["ignored_layers"]
+    assert not any(".experts." in m for m in q["ignored_layers"])

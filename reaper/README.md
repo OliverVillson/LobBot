@@ -41,6 +41,7 @@ stop it, and the next `reaper` reattaches to it.
 | `F3`, `/market` | MoE marketplace, with whether each model fits this machine |
 | `F5`, `/reap` | start the pipeline (`/reap --force` past a failed hardware check) |
 | `/model <name or id>`, `/purpose <text>`, `/prune <pct>` | change the run inline |
+| `/quant fp8-experts\|none`, `--quant` | after pruning, store the routed experts in fp8 (default) or leave the model in bf16 |
 | `/hw` | detect the hardware again and show the plan |
 | `/stop`, `/logs`, `/quit` | stop the run, show the last log lines, leave the TUI |
 
@@ -60,7 +61,7 @@ packages exist, the TUI reads `nvidia-smi` itself and refuses to start a run
   `ram_gb` and `disk_free_gb`. `plan(hardware, model_id, prune)` returns `ok`,
   `notes` (what was adapted, shown under Machine) and `problems`.
 - **Pipeline:** `python -m reaper_pipeline --job DIR` with `DIR/config.json` =
-  `{"model", "purpose", "prune", "calib", "calib_samples"}`. It prints one JSON
+  `{"model", "purpose", "prune", "calib", "calib_samples", "quant"}`. It prints one JSON
   event per line (`{"stage", "status", "pct", "msg"}`, LobBot's protocol) and
   ends with `{"stage": "pipeline", "status": "done", "model": "<output dir>"}`.
   A module-level `STAGES` list names the stages, and SIGTERM stops a run.

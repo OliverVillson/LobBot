@@ -59,17 +59,18 @@ def test_parse_list_handles_json_and_bullets():
     assert calib.parse_list("1. first one\n2) second\n- third") == ["first one", "second", "third"]
 
 
-def test_full_run_on_a_tiny_moe(tmp_path):
+@pytest.mark.parametrize("arch", ["qwen3_moe", "flint"])
+def test_full_run_on_a_tiny_moe(tmp_path, arch):
     pytest.importorskip("torch")
     pytest.importorskip("transformers")
     sys.path.insert(0, str(Path(__file__).parent))
     from tiny_moe import build
-    model = build("qwen3_moe", tmp_path / "qwen3-tiny")
+    model = build(arch, tmp_path / f"{arch}-tiny")
     job = tmp_path / "job"
     job.mkdir()
     (job / "config.json").write_text(json.dumps({
         "model": str(model), "purpose": "Debugging only", "prune": 0.5, "calib": "mix", "calib_samples": 8,
-        "heldout": 4, "max_seq": 96, "answer_max_tokens": 12, "teacher_backend": "hf"}))
+        "heldout": 4, "max_seq": 96, "answer_max_tokens": 12, "writer_max_tokens": 24, "teacher_backend": "hf"}))
     env = {**os.environ, "PYTHONPATH": str(ROOT), "REAPER_HW": "builtin", "HF_HUB_OFFLINE": "1", "HF_DATASETS_OFFLINE": "1",
            "REAPER_HOME": str(tmp_path / "home")}
     p = subprocess.run([sys.executable, "-m", "reaper_pipeline", "--job", str(job)], env=env, cwd=tmp_path,
@@ -82,6 +83,7 @@ def test_full_run_on_a_tiny_moe(tmp_path):
     assert (out / "config.json").exists() and (out / "README.md").exists()
     cfg = json.loads((out / "config.json").read_text())
     assert 4 in (cfg.get("num_experts"), cfg.get("num_local_experts"))
+    assert out.name.endswith("-FP8") and cfg["quantization_config"]["quant_method"] == "fp8"
     ev = json.loads((job / "work" / "eval.json").read_text())
     assert 0 <= ev["top1_agreement"] <= 1 and ev["loads"]
 

@@ -26,7 +26,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-DEFAULT_STAGES = ["plan", "weights", "calibrate", "score", "prune", "eval", "package"]
+DEFAULT_STAGES = ["plan", "weights", "calibrate", "score", "prune", "eval", "quant", "package"]
 
 
 def _module(*names: str):

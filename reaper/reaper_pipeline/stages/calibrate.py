@@ -34,7 +34,8 @@ def run(job: Job) -> None:
     emit(STAGE, pct=5, msg=f"teacher writing {what}" if cfg.purpose.strip() else f"loading {what}")
     rows, info = calib.build_prompts(
         teacher, cfg.purpose, cfg.calib, n, cfg.purpose_mix, cfg.seed,
-        on_progress=lambda got, of: emit(STAGE, pct=5 + 35 * got / of, msg=f"{got}/{of} prompts written"))
+        on_progress=lambda got, of: emit(STAGE, pct=5 + 35 * got / of, msg=f"{got}/{of} prompts written"),
+        max_tokens=cfg.writer_max_tokens)
     log(f"calibration: {info['note']}")
     if info.get("topics"):
         log("sub-tasks: " + "; ".join(info["topics"]))

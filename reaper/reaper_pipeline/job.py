@@ -39,9 +39,11 @@ class Config:
     prune: float = 0.5               # share of routed experts dropped in every MoE layer
     calib: str = "mix"               # mix | chat | code | math | builtin | path to .jsonl/.txt prompts
     calib_samples: int = 512         # calibration sequences REAP is scored on
+    quant: str = "fp8-experts"       # fp8-experts (routed experts to block fp8, the rest bf16) | none
     heldout: int = 32                # teacher answers kept back for eval
     max_seq: int = 2048              # tokens per calibration sequence
     answer_max_tokens: int = 1024    # teacher answer length cap
+    writer_max_tokens: int = 4096    # teacher budget for writing the purpose's sub-tasks and prompts (room to reason)
     teacher_answers: bool = True     # calibrate on prompt + teacher answer (False: prompts only)
     teacher_backend: str = "auto"    # auto (vLLM when installed and on GPU, else transformers) | vllm | hf
     purpose_mix: float = 0.25        # share of a purpose's prompts taken from the closest public preset
@@ -113,6 +115,16 @@ class Job:
             return self.path("out", self.config.out_name)
         n = (self.read("work/reap.json") or {}).get("experts_kept")
         return self.path("out", Path(self.config.model).name + (f"-REAP-{n}e" if n else "-REAP"))
+
+    @property
+    def quant_dir(self) -> Path:
+        """The pruned model with its experts in fp8 (the quant stage writes it)."""
+        return self.out_dir.with_name(self.out_dir.name + "-FP8")
+
+    @property
+    def final_dir(self) -> Path:
+        q = self.quant_dir
+        return q if (q / "config.json").exists() and self.is_done("quant") else self.out_dir
 
     def read(self, rel: str):
         p = self.path(rel)

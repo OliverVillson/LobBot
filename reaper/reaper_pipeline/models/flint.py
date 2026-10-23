@@ -1,0 +1,296 @@
+"""Recursive's Flint (RecursiveSI/flint) in plain PyTorch, for REAP scoring and eval.
+
+transformers has no Flint yet, so REAPer registers this one for model_type
+"flint" (only when transformers does not know it). Written from the vLLM
+implementation's semantics and the checkpoint's tensor names:
+
+- 49 layers; `layer_types` picks sliding (window 513, counting the current
+  token) or full attention; layers in `no_rope_layer_indices` (the full ones)
+  use no positional encoding, the others NeoX RoPE.
+- GQA attention with per-head q/k RMSNorm before RoPE and one learned sink
+  logit per head (`self_attn.softmax_offset`), added to the softmax
+  denominator.
+- `mlp_only_layers` have a dense SwiGLU MLP; the others a MoE block: router
+  `mlp.gate` [E, H], sigmoid scores, top-k, renormalised over the chosen
+  experts; per-expert SwiGLU `mlp.experts.<j>.{gate,up,down}_proj`; an
+  ungated shared expert `mlp.shared_expert`.
+- RMSNorm in fp32. The LM head runs in the model dtype (the reference uses
+  fp32): REAP never reads the logits, and fp32 logits of a 150k vocabulary
+  over a full calibration batch would cost tens of GB.
+
+No KV cache: forward always sees the whole sequence (generation recomputes;
+use vLLM for long generations). The router returns (logits, weights, ids), so
+REAP reads Flint's routing exactly as the model applies it.
+"""
+
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from transformers import GenerationMixin, PreTrainedConfig, PreTrainedModel
+from transformers.modeling_outputs import CausalLMOutputWithPast
+
+Q_CHUNK = 1024  # query rows per attention chunk (bounds the [heads, q, k] score matrix)
+
+
+class FlintConfig(PreTrainedConfig):
+    model_type = "flint"
+    keys_to_ignore_at_inference = ["past_key_values"]
+
+    def __init__(self, vocab_size=150144, hidden_size=2048, intermediate_size=6144, num_hidden_layers=49,
+                 num_attention_heads=32, num_key_value_heads=4, head_dim=128, hidden_act="silu",
+                 max_position_embeddings=262144, initializer_range=0.02, rms_norm_eps=1e-6, use_cache=False,
+                 tie_word_embeddings=False, rope_theta=10000.0, rope_parameters=None, attention_bias=False,
+                 attention_dropout=0.0, use_sliding_window=True, sliding_window=513, layer_types=None,
+                 no_rope_layer_indices=None, moe_intermediate_size=512, shared_expert_intermediate_size=1024,
+                 num_experts_per_tok=6, num_experts=256, norm_topk_prob=True, router_score_function="sigmoid",
+                 mlp_only_layers=None, **kwargs):
+        self.vocab_size = vocab_size
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.num_hidden_layers = num_hidden_layers
+        self.num_attention_heads = num_attention_heads
+        self.num_key_value_heads = num_key_value_heads
+        self.head_dim = head_dim
+        self.hidden_act = hidden_act
+        self.max_position_embeddings = max_position_embeddings
+        self.initializer_range = initializer_range
+        self.rms_norm_eps = rms_norm_eps
+        self.use_cache = use_cache
+        self.rope_theta = (rope_parameters or {}).get("rope_theta", rope_theta)
+        self.rope_parameters = rope_parameters or {"rope_type": "default", "rope_theta": rope_theta}
+        self.attention_bias = attention_bias
+        self.attention_dropout = attention_dropout
+        self.use_sliding_window = use_sliding_window
+        self.sliding_window = sliding_window if use_sliding_window else None
+        self.layer_types = layer_types or ["full_attention"] * num_hidden_layers
+        self.no_rope_layer_indices = list(no_rope_layer_indices or [])
+        self.moe_intermediate_size = moe_intermediate_size
+        self.shared_expert_intermediate_size = shared_expert_intermediate_size
+        self.num_experts_per_tok = num_experts_per_tok
+        self.num_experts = num_experts
+        self.norm_topk_prob = norm_topk_prob
+        self.router_score_function = router_score_function
+        self.mlp_only_layers = list(mlp_only_layers or [])
+        super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
+
+
+class FlintRMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.eps = eps
+
+    def forward(self, x):
+        h = x.float()
+        h = h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + self.eps)
+        return (h * self.weight.float()).to(x.dtype)
+
+
+class FlintMLP(nn.Module):
+    def __init__(self, hidden: int, inter: int):
+        super().__init__()
+        self.gate_proj = nn.Linear(hidden, inter, bias=False)
+        self.up_proj = nn.Linear(hidden, inter, bias=False)
+        self.down_proj = nn.Linear(inter, hidden, bias=False)
+
+    def forward(self, x):
+        return self.down_proj(F.silu(self.gate_proj(x).float()).to(x.dtype) * self.up_proj(x))
+
+
+class FlintRouter(nn.Module):
+    """Sigmoid top-k router. Returns (logits [N, E], weights [N, k], ids [N, k])."""
+
+    def __init__(self, config: FlintConfig):
+        super().__init__()
+        self.weight = nn.Parameter(torch.zeros(config.num_experts, config.hidden_size))
+        self.top_k = config.num_experts_per_tok
+        self.norm = config.norm_topk_prob
+        if config.router_score_function != "sigmoid":
+            raise NotImplementedError(f"Flint router {config.router_score_function!r}")
+
+    def forward(self, x):
+        logits = F.linear(x, self.weight).float()
+        s, ids = torch.sigmoid(logits).topk(self.top_k, dim=-1)
+        if self.norm:
+            s = s / (s.sum(-1, keepdim=True) + 1e-20)
+        return logits, s.to(x.dtype), ids
+
+
+class FlintSparseMoeBlock(nn.Module):
+    def __init__(self, config: FlintConfig):
+        super().__init__()
+        self.top_k = config.num_experts_per_tok
+        self.gate = FlintRouter(config)
+        self.experts = nn.ModuleList(FlintMLP(config.hidden_size, config.moe_intermediate_size)
+                                     for _ in range(config.num_experts))
+        self.shared_expert = FlintMLP(config.hidden_size, config.shared_expert_intermediate_size)
+
+    def forward(self, x):
+        shape = x.shape
+        h = x.reshape(-1, shape[-1])
+        _, w, ids = self.gate(h)
+        out = torch.zeros(h.shape, dtype=torch.float32, device=h.device)
+        for j in torch.unique(ids).tolist():
+            tok, slot = torch.where(ids == j)
+            out.index_add_(0, tok, (self.experts[j](h[tok]) * w[tok, slot, None]).float())
+        return (out.to(x.dtype) + self.shared_expert(h)).reshape(shape)
+
+
+def _rope(x, pos, theta: float):
+    """NeoX rotary embedding on [B, heads, T, D] with positions [B, T]."""
+    d = x.shape[-1]
+    inv = 1.0 / (theta ** (torch.arange(0, d, 2, device=x.device, dtype=torch.float32) / d))
+    ang = pos.float()[:, None, :, None] * inv
+    cos, sin = ang.cos(), ang.sin()
+    x1, x2 = x.float()[..., : d // 2], x.float()[..., d // 2:]
+    return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], -1).to(x.dtype)
+
+
+class FlintAttention(nn.Module):
+    def __init__(self, config: FlintConfig, layer_idx: int):
+        super().__init__()
+        H, D = config.num_attention_heads, config.head_dim
+        self.nh, self.nkv, self.d = H, config.num_key_value_heads, D
+        self.q_proj = nn.Linear(config.hidden_size, H * D, bias=config.attention_bias)
+        self.k_proj = nn.Linear(config.hidden_size, self.nkv * D, bias=config.attention_bias)
+        self.v_proj = nn.Linear(config.hidden_size, self.nkv * D, bias=config.attention_bias)
+        self.o_proj = nn.Linear(H * D, config.hidden_size, bias=False)
+        self.q_norm = FlintRMSNorm(D, config.rms_norm_eps)
+        self.k_norm = FlintRMSNorm(D, config.rms_norm_eps)
+        self.softmax_offset = nn.Parameter(torch.zeros(H, dtype=torch.float32))
+        self.rope = layer_idx not in config.no_rope_layer_indices
+        self.theta = float(config.rope_parameters.get("rope_theta", config.rope_theta))
+        sliding = config.layer_types[layer_idx] == "sliding_attention"
+        self.window = config.sliding_window if sliding else None
+        self.scale = D ** -0.5
+
+    def forward(self, x, pos, key_mask):
+        B, T, _ = x.shape
+        q = self.q_norm(self.q_proj(x).view(B, T, self.nh, self.d)).transpose(1, 2)
+        k = self.k_norm(self.k_proj(x).view(B, T, self.nkv, self.d)).transpose(1, 2)
+        v = self.v_proj(x).view(B, T, self.nkv, self.d).transpose(1, 2)
+        if self.rope:
+            q, k = _rope(q, pos, self.theta), _rope(k, pos, self.theta)
+        rep = self.nh // self.nkv
+        k = k.repeat_interleave(rep, 1).float()
+        v = v.repeat_interleave(rep, 1).float()
+        sink = self.softmax_offset.float().view(1, self.nh, 1, 1)
+        kpos = torch.arange(T, device=x.device)
+        out = torch.empty(B, self.nh, T, self.d, device=x.device, dtype=torch.float32)
+        for a in range(0, T, Q_CHUNK):
+            b = min(T, a + Q_CHUNK)
+            s = torch.matmul(q[:, :, a:b].float(), k.transpose(-1, -2)) * self.scale
+            qpos = kpos[a:b, None]
+            allowed = kpos[None, :] <= qpos
+            if self.window:
+                allowed &= kpos[None, :] > qpos - self.window
+            allowed = allowed[None, None] & key_mask[:, None, None, :]
+            s = s.masked_fill(~allowed, float("-inf"))
+            m = torch.maximum(s.amax(-1, keepdim=True), sink)
+            p = torch.exp(s - m)
+            out[:, :, a:b] = torch.matmul(p, v) / (p.sum(-1, keepdim=True) + torch.exp(sink - m))
+        out = out.to(x.dtype).transpose(1, 2).reshape(B, T, self.nh * self.d)
+        return self.o_proj(out)
+
+
+class FlintDecoderLayer(nn.Module):
+    def __init__(self, config: FlintConfig, layer_idx: int):
+        super().__init__()
+        self.self_attn = FlintAttention(config, layer_idx)
+        self.mlp = (FlintMLP(config.hidden_size, config.intermediate_size) if layer_idx in config.mlp_only_layers
+                    else FlintSparseMoeBlock(config))
+        self.input_layernorm = FlintRMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.post_attention_layernorm = FlintRMSNorm(config.hidden_size, config.rms_norm_eps)
+
+    def forward(self, x, pos, key_mask):
+        x = x + self.self_attn(self.input_layernorm(x), pos, key_mask)
+        return x + self.mlp(self.post_attention_layernorm(x))
+
+
+class FlintPreTrainedModel(PreTrainedModel):
+    config_class = FlintConfig
+    base_model_prefix = "model"
+    _no_split_modules = ["FlintDecoderLayer"]
+    _supports_cache_class = False
+
+    def _init_weights(self, module):
+        std = self.config.initializer_range
+        if isinstance(module, nn.Linear):
+            module.weight.data.normal_(0.0, std)
+            if module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.Embedding):
+            module.weight.data.normal_(0.0, std)
+        elif isinstance(module, FlintRouter):
+            module.weight.data.normal_(0.0, std)
+        elif isinstance(module, FlintRMSNorm):
+            module.weight.data.fill_(1.0)
+        elif isinstance(module, FlintAttention):
+            module.softmax_offset.data.zero_()
+
+
+class FlintModel(FlintPreTrainedModel):
+    def __init__(self, config: FlintConfig):
+        super().__init__(config)
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.layers = nn.ModuleList(FlintDecoderLayer(config, i) for i in range(config.num_hidden_layers))
+        self.norm = FlintRMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.post_init()
+
+    def get_input_embeddings(self):
+        return self.embed_tokens
+
+    def set_input_embeddings(self, value):
+        self.embed_tokens = value
+
+    def forward(self, input_ids=None, attention_mask=None, inputs_embeds=None, **_):
+        x = inputs_embeds if inputs_embeds is not None else self.embed_tokens(input_ids)
+        B, T = x.shape[:2]
+        if attention_mask is None or attention_mask.dim() != 2:
+            key_mask = torch.ones(B, T, dtype=torch.bool, device=x.device)
+        else:
+            key_mask = attention_mask.to(x.device).bool()
+        pos = (key_mask.long().cumsum(-1) - 1).clamp(min=0)  # left padding (batched generation) too
+        for layer in self.layers:
+            x = layer(x, pos, key_mask)
+        return self.norm(x)
+
+
+class FlintForCausalLM(FlintPreTrainedModel, GenerationMixin):
+    def __init__(self, config: FlintConfig):
+        super().__init__(config)
+        self.model = FlintModel(config)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.post_init()
+        self.generation_config.use_cache = False  # no KV cache: every step sees the whole sequence
+
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def forward(self, input_ids=None, attention_mask=None, inputs_embeds=None, labels=None, **kwargs):
+        h = self.model(input_ids=input_ids, attention_mask=attention_mask, inputs_embeds=inputs_embeds)
+        logits = self.lm_head(h)
+        loss = None
+        if labels is not None:
+            loss = F.cross_entropy(logits[:, :-1].reshape(-1, logits.shape[-1]), labels[:, 1:].reshape(-1),
+                                   ignore_index=-100)
+        return CausalLMOutputWithPast(loss=loss, logits=logits)
+
+    def prepare_inputs_for_generation(self, input_ids, attention_mask=None, **_):
+        return {"input_ids": input_ids, "attention_mask": attention_mask}
+
+
+def register() -> bool:
+    """Make AutoConfig / AutoModelForCausalLM load model_type "flint". False when transformers has its own."""
+    from transformers import AutoConfig, AutoModelForCausalLM
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+    if "flint" in CONFIG_MAPPING:
+        return CONFIG_MAPPING["flint"] is FlintConfig
+    AutoConfig.register("flint", FlintConfig)
+    AutoModelForCausalLM.register(FlintConfig, FlintForCausalLM)
+    return True

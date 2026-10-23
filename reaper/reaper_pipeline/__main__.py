@@ -88,7 +88,7 @@ def run(job: Job, start: str | None = None, only: str | None = None) -> int:
             emit("pipeline", "error", msg=f"{stage} failed")
             return 1
     if job.is_done("prune"):
-        emit("pipeline", "done", 100, str(job.out_dir), model=str(job.out_dir))
+        emit("pipeline", "done", 100, str(job.final_dir), model=str(job.final_dir))
     else:
         emit("pipeline", "done", 100, "partial run; no pruned model yet", model=None)
     return 0
@@ -114,6 +114,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--prune", type=float, default=None)
     ap.add_argument("--calib", default=None)
     ap.add_argument("--calib-samples", type=int, default=None)
+    ap.add_argument("--quant", choices=["fp8-experts", "none"], default=None)
     ap.add_argument("--from", dest="start", choices=STAGES, help="rerun from this stage onward")
     ap.add_argument("--only", choices=STAGES, help="run the process holding this stage")
     a = ap.parse_args(argv)
@@ -124,7 +125,7 @@ def main(argv: list[str] | None = None) -> int:
         if a.job and (Job(a.job).path("config.json")).exists():
             cfg = Job(a.job).config
             cfg.model = a.model
-        for name in ("purpose", "prune", "calib", "calib_samples"):
+        for name in ("purpose", "prune", "calib", "calib_samples", "quant"):
             if getattr(a, name) is not None:
                 setattr(cfg, name, getattr(a, name))
         job = Job.create(cfg, a.job)
