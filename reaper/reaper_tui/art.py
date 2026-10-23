@@ -3,12 +3,13 @@ cell): only the white strokes inside the robe and its outer contour are drawn, s
 the terminal's black is the robe. The skull is enlarged 1.7x before tracing to keep
 the face readable. Regenerate from the source image if it needs changing."""
 
+# "REAP" in figlet ansi_regular, "er" drawn to match in lowercase
 BANNER = """\
-██████  ███████  █████  ██████  ███████ ██████
-██   ██ ██      ██   ██ ██   ██ ██      ██   ██
-██████  █████   ███████ ██████  █████   ██████
-██   ██ ██      ██   ██ ██      ██      ██   ██
-██   ██ ███████ ██   ██ ██      ███████ ██   ██"""
+██████  ███████  █████  ██████
+██   ██ ██      ██   ██ ██   ██   █████  ██ ███
+██████  █████   ███████ ██████   ███████ ███
+██   ██ ██      ██   ██ ██       ██      ██
+██   ██ ███████ ██   ██ ██        ██████ ██"""
 
 # 60 x 38, used when the terminal is tall enough
 REAPER_LARGE = """\
