@@ -468,7 +468,55 @@ def calib_size(job: Job, sizes: list[int]) -> None:
         save(job, "calib_size", out)
 
 
-def frontier(job: Job, prunes: list[float], formats: list[str]) -> None:
+def expert_hessians(model, blocks, batches, H: int) -> dict:
+    """Per-expert GPTQ Hessians for the given MoE blocks: {layer: (Hin [E, H, H], Hdn [E, I, I])},
+    from the tokens the model's own router sends to each expert (padding excluded)."""
+    import torch
+
+    from reaper_pipeline import moe
+
+    out, state, handles = {}, {"mask": None}, []
+    act = None
+    for blk in blocks:
+        act = moe._act(blk.experts, model.config)
+
+        @torch.no_grad()
+        def hook(_mod, args, kwargs, o, blk=blk):
+            x = args[0] if args else next(iter(kwargs.values()))
+            x = x.reshape(-1, x.shape[-1])
+            parsed = moe.parse_router_output(o, x.shape[0], blk.num_experts)
+            if parsed is None:
+                logits = o[0] if isinstance(o, (tuple, list)) else o
+                parsed = moe.route_from_logits(blk, model.config, logits.reshape(-1, blk.num_experts))
+            idx = parsed[0]
+            m = state["mask"].to(x.device)
+            E = blk.num_experts
+            if blk.layer not in out:
+                I = expert_views(blk, 0, H)["down"].shape[1]
+                out[blk.layer] = (torch.zeros(E, H, H, device=x.device), torch.zeros(E, I, I, device=x.device))
+            Hin, Hdn = out[blk.layer]
+            for j in range(E):
+                xe = x[(idx == j).any(-1) & m]
+                if xe.shape[0] == 0:
+                    continue
+                v = expert_views(blk, j, H)
+                xf = xe.float()
+                Hin[j].addmm_(xf.T, xf)
+                h = (act(xe @ v["gate"].T.to(xe.dtype)) * (xe @ v["up"].T.to(xe.dtype))).float()
+                Hdn[j].addmm_(h.T, h)
+        handles.append(blk.router.register_forward_hook(hook, with_kwargs=True))
+    try:
+        for ids, mask in batches:
+            state["mask"] = mask.reshape(-1).bool()
+            model(input_ids=ids, attention_mask=mask, use_cache=False, logits_to_keep=1)
+    finally:
+        for h in handles:
+            h.remove()
+    return out
+
+
+def frontier(job: Job, prunes: list[float], formats: list[str], gptq_formats: list[str] = (),
+             gptq_calib: int = 64, layer_chunk: int = 12) -> None:
     """Prune ratio x expert format sweep: is a byte budget better spent on pruning or on bits?"""
     import shutil
 
@@ -476,9 +524,10 @@ def frontier(job: Job, prunes: list[float], formats: list[str]) -> None:
 
     import fast_prune
     from fakequant import BPW, fake_quant
+    from gptq import gptq_batched
     from reaper_pipeline import moe
-    from reaper_pipeline.load import free, load_model
-    from reaper_pipeline.stages._common import profile
+    from reaper_pipeline.load import free, input_device, load_model, load_tokenizer
+    from reaper_pipeline.stages._common import batches, encode, pad_batch, profile, read_jsonl
     from reaper_pipeline.stages.eval import compare
 
     s = job.read("work/gpu_perf_saliency.json")
@@ -489,7 +538,8 @@ def frontier(job: Job, prunes: list[float], formats: list[str]) -> None:
     for pr in prunes:
         n_keep = moe.experts_to_keep(E, pr, k)
         todo = [f for f in formats if f"{pr:.3f}/{f}" not in out]
-        if not todo:
+        gtodo = [f for f in gptq_formats if f"{pr:.3f}/gptq-{f}" not in out]
+        if not todo and not gtodo:
             continue
         keep = {L["layer"]: moe.choose_keep(L["saliency"], L["freq"], n_keep) for L in s["layers"]}
         d = job.path("work", f"gpu_perf_frontier_{int(pr * 1000)}")
@@ -499,7 +549,7 @@ def frontier(job: Job, prunes: list[float], formats: list[str]) -> None:
         views = [expert_views(b, j, H) for b in moe.find_blocks(model) for j in range(b.num_experts)]
         params = sum(w.numel() for v in views for w in v.values())
         orig = [{n: w.detach().to("cpu", copy=True) for n, w in v.items()} for v in views] \
-            if any(f != "bf16" for f in todo) else None
+            if any(f != "bf16" for f in todo) or gtodo else None
         for f in todo:
             if orig is not None:
                 with torch.no_grad():
@@ -512,6 +562,45 @@ def frontier(job: Job, prunes: list[float], formats: list[str]) -> None:
                                     "expert_gb": round(params * BPW[f] / 8 / 1024 ** 3, 2),
                                     "top1": round(r["top1_agreement"], 4), "kl": round(r["kl"], 4),
                                     "ppl": round(r["ppl_pruned"], 3)}
+            save(job, "frontier", out)
+        if gtodo:
+            tok = load_tokenizer(job.model_dir, job.config.trust_remote_code)
+            rows = read_jsonl(job.path("data", "calib.jsonl"))[:gptq_calib]
+            enc = [encode(tok, r["prompt"], r.get("answer"), job.config.max_seq)[0] for r in rows]
+            dev = input_device(model)
+            bs = max(1, int((prof.get("reap") or {}).get("batch_seqs", 1)))
+            cb = [pad_batch([enc[i] for i in g], tok.pad_token_id, dev)
+                  for g in batches(enc, bs, bs * job.config.max_seq)]
+            blocks = moe.find_blocks(model)
+        for f in gtodo:
+            t1 = time.time()
+            with torch.no_grad():
+                for v, o in zip(views, orig):
+                    for n, w in v.items():
+                        w.copy_(o[n].to(w.device))
+                # sequential GPTQ: each chunk's Hessians see the already-quantized earlier layers
+                for c0 in range(0, len(blocks), layer_chunk):
+                    chunk = blocks[c0:c0 + layer_chunk]
+                    hs = expert_hessians(model, chunk, cb, H)
+                    for blk in chunk:
+                        Hin, Hdn = hs.pop(blk.layer)
+                        vs = [expert_views(blk, j, H) for j in range(blk.num_experts)]
+                        gu = torch.stack([torch.cat([x["gate"], x["up"]]) for x in vs])
+                        q = gptq_batched(gu, Hin, f)
+                        I = vs[0]["gate"].shape[0]
+                        dn = gptq_batched(torch.stack([x["down"] for x in vs]), Hdn, f)
+                        for j, x in enumerate(vs):
+                            x["gate"].copy_(q[j, :I].to(x["gate"].dtype))
+                            x["up"].copy_(q[j, I:].to(x["up"].dtype))
+                            x["down"].copy_(dn[j].to(x["down"].dtype))
+                        del Hin, Hdn, gu, q, dn
+                    del hs
+            quant_s = time.time() - t1
+            r = compare(model, refs)
+            out[f"{pr:.3f}/gptq-{f}"] = {"prune": pr, "kept": n_keep, "format": f"gptq-{f}",
+                                         "expert_gb": round(params * BPW[f] / 8 / 1024 ** 3, 2),
+                                         "top1": round(r["top1_agreement"], 4), "kl": round(r["kl"], 4),
+                                         "ppl": round(r["ppl_pruned"], 3), "quant_s": round(quant_s, 1)}
             save(job, "frontier", out)
         del model, views, orig
         free()
@@ -538,9 +627,9 @@ def summary(job: Job) -> None:
             print(f"{key:17s} {json.dumps(r[key])}")
     fr = r.get("frontier", {})
     if fr:
-        print("\nfrontier: prune  kept  format      expert GB   top1    KL      ppl")
+        print("\nfrontier: prune  kept  format           expert GB   top1    KL      ppl")
         for x in sorted(fr.values(), key=lambda x: x["expert_gb"]):
-            print(f"          {x['prune']:.3f}  {x['kept']:4d}  {x['format']:10s}  {x['expert_gb']:8.2f}  "
+            print(f"          {x['prune']:.3f}  {x['kept']:4d}  {x['format']:15s}  {x['expert_gb']:8.2f}  "
                   f"{x['top1']:.3f}  {x['kl']:.4f}  {x['ppl']:.3f}")
     print(f"\nall results: {job.path(*RESULTS.split('/'))}")
 
@@ -564,6 +653,8 @@ def main() -> None:
     ap.add_argument("--prunes", default="0.25,0.375,0.5,0.625,0.75")
     ap.add_argument("--formats", default="bf16,int8_g128,int4_g128,int3_g64")
     ap.add_argument("--calib-sizes", default="32,64,128")
+    ap.add_argument("--gptq-formats", default="", help="also run the frontier with GPTQ, e.g. int4_g128,int3_g64")
+    ap.add_argument("--frontier-only", action="store_true", help="skip every phase except the frontier")
     ap.add_argument("--_teacher_ab", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--_teacher_variant", default=None, help=argparse.SUPPRESS)
     a = ap.parse_args()
@@ -580,6 +671,11 @@ def main() -> None:
         job = Job.create(Config(model=a.model, purpose=a.purpose, prune=0.5, calib_samples=a.calib_samples,
                                 quant="none", out_name="gpu-perf-reference"))
     print(f"[gpu_perf] job {job.root}", flush=True)
+    if a.frontier_only:
+        frontier(job, [float(x) for x in a.prunes.split(",")], a.formats.split(","),
+                 [f for f in a.gptq_formats.split(",") if f])
+        summary(job)
+        return
     skip, redo = set(filter(None, a.skip.split(","))), set(filter(None, a.redo.split(",")))
     have = lambda k: k in load_results(job) and k.split("_")[0] not in redo  # noqa: E731
 
@@ -604,7 +700,8 @@ def main() -> None:
                                  str(job.root), "--teacher-prompts", str(a.teacher_prompts)], env=env_for_children())
         if not have("calib_size"):
             calib_size(job, [int(x) for x in a.calib_sizes.split(",")])
-        frontier(job, [float(x) for x in a.prunes.split(",")], a.formats.split(","))
+        frontier(job, [float(x) for x in a.prunes.split(",")], a.formats.split(","),
+                 [f for f in a.gptq_formats.split(",") if f])
     summary(job)
 
 
