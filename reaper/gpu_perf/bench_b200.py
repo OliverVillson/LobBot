@@ -337,6 +337,187 @@ def quality(job: Job, tiers: list[int], menu: list[str], bases: list[str]) -> No
     free()
 
 
+# --------------------------------------------------------------------------- explore: more tests
+
+
+def calib_breakdown(job: Job) -> None:
+    """Where calibrate's wall time went, from the stage's own progress events."""
+    ev, lines = [], []
+    for src in (job.path("logs", "calibrate.log"), job.path("events.log")):
+        if src.exists():
+            lines = src.read_text(errors="replace").splitlines()
+            break
+    for line in lines:
+        if line.startswith("{"):
+            try:
+                e = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if e.get("stage") == "calibrate" and "ts" in e:
+                ev.append(e)
+    if not ev:
+        save(job, "calib_breakdown", {"skipped": "no calibrate events"})
+        return
+
+    def first(pred):
+        return next((e["ts"] for e in ev if pred(e)), None)
+
+    t0, t_end = ev[0]["ts"], ev[-1]["ts"]
+    t_write = first(lambda e: e.get("pct") == 5)
+    t_written = first(lambda e: (e.get("pct") or 0) >= 40)
+    out = {"total_s": round(t_end - t0, 1)}
+    if t_write:
+        out["teacher_startup_s"] = round(t_write - t0, 1)
+    if t_write and t_written:
+        out["prompt_writing_s"] = round(t_written - t_write, 1)
+    if t_written:
+        out["answering_s"] = round(t_end - t_written, 1)
+    save(job, "calib_breakdown", out)
+
+
+def teacher_variant(job_dir: str, variant: str, n_answers: int, n_written: int) -> None:
+    """vLLM teacher in bf16 or fp8 (weights + KV cache): startup, prompt writing and answering."""
+    from reaper_pipeline import calib
+    from reaper_pipeline.stages._common import profile, read_jsonl
+    from reaper_pipeline.stages.calibrate import answer_chunk
+    from reaper_pipeline.teacher import make_teacher
+    job = Job(job_dir)
+    cfg, prof = job.config, dict(profile(job))
+    prof["teacher"] = dict(prof.get("teacher") or {})
+    if variant == "fp8":
+        prof["teacher"].update(quantization="fp8", kv_cache_dtype="fp8")
+    t0 = time.time()
+    teacher = make_teacher(str(job.model_dir), prof, "vllm", cfg.trust_remote_code, cfg.seed)
+    startup = time.time() - t0
+    t = time.time()
+    rows, _ = calib.build_prompts(teacher, cfg.purpose, cfg.calib, n_written, 0.0, cfg.seed,
+                                  max_tokens=cfg.writer_max_tokens)
+    write_s = time.time() - t
+    prompts = (read_jsonl(job.path("data", "heldout.jsonl")) + read_jsonl(job.path("data", "calib.jsonl")))[:n_answers]
+    convs = [[{"role": "user", "content": r["prompt"]}] for r in prompts]
+    t, chars = time.time(), 0
+    chunk = answer_chunk(prof, "vllm", len(convs))
+    for i in range(0, len(convs), chunk):
+        chars += sum(len(x) for x in teacher.chat(convs[i:i + chunk], cfg.answer_max_tokens, 0.6))
+    answer_s = time.time() - t
+    teacher.close()
+    r = load_results(job).get("teacher_precision", {})
+    r[variant] = {"startup_s": round(startup, 1), "write_s": round(write_s, 1), "prompts_written": len(rows),
+                  "answer_s": round(answer_s, 1), "answers": len(convs), "chars": chars}
+    save(job, "teacher_precision", r)
+
+
+def calib_size(job: Job, sizes: list[int]) -> None:
+    """How many calibration sequences does REAP need? Keep-set overlap with the full set when
+    scoring on a subset, and the pruned model's quality when pruned from a small subset."""
+    import random
+
+    import torch
+
+    import fast_prune
+    from fast_saliency import FastSaliency
+    from reaper_pipeline import moe
+    from reaper_pipeline.load import free, input_device, load_model, load_tokenizer
+    from reaper_pipeline.stages._common import encode, pad_batch, profile, read_jsonl
+    from reaper_pipeline.stages.eval import compare
+
+    cfg, prof = job.config, profile(job)
+    full = job.read("work/gpu_perf_saliency.json")
+    n_keep = full["kept"]
+    tok = load_tokenizer(job.model_dir, cfg.trust_remote_code)
+    model = load_model(job.model_dir, prof, cfg.trust_remote_code)
+    blocks = moe.find_blocks(model)
+    rows = read_jsonl(job.path("data", "calib.jsonl"))
+    enc = [encode(tok, r["prompt"], r.get("answer"), cfg.max_seq)[0] for r in rows]
+    order = list(range(len(enc)))
+    random.Random(1).shuffle(order)
+    dev = input_device(model)
+    bs = max(1, int((prof.get("reap") or {}).get("batch_seqs", 1)))
+    out, keeps = {}, {}
+    for n in sizes:
+        idx = sorted(order[:n], key=lambda i: len(enc[i]))
+        col = FastSaliency(model, blocks)
+        with torch.no_grad():
+            for b in range(0, len(idx), bs):
+                ids, mask = pad_batch([enc[i] for i in idx[b:b + bs]], tok.pad_token_id, dev)
+                col.mask = mask.reshape(-1).bool()
+                try:
+                    model(input_ids=ids, attention_mask=mask, use_cache=False, logits_to_keep=1)
+                except TypeError:
+                    model(input_ids=ids, attention_mask=mask, use_cache=False)
+        col.remove()
+        res = col.results()
+        keeps[n] = {L["layer"]: moe.choose_keep(res[L["layer"]]["saliency"], res[L["layer"]]["freq"], n_keep)
+                    for L in full["layers"]}
+        overlap = sum(len(set(keeps[n][L["layer"]]) & set(L["kept"])) for L in full["layers"]) / (n_keep * len(full["layers"]))
+        out[str(n)] = {"keep_overlap_with_full": round(overlap, 4)}
+    del model
+    free()
+    refs = torch.load(job.path("work", "teacher_ref.pt"), weights_only=False)
+    for n in sizes:
+        d = job.path("work", f"gpu_perf_calib{n}")
+        fast_prune.prune_checkpoint(job.model_dir, d, keeps[n], full["experts"], full["num_layers"],
+                                    workers=min(16, os.cpu_count() or 8))
+        m = load_model(d, prof, cfg.trust_remote_code)
+        r = compare(m, refs)
+        out[str(n)].update(top1=round(r["top1_agreement"], 4), kl=round(r["kl"], 4), ppl=round(r["ppl_pruned"], 3))
+        del m
+        free()
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+        save(job, "calib_size", out)
+
+
+def frontier(job: Job, prunes: list[float], formats: list[str]) -> None:
+    """Prune ratio x expert format sweep: is a byte budget better spent on pruning or on bits?"""
+    import shutil
+
+    import torch
+
+    import fast_prune
+    from fakequant import BPW, fake_quant
+    from reaper_pipeline import moe
+    from reaper_pipeline.load import free, load_model
+    from reaper_pipeline.stages._common import profile
+    from reaper_pipeline.stages.eval import compare
+
+    s = job.read("work/gpu_perf_saliency.json")
+    refs = torch.load(job.path("work", "teacher_ref.pt"), weights_only=False)
+    prof = profile(job)
+    E, k = s["experts"], s["top_k"]
+    out = load_results(job).get("frontier", {})
+    for pr in prunes:
+        n_keep = moe.experts_to_keep(E, pr, k)
+        todo = [f for f in formats if f"{pr:.3f}/{f}" not in out]
+        if not todo:
+            continue
+        keep = {L["layer"]: moe.choose_keep(L["saliency"], L["freq"], n_keep) for L in s["layers"]}
+        d = job.path("work", f"gpu_perf_frontier_{int(pr * 1000)}")
+        fast_prune.prune_checkpoint(job.model_dir, d, keep, E, s["num_layers"], workers=min(16, os.cpu_count() or 8))
+        model = load_model(d, prof, job.config.trust_remote_code)
+        H = moe.text_config(model.config).hidden_size
+        views = [expert_views(b, j, H) for b in moe.find_blocks(model) for j in range(b.num_experts)]
+        params = sum(w.numel() for v in views for w in v.values())
+        orig = [{n: w.detach().to("cpu", copy=True) for n, w in v.items()} for v in views] \
+            if any(f != "bf16" for f in todo) else None
+        for f in todo:
+            if orig is not None:
+                with torch.no_grad():
+                    for v, o in zip(views, orig):
+                        for n, w in v.items():
+                            src = o[n].to(w.device)
+                            w.copy_(src if f == "bf16" else fake_quant(src, f).to(w.dtype))
+            r = compare(model, refs)
+            out[f"{pr:.3f}/{f}"] = {"prune": pr, "kept": n_keep, "format": f,
+                                    "expert_gb": round(params * BPW[f] / 8 / 1024 ** 3, 2),
+                                    "top1": round(r["top1_agreement"], 4), "kl": round(r["kl"], 4),
+                                    "ppl": round(r["ppl_pruned"], 3)}
+            save(job, "frontier", out)
+        del model, views, orig
+        free()
+        shutil.rmtree(d, ignore_errors=True)
+
+
 # --------------------------------------------------------------------------- summary
 
 
@@ -352,6 +533,15 @@ def summary(job: Job) -> None:
         for name, x in q["runs"].items():
             print(f"  {name:62s} {x.get('top1_agreement', 0):.3f}  {x.get('kl', 0):.4f}  {x.get('ppl_pruned', 0):6.3f}"
                   f"  {x.get('expert_gb', ''):>8}  {x.get('traffic_gb_per_tok', '')}")
+    for key in ("calib_breakdown", "teacher_precision", "calib_size"):
+        if key in r:
+            print(f"{key:17s} {json.dumps(r[key])}")
+    fr = r.get("frontier", {})
+    if fr:
+        print("\nfrontier: prune  kept  format      expert GB   top1    KL      ppl")
+        for x in sorted(fr.values(), key=lambda x: x["expert_gb"]):
+            print(f"          {x['prune']:.3f}  {x['kept']:4d}  {x['format']:10s}  {x['expert_gb']:8.2f}  "
+                  f"{x['top1']:.3f}  {x['kl']:.4f}  {x['ppl']:.3f}")
     print(f"\nall results: {job.path(*RESULTS.split('/'))}")
 
 
@@ -369,11 +559,20 @@ def main() -> None:
     ap.add_argument("--bases", default="int4_g128", help="uniform formats whose size budgets are compared")
     ap.add_argument("--skip", default="", help="comma list of phases to skip: teacher,score,prune,quality")
     ap.add_argument("--redo", default="", help="comma list of phases to rerun even if measured")
+    ap.add_argument("--explore", action="store_true",
+                    help="more tests: calibrate breakdown, fp8 teacher, calibration size, prune x bits frontier")
+    ap.add_argument("--prunes", default="0.25,0.375,0.5,0.625,0.75")
+    ap.add_argument("--formats", default="bf16,int8_g128,int4_g128,int3_g64")
+    ap.add_argument("--calib-sizes", default="32,64,128")
     ap.add_argument("--_teacher_ab", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--_teacher_variant", default=None, help=argparse.SUPPRESS)
     a = ap.parse_args()
 
     if a._teacher_ab:
         teacher_ab(a.job, a.teacher_prompts)
+        return
+    if a._teacher_variant:
+        teacher_variant(a.job, a._teacher_variant, a.teacher_prompts, 64)
         return
     if a.job:
         job = Job(a.job)
@@ -395,6 +594,17 @@ def main() -> None:
         prune(job)
     if "quality" not in skip and not have("quality"):
         quality(job, [int(x) for x in a.tiers.split(",")], a.menu.split(","), a.bases.split(","))
+    if a.explore:
+        if not have("calib_breakdown"):
+            calib_breakdown(job)
+        py = os.environ.get("REAPER_VLLM_PY") or sys.executable
+        for variant in ("bf16", "fp8"):
+            if "teacher" not in skip and variant not in (load_results(job).get("teacher_precision") or {}):
+                subprocess.call([py, str(Path(__file__).resolve()), "--_teacher_variant", variant, "--job",
+                                 str(job.root), "--teacher-prompts", str(a.teacher_prompts)], env=env_for_children())
+        if not have("calib_size"):
+            calib_size(job, [int(x) for x in a.calib_sizes.split(",")])
+        frontier(job, [float(x) for x in a.prunes.split(",")], a.formats.split(","))
     summary(job)
 
 
