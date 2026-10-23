@@ -16,14 +16,25 @@ from reaper_pipeline.stages._common import profile, stage_main, write_jsonl
 from reaper_pipeline.teacher import make_teacher, pick_backend
 
 STAGE = "calibrate"
-CHUNK = 64
+CHUNK = 64  # HF generate batch; vLLM gets far bigger submissions, see answer_chunk()
+
+
+def answer_chunk(prof: dict, backend: str, n: int) -> int:
+    """Prompts per teacher.chat call. vLLM schedules continuously inside one call, but every
+    call ends with its slowest answer: 64-prompt calls leave most of max_num_seqs idle and
+    pay a full 1024-token straggler tail per call. Submit ~4x the batch the engine can hold
+    (still >= 10 progress updates on big sets), which keeps the GPU full until the end."""
+    if backend != "vllm":
+        return CHUNK
+    seqs = int((prof.get("teacher") or {}).get("max_num_seqs") or 256)
+    return max(CHUNK, min(n, max(4 * seqs, -(-n // 10))))
 
 
 def run(job: Job) -> None:
     cfg = job.config
     prof = profile(job)
     need_teacher = bool(cfg.purpose.strip()) or cfg.teacher_answers
-    teacher = None
+    teacher, backend = None, "hf"
     if need_teacher:
         backend = pick_backend(prof, cfg.teacher_backend)
         emit(STAGE, pct=1, msg=f"starting the teacher ({backend})")
@@ -42,13 +53,14 @@ def run(job: Job) -> None:
     job.write("data/topics.json", info)
 
     if cfg.teacher_answers:
-        for i in range(0, len(rows), CHUNK):
-            part = rows[i:i + CHUNK]
+        chunk = answer_chunk(prof, backend, len(rows))
+        for i in range(0, len(rows), chunk):
+            part = rows[i:i + chunk]
             answers = teacher.chat([[{"role": "user", "content": r["prompt"]}] for r in part],
                                    cfg.answer_max_tokens, 0.6)
             for r, a in zip(part, answers):
                 r["answer"] = a
-            done = min(i + CHUNK, len(rows))
+            done = min(i + chunk, len(rows))
             emit(STAGE, pct=40 + 58 * done / len(rows), msg=f"teacher answered {done}/{len(rows)}")
         rows = [r for r in rows if r.get("answer", "").strip()]
     if teacher is not None:
