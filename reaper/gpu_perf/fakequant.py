@@ -39,9 +39,11 @@ def _ungroup(x: torch.Tensor, shape, pad: int) -> torch.Tensor:
 def int_sym(w: torch.Tensor, bits: int, g: int) -> torch.Tensor:
     x, pad = _groups(w, g)
     qmax = 2 ** (bits - 1) - 1
-    s = (x.abs().amax(-1, keepdim=True) / max(qmax, 1)).clamp(min=1e-12).half().float()
+    s = (x.abs().amax(-1, keepdim=True) / max(qmax, 1)).half().float()
     if bits == 2:  # {-2,-1,0,1} with a midpoint grid works better than {-1,0,1}
-        s = (x.abs().amax(-1, keepdim=True) / 1.5).clamp(min=1e-12).half().float()
+        s = (x.abs().amax(-1, keepdim=True) / 1.5).half().float()
+    s = torch.where(s > 0, s, torch.ones_like(s))  # all-zero group (e.g. pruned rows); fp16 scale underflow
+    if bits == 2:
         q = (x / s - 0.5).round().clamp(-2, 1) + 0.5
     else:
         q = (x / s).round().clamp(-qmax - 1, qmax)
