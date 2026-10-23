@@ -37,9 +37,21 @@ def gptq(w: torch.Tensor, H: torch.Tensor, fmt: str, damp: float = 0.01, block: 
     H[:, dead] = 0
     H[dead, dead] = 1
     W[:, dead] = 0
-    H.diagonal().add_(damp * H.diagonal()[~dead].mean() if (~dead).any() else damp)
-    L = torch.linalg.cholesky(H)
-    Hinv = torch.linalg.cholesky(torch.cholesky_inverse(L), upper=True)
+    # outlier features (massive activations) make H badly conditioned in fp32: factor in fp64 and
+    # raise the damping until both Cholesky steps succeed
+    H = H.double()
+    base = H.diagonal()[~dead].mean() if (~dead).any() else torch.tensor(1.0, dtype=H.dtype, device=H.device)
+    for d in (damp, 0.03, 0.1, 0.3, 1.0):
+        Hd = H.clone()
+        Hd.diagonal().add_(d * base)
+        L, info = torch.linalg.cholesky_ex(Hd)
+        if info == 0:
+            Hinv, info = torch.linalg.cholesky_ex(torch.cholesky_inverse(L), upper=True)
+            if info == 0:
+                break
+    else:
+        raise RuntimeError("GPTQ: Hessian not positive definite even with damping 1.0")
+    Hinv = Hinv.float()
     Q = torch.zeros_like(W)
     s = None
     for b0 in range(0, n, block):
