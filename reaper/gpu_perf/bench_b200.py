@@ -468,7 +468,7 @@ def calib_size(job: Job, sizes: list[int]) -> None:
         save(job, "calib_size", out)
 
 
-def expert_hessians(model, blocks, batches, H: int) -> dict:
+def expert_hessians(model, blocks, batches, H: int, diag: bool = False) -> dict:
     """Per-expert GPTQ Hessians for the given MoE blocks: {layer: (Hin [E, H, H], Hdn [E, I, I])},
     from the tokens the model's own router sends to each expert (padding excluded)."""
     import torch
@@ -493,7 +493,8 @@ def expert_hessians(model, blocks, batches, H: int) -> dict:
             E = blk.num_experts
             if blk.layer not in out:
                 I = expert_views(blk, 0, H)["down"].shape[1]
-                out[blk.layer] = (torch.zeros(E, H, H, device=x.device), torch.zeros(E, I, I, device=x.device))
+                out[blk.layer] = ((torch.zeros(E, H, device=x.device), torch.zeros(E, I, device=x.device)) if diag else
+                                  (torch.zeros(E, H, H, device=x.device), torch.zeros(E, I, I, device=x.device)))
             Hin, Hdn = out[blk.layer]
             for j in range(E):
                 xe = x[(idx == j).any(-1) & m]
@@ -501,9 +502,13 @@ def expert_hessians(model, blocks, batches, H: int) -> dict:
                     continue
                 v = expert_views(blk, j, H)
                 xf = xe.float()
-                Hin[j].addmm_(xf.T, xf)
                 h = (act(xe @ v["gate"].T.to(xe.dtype)) * (xe @ v["up"].T.to(xe.dtype))).float()
-                Hdn[j].addmm_(h.T, h)
+                if diag:
+                    Hin[j] += xf.pow(2).sum(0)
+                    Hdn[j] += h.pow(2).sum(0)
+                else:
+                    Hin[j].addmm_(xf.T, xf)
+                    Hdn[j].addmm_(h.T, h)
         handles.append(blk.router.register_forward_hook(hook, with_kwargs=True))
     try:
         for ids, mask in batches:
@@ -513,6 +518,116 @@ def expert_hessians(model, blocks, batches, H: int) -> dict:
         for h in handles:
             h.remove()
     return out
+
+
+def headers(job: Job, pr: float, calib: int = 64) -> None:
+    """Per-expert header formats (headers.py) and REAQ on top, on the REAP-pruned model."""
+    import random as _random
+    import shutil
+
+    import torch
+
+    import fast_prune
+    from headers import bpw, header_quant
+    from reaper_pipeline import moe
+    from reaper_pipeline.load import free, input_device, load_model, load_tokenizer
+    from reaper_pipeline.stages._common import batches, encode, pad_batch, profile, read_jsonl
+    from reaper_pipeline.stages.eval import compare
+
+    s = job.read("work/gpu_perf_saliency.json")
+    refs = torch.load(job.path("work", "teacher_ref.pt"), weights_only=False)
+    prof = profile(job)
+    E, k = s["experts"], s["top_k"]
+    n_keep = moe.experts_to_keep(E, pr, k)
+    keep = {L["layer"]: moe.choose_keep(L["saliency"], L["freq"], n_keep) for L in s["layers"]}
+    sal = {L["layer"]: [L["saliency"][j] for j in keep[L["layer"]]] for L in s["layers"]}
+    out = load_results(job).get("headers", {})
+    d = job.path("work", f"gpu_perf_headers_{int(pr * 1000)}")
+    fast_prune.prune_checkpoint(job.model_dir, d, keep, E, s["num_layers"], workers=min(16, os.cpu_count() or 8))
+    model = load_model(d, prof, job.config.trust_remote_code)
+    H = moe.text_config(model.config).hidden_size
+    blocks = moe.find_blocks(model)
+    tok = load_tokenizer(job.model_dir, job.config.trust_remote_code)
+    rows = read_jsonl(job.path("data", "calib.jsonl"))[:calib]
+    enc = [encode(tok, r["prompt"], r.get("answer"), job.config.max_seq)[0] for r in rows]
+    dev = input_device(model)
+    bs = max(1, int((prof.get("reap") or {}).get("batch_seqs", 1)))
+    cb = [pad_batch([enc[i] for i in g], tok.pad_token_id, dev) for g in batches(enc, bs, bs * job.config.max_seq)]
+    energy = expert_hessians(model, blocks, cb, H, diag=True)          # activation energy per input channel
+    views = {b.layer: [expert_views(b, j, H) for j in range(b.num_experts)] for b in blocks}
+    orig = {L: [{n: w.detach().to("cpu", copy=True) for n, w in v.items()} for v in vs] for L, vs in views.items()}
+    params = sum(w.numel() for vs in views.values() for v in vs for w in v.values())
+    # REAQ ranking: kept experts by REAP saliency, per layer (0 = most important)
+    rank = {}
+    for L, sv in sal.items():
+        order = sorted(range(len(sv)), key=lambda j: -sv[j])
+        rank[L] = {j: r for r, j in enumerate(order)}
+    rnd = _random.Random(0)
+    rrank = {L: dict(zip(range(len(sv)), rnd.sample(range(len(sv)), len(sv)))) for L, sv in sal.items()}
+
+    def apply(spec_of):
+        """spec_of(layer, expert) -> dict(table, L, block, shared); experts sharing a spec go together."""
+        with torch.no_grad():
+            for blk in blocks:
+                vs, os_ = views[blk.layer], orig[blk.layer]
+                ein, edn = energy[blk.layer]
+                groups = {}
+                for j in range(len(vs)):
+                    groups.setdefault(tuple(sorted(spec_of(blk.layer, j).items())), []).append(j)
+                for key, js in groups.items():
+                    sp = dict(key)
+                    jj = torch.tensor(js, device=ein.device)
+                    gu = torch.stack([torch.cat([os_[j]["gate"], os_[j]["up"]]) for j in js]).to(ein.device)
+                    dn = torch.stack([os_[j]["down"] for j in js]).to(ein.device)
+                    I = os_[js[0]]["gate"].shape[0]
+                    qg = header_quant(gu, sp["table"], sp["L"], sp["block"], ein[jj], sp["shared"])
+                    qd = header_quant(dn, sp["table"], sp["L"], sp["block"], edn[jj], sp["shared"])
+                    for i, j in enumerate(js):
+                        v = vs[j]
+                        v["gate"].copy_(qg[i, :I].to(v["gate"].dtype))
+                        v["up"].copy_(qg[i, I:].to(v["up"].dtype))
+                        v["down"].copy_(qd[i].to(v["down"].dtype))
+                    del gu, dn, qg, qd
+
+    def spec(table, L, block=16, shared=False):
+        return {"table": table, "L": L, "block": block, "shared": shared}
+
+    configs = [
+        ("NVFP4, one scale per layer (no header)", lambda L, j: spec("e2m1", 16, shared=True)),
+        ("NVFP4, per-expert scale header", lambda L, j: spec("e2m1", 16)),
+        ("int4 grid, per-expert scale, b16", lambda L, j: spec("int", 16)),
+        ("16-level table per layer, b16", lambda L, j: spec("layer", 16)),
+        ("16-level table per expert, b16", lambda L, j: spec("expert", 16)),
+        ("16-level table per expert, b32", lambda L, j: spec("expert", 16, 32)),
+        ("int3 grid, per-expert scale, b16", lambda L, j: spec("int", 8)),
+        ("8-level table per layer, b16", lambda L, j: spec("layer", 8)),
+        ("8-level table per expert, b16", lambda L, j: spec("expert", 8)),
+        ("8-level table per expert, b32", lambda L, j: spec("expert", 8, 32)),
+    ]
+    n = n_keep
+    for frac in (0.25, 0.5):
+        cut = int(round(n * frac))
+        configs.append((f"REAQ: top {frac:.0%} 16-level, rest 8-level",
+                        lambda L, j, cut=cut: spec("expert", 16 if rank[L][j] < cut else 8)))
+    cut = n // 2
+    configs.append(("random 50% 16-level, rest 8-level (control)",
+                    lambda L, j: spec("expert", 16 if rrank[L][j] < cut else 8)))
+    for name, fn in configs:
+        if name in out:
+            continue
+        t1 = time.time()
+        apply(fn)
+        quant_s = time.time() - t1
+        r = compare(model, refs)
+        any_layer = blocks[0].layer
+        b = sum(bpw(fn(any_layer, j)["L"], fn(any_layer, j)["block"]) for j in range(n)) / n
+        out[name] = {"prune": pr, "bpw": round(b, 3), "expert_gb": round(params * b / 8 / 1024 ** 3, 2),
+                     "top1": round(r["top1_agreement"], 4), "kl": round(r["kl"], 4), "ppl": round(r["ppl_pruned"], 3),
+                     "quant_s": round(quant_s, 1)}
+        save(job, "headers", out)
+    del model, views, orig
+    free()
+    shutil.rmtree(d, ignore_errors=True)
 
 
 def frontier(job: Job, prunes: list[float], formats: list[str], gptq_formats: list[str] = (),
@@ -631,6 +746,11 @@ def summary(job: Job) -> None:
         for x in sorted(fr.values(), key=lambda x: x["expert_gb"]):
             print(f"          {x['prune']:.3f}  {x['kept']:4d}  {x['format']:15s}  {x['expert_gb']:8.2f}  "
                   f"{x['top1']:.3f}  {x['kl']:.4f}  {x['ppl']:.3f}")
+    hd = r.get("headers", {})
+    if hd:
+        print("\nheaders: config                                          bpw   expert GB  top1    KL      ppl")
+        for name, x in sorted(hd.items(), key=lambda kv: (-kv[1]["bpw"], kv[1]["kl"])):
+            print(f"         {name:48s} {x['bpw']:5.2f}  {x['expert_gb']:7.2f}  {x['top1']:.3f}  {x['kl']:.4f}  {x['ppl']:.3f}")
     print(f"\nall results: {job.path(*RESULTS.split('/'))}")
 
 
@@ -655,6 +775,8 @@ def main() -> None:
     ap.add_argument("--calib-sizes", default="32,64,128")
     ap.add_argument("--gptq-formats", default="", help="also run the frontier with GPTQ, e.g. int4_g128,int3_g64")
     ap.add_argument("--frontier-only", action="store_true", help="skip every phase except the frontier")
+    ap.add_argument("--headers-only", action="store_true", help="only the per-expert header formats test")
+    ap.add_argument("--headers-prune", type=float, default=0.25)
     ap.add_argument("--_teacher_ab", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--_teacher_variant", default=None, help=argparse.SUPPRESS)
     a = ap.parse_args()
@@ -671,6 +793,10 @@ def main() -> None:
         job = Job.create(Config(model=a.model, purpose=a.purpose, prune=0.5, calib_samples=a.calib_samples,
                                 quant="none", out_name="gpu-perf-reference"))
     print(f"[gpu_perf] job {job.root}", flush=True)
+    if a.headers_only:
+        headers(job, a.headers_prune)
+        summary(job)
+        return
     if a.frontier_only:
         frontier(job, [float(x) for x in a.prunes.split(",")], a.formats.split(","),
                  [f for f in a.gptq_formats.split(",") if f])

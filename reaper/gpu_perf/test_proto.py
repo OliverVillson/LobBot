@@ -204,3 +204,15 @@ def test_gptq_matches_rtn_on_identity_and_beats_it_on_correlated_inputs():
     Q = gptq(W, X.T @ X, "int3_g64")
     assert Q[:, 5:9].abs().max() == 0
     assert ((W - Q) @ X.T).norm() < 0.9 * ((W - fake_quant(W, "int3_g64")) @ X.T).norm()
+
+
+def test_header_formats():
+    from fakequant import fake_quant
+    from headers import header_quant
+    torch.manual_seed(0)
+    W = torch.randn(3, 64, 256) * torch.tensor([1.0, 3.0, 0.2])[:, None, None]
+    nv = torch.stack([fake_quant(w, "nvfp4") for w in W])
+    assert torch.allclose(header_quant(W, "e2m1"), nv)              # per-expert header == NVFP4 per matrix
+    err = lambda Q: float((W - Q).pow(2).sum())                     # noqa: E731
+    assert err(header_quant(W, "expert", 8)) < err(header_quant(W, "int", 8))
+    assert err(header_quant(W, "expert", 16)) <= err(header_quant(W, "e2m1")) * 1.01
