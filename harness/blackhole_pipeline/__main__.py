@@ -91,39 +91,98 @@ def error_message(rc: int, tail: list[str]) -> str:
     return tail[-1][:400] if tail else f"stage exited with {rc}"
 
 
+def _same_model(c: dict, rj) -> bool:
+    if c.get("model") == rj.config.model:
+        return True
+    try:  # a local path vs the hub id of the same download
+        p = Path(str(c.get("model", ""))).expanduser()
+        return p.is_dir() and p.resolve() == rj.model_dir.resolve()
+    except OSError:
+        return False
+
+
 def seed_from_previous(bh: BHJob, rj) -> None:
-    """Reuse calibration, REAP scores and the teacher reference of an earlier REAPer job on the
-    same model and purpose (e.g. ~/.reaper/jobs/flint-prune50): REAP saliency does not depend on
-    the prune ratio, so only the kept lists are recomputed. Saves the vLLM teacher and the scoring
-    pass over the full model."""
-    if rj.is_done("score") or os.environ.get("BLACKHOLE_NO_REUSE"):
+    """Reuse what an earlier REAPer job on the same model and purpose (e.g. ~/.reaper/jobs/flint-prune50)
+    already paid for. Its calibration set and teacher answers skip the teacher (vLLM) entirely; its REAP
+    scores and teacher reference, when complete, also skip the scoring pass (REAP saliency does not
+    depend on the prune ratio, so only the kept lists are recomputed). Every candidate looked at is
+    logged with the reason it was or was not used."""
+    if rj.is_done("calibrate") or os.environ.get("BLACKHOLE_NO_REUSE"):
         return
     from reaper_pipeline.job import home
     cfg = rj.config
-    cands = []
-    for d in (home() / "jobs").glob("*") if (home() / "jobs").is_dir() else []:
+    jobs = home() / "jobs"
+    data_ok, score_ok = [], []
+    for d in sorted(jobs.glob("*")) if jobs.is_dir() else []:
+        if d.resolve() == rj.root or not d.is_dir():
+            continue
         try:
             c = json.loads((d / "config.json").read_text())
         except (OSError, ValueError):
+            log(f"reuse: {d.name}: no readable config.json")
             continue
-        need = [d / "work" / "saliency.json", d / "work" / "reap.json", d / "work" / "teacher_ref.pt",
-                d / "data" / "calib.jsonl", d / ".done" / "score"]
-        if c.get("model") == cfg.model and c.get("purpose", "") == cfg.purpose and all(p.exists() for p in need) \
-                and d.resolve() != rj.root:
-            cands.append(d)
-    if not cands:
+        if not _same_model(c, rj):
+            log(f"reuse: {d.name}: other model ({c.get('model')})")
+            continue
+        if c.get("purpose", "") != cfg.purpose:
+            log(f"reuse: {d.name}: other purpose ({c.get('purpose')!r} vs {cfg.purpose!r})")
+            continue
+        missing = [n for n in ("data/calib.jsonl", "data/heldout.jsonl") if not (d / n).exists()]
+        if missing:
+            log(f"reuse: {d.name}: missing {', '.join(missing)}")
+            continue
+        data_ok.append(d)
+        smiss = [n for n in ("work/saliency.json", "work/reap.json", "work/teacher_ref.pt", ".done/score")
+                 if not (d / n).exists()]
+        if smiss:
+            log(f"reuse: {d.name}: calibration usable, REAP scores not ({', '.join(smiss)} missing)")
+        else:
+            score_ok.append(d)
+    if not data_ok:
+        if jobs.is_dir():
+            log(f"reuse: nothing reusable in {jobs} for {cfg.model} (purpose {cfg.purpose!r})")
         return
-    src = max(cands, key=lambda d: (d / ".done" / "score").stat().st_mtime)
-    for sub in ("data",):
-        for p in (src / sub).iterdir():
-            if p.is_file():
-                shutil.copy2(p, rj.path(sub, p.name))
-    for f in ("saliency.json", "reap.json", "teacher_ref.pt"):
-        shutil.copy2(src / "work" / f, rj.path("work", f))
-    rekeep(rj)
-    for s in ("calibrate", "score"):
-        rj.mark_done(s, {"reused_from": str(src)})
-    log(f"reusing calibration, REAP scores and teacher reference from {src}")
+    newest = lambda d: (d / "data" / "calib.jsonl").stat().st_mtime  # noqa: E731
+    src = max(score_ok or data_ok, key=newest)
+    for p in (src / "data").iterdir():
+        if p.is_file():
+            shutil.copy2(p, rj.path("data", p.name))
+    rj.mark_done("calibrate", {"reused_from": str(src)})
+    if src in score_ok:
+        for f in ("saliency.json", "reap.json", "teacher_ref.pt"):
+            shutil.copy2(src / "work" / f, rj.path("work", f))
+        rekeep(rj)
+        rj.mark_done("score", {"reused_from": str(src)})
+        log(f"reusing calibration, teacher answers, REAP scores and teacher reference from {src}")
+    else:
+        log(f"reusing calibration and teacher answers from {src}; REAP scoring runs again")
+
+
+def teacher_check(rj) -> None:
+    """When calibrate must run: if the installed vLLM has no model class for this architecture (current
+    vLLM releases have no Flint), use REAPer's PyTorch model as the teacher instead of failing, with
+    shorter answers and fewer samples so it finishes in reasonable time (it has no KV cache)."""
+    if rj.config.teacher_backend != "auto":
+        return
+    mc = json.loads((rj.model_dir / "config.json").read_text()) if (rj.model_dir / "config.json").exists() else {}
+    arch = (mc.get("architectures") or [None])[0]
+    if not arch:
+        return
+    py = os.environ.get("REAPER_VLLM_PY") or sys.executable
+    code = ("import sys\ntry:\n from vllm import ModelRegistry\nexcept Exception:\n print('novllm'); sys.exit()\n"
+            f"print('yes' if {arch!r} in ModelRegistry.get_supported_archs() else 'no')")
+    try:
+        out = subprocess.run([py, "-c", code], capture_output=True, text=True, timeout=300).stdout.strip().splitlines()
+    except (OSError, subprocess.SubprocessError):
+        return
+    if not out or out[-1] != "no":
+        return
+    raw = json.loads(rj.path("config.json").read_text())
+    raw.update(teacher_backend="hf", answer_max_tokens=min(raw.get("answer_max_tokens", 1024), 320),
+               calib_samples=min(raw.get("calib_samples", 256), 96))
+    rj.path("config.json").write_text(json.dumps(raw, indent=2) + "\n")
+    log(f"teacher: this vLLM has no {arch}; using REAPer's PyTorch model as the teacher "
+        f"({raw['calib_samples']} samples, answers up to {raw['answer_max_tokens']} tokens; slower, no KV cache)")
 
 
 def rekeep(rj) -> None:
@@ -154,6 +213,8 @@ def run(bh: BHJob, start: str | None = None) -> int:
     for name, stages, who in PROCESSES:
         if name == "calibrate":
             seed_from_previous(bh, rj)
+            if not rj.is_done("calibrate"):
+                teacher_check(rj)
         if all(rj.is_done(s) for s in stages):
             for s in stages:
                 info = json.loads(rj.path(".done", s).read_text() or "{}")

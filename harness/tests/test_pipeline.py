@@ -64,7 +64,8 @@ def test_lab_schema_stages_match_the_pipeline():
     assert sc.stages() == STAGES and "lab" in sc.tags
 
 
-def test_full_run_on_a_tiny_flint(tmp_path):
+@pytest.mark.parametrize("donor", ["scores", "data-only"])
+def test_full_run_on_a_tiny_flint(tmp_path, donor):
     pytest.importorskip("transformers")
     sys.path.insert(0, str(REAPER / "tests"))
     from tiny_moe import build
@@ -84,6 +85,10 @@ def test_full_run_on_a_tiny_flint(tmp_path):
                        capture_output=True, text=True, timeout=900)
     assert p.returncode == 0, p.stdout[-3000:] + p.stderr[-3000:]
 
+    if donor == "data-only":  # e.g. a job whose scoring never finished: reuse the teacher answers only
+        (old / ".done" / "score").unlink()
+        (old / "work" / "teacher_ref.pt").unlink()
+
     sc = find_schema("reaq-codebook")
     job = tmp_path / "bh" / "flint-tiny-reaq"
     job.mkdir(parents=True)
@@ -98,7 +103,11 @@ def test_full_run_on_a_tiny_flint(tmp_path):
     for e in events:
         by.setdefault(e["stage"], []).append(e)
     assert by["calibrate"][-1]["status"] == "skipped" and "reused" in by["calibrate"][-1]["msg"]
-    assert all(e["status"] == "skipped" for e in by["score"])  # scores reused, only prune ran
+    if donor == "scores":
+        assert all(e["status"] == "skipped" for e in by["score"])  # scores reused, only prune ran
+    else:
+        assert by["score"][-1]["status"] == "done"
+        assert "calibration usable, REAP scores not" in p.stdout
     for s in ("detect", "plan", "prune", "eval", "gptq", "reaq", "quant", "package"):
         assert by[s][-1]["status"] == "done", (s, by[s][-1])
     ev = by["eval"][-1]
