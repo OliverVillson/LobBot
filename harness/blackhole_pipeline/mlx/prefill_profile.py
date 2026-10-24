@@ -1,6 +1,6 @@
 """Where does prompt processing (prefill) time go in an exported Flint MLX model? Run on the Mac:
 
-    python prefill_profile.py ~/flint/flint-REAP-128e-MLX-9.1GB [tokens]
+    python prefill_profile.py ~/flint/flint-REAP-128e-MLX-9.1GB [tokens] [--wire]
 
 Prefills real text (mlx-lm's sources) and reports: the whole model; without routed experts; then
 every MoE layer timed on its own real input, as exported and with variants (both tiers on all
@@ -26,8 +26,17 @@ def timed(fn, n=3):
 
 def main():
     path = Path(sys.argv[1]).expanduser()
-    T = int(sys.argv[2]) if len(sys.argv) > 2 else 1024
+    nums = [a for a in sys.argv[2:] if a.isdigit()]
+    T = int(nums[0]) if nums else 1024
+    info = mx.metal.device_info() if hasattr(mx.metal, "device_info") else mx.device_info()
+    rec = int(info.get("max_recommended_working_set_size", 0))
+    print(f"RAM {info.get('memory_size', 0) / 2**30:.1f} GB, GPU working set limit {rec / 2**30:.1f} GB")
+    if "--wire" in sys.argv:   # pin the model in memory (what mlx_lm.generate does for big models)
+        mx.set_wired_limit(rec)
+        print(f"wired limit set to {rec / 2**30:.1f} GB")
     model, _ = load_model(path, trust_remote_code=True)
+    mx.eval(model.parameters())
+    print(f"model in memory: {mx.get_active_memory() / 2**30:.2f} GB")
     tok = load_tokenizer(path)
     import mlx_lm.generate as g
     import mlx_lm.utils as u
