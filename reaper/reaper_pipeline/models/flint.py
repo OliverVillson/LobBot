@@ -276,13 +276,16 @@ class FlintAttention(nn.Module):
         if self.rope:
             q, k = _rope(q, pos, self.theta), _rope(k, pos, self.theta)
         kc, vc = st["k"][li], st["v"][li]
-        kc.index_copy_(2, st["t"], k.to(kc.dtype))
-        vc.index_copy_(2, st["t"], v.to(vc.dtype))
+        ring = self.window is not None and "W" in st
+        at = st["slot"] if ring else st["t"]
+        kc.index_copy_(2, at, k.to(kc.dtype))
+        vc.index_copy_(2, at, v.to(vc.dtype))
         G, rep = self.nkv, self.nh // self.nkv
         s = torch.matmul(q.reshape(B, G, rep, self.d).to(kc.dtype), kc.transpose(-1, -2)).float() * self.scale
-        allowed = st["mask"] & (st["kpos"][None, :] <= st["t"])
+        kpos, kmask = (st["ring_pos"], st["ring_mask"]) if ring else (st["kpos"], st["mask"])
+        allowed = kmask & (kpos[None, :] <= st["t"])
         if self.window:
-            allowed = allowed & (st["kpos"][None, :] > st["t"] - self.window)
+            allowed = allowed & (kpos[None, :] > st["t"] - self.window)
         s = s.masked_fill(~allowed[:, None, None, :], float("-inf"))
         sink = self.softmax_offset.float().view(1, G, rep, 1)
         m = torch.maximum(s.amax(-1, keepdim=True), sink)
@@ -452,10 +455,23 @@ class FlintForCausalLM(FlintPreTrainedModel, GenerationMixin):
               "kpos": torch.arange(Tmax, device=dev), "tok": torch.zeros(B, dtype=torch.long, device=dev),
               "mask": torch.zeros(B, Tmax, dtype=torch.bool, device=dev)}
         st["mask"][:, :T] = key_mask
-        for kv in caches:
+        # sliding-window layers keep a ring of `window` slots (position p in slot p % window), so
+        # long answers only grow the cache of the full-attention layers
+        W = next((l.self_attn.window for l in m.layers if l.self_attn.window), None)
+        if W is not None and W < Tmax:
+            keep = torch.arange(max(0, T - W), T, device=dev)
+            slots = keep % W
+            st["W"] = torch.tensor(W, device=dev)
+            st["ring_pos"] = torch.full((W,), -(1 << 40), dtype=torch.long, device=dev).index_copy_(0, slots, keep)
+            st["ring_mask"] = torch.zeros(B, W, dtype=torch.bool, device=dev).index_copy_(1, slots, key_mask[:, keep])
+        for layer, kv in zip(m.layers, caches):
+            ring = "W" in st and layer.self_attn.window is not None
             for name in ("k", "v"):
-                buf = torch.zeros(B, k0.shape[1], Tmax, k0.shape[3], dtype=kv[name].dtype, device=dev)
-                buf[:, :, :T] = kv[name]
+                buf = torch.zeros(B, k0.shape[1], W if ring else Tmax, k0.shape[3], dtype=kv[name].dtype, device=dev)
+                if ring:
+                    buf.index_copy_(2, slots, kv[name][:, :, keep])
+                else:
+                    buf[:, :, :T] = kv[name]
                 st[name].append(buf)
             kv.clear()
         del caches
@@ -466,6 +482,10 @@ class FlintForCausalLM(FlintPreTrainedModel, GenerationMixin):
             st["t"].add_(1)
             st["pos"].add_(1)
             st["mask"].index_fill_(1, st["t"], True)
+            if "W" in st:
+                st["slot"] = st["t"] % st["W"]
+                st["ring_pos"].index_copy_(0, st["slot"], st["t"])
+                st["ring_mask"].index_fill_(1, st["slot"], True)
             h = m.embed_tokens(st["tok"][:, None])
             p = st["pos"][:, None]
             for li, layer in enumerate(m.layers):

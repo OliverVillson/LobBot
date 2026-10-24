@@ -11,7 +11,7 @@ calibrate → REAP → eval, plus two stages of our own on the pruned model:
          rest on 8 (block 32, fp8 block scales). No kernel serves this yet, so it is a
          measured stage: KL / top-1 / size against int4, and the packed indices, tables
          and scales are saved for a future kernel.
-  bench  LiveCodeBench pass@1 of the original and the int4 model (one sample, 4k tokens)
+  bench  LiveCodeBench pass@1 and tok/s of the original and the REAQ model (bench_models) (one sample, up to 32k tokens)
 
 Events are REAPer's JSON lines; stage names are STAGES.
 """
@@ -47,8 +47,9 @@ DEFAULTS = {
     "reaq_top": 0.5,         # share of each layer's experts (by REAP score) on 16-level tables
     "reaq_block": 32,
     "bench": "lcb-v6",       # LiveCodeBench release (problems new in it) for original vs int4; "none" skips
+    "bench_models": "original,reaq",  # any of original, int4, reaq
     "bench_limit": 0,        # 0 = every problem of the release
-    "bench_max_tokens": 4096,
+    "bench_max_tokens": 32768,  # reasoning models think for tens of thousands of tokens; 4k cut most off
     "bench_file": "",        # a local jsonl in LiveCodeBench's format instead of the download
 }
 

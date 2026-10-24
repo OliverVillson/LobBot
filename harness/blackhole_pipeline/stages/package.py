@@ -40,10 +40,12 @@ def run(bh, rj) -> None:
              row("REAP + GPTQ int4 (shipped)", g),
              row("REAP + REAQ codebooks (lab)", q)]
     b = rj.read("work/bench.json") or {}
-    if b.get("original") is not None:
-        table += ["", f"**{b['bench']}** ({b['problems']} problems, pass@1, one sample at temperature 0.2): "
-                      f"original {b['original']:.1%} → int4 {b['int4']:.1%}"
-                      + (f" ({b['retained']:.0%} retained)." if b.get("retained") else ".")]
+    if b.get("runs"):
+        names = {"original": "original", "int4": "GPTQ int4", "reaq": "REAQ codebooks"}
+        table += ["", f"**{b['bench']}** ({b['problems']} problems, pass@1, one sample, up to "
+                      f"{next(iter(b['runs'].values())).get('max_tokens', '?')} tokens):", "",
+                  "| model | pass@1 | tok/s (batched, PyTorch) |", "|---|---|---|"]
+        table += [f"| {names.get(m, m)} | {r['pass@1']:.1%} | {r.get('tok_s') or '–'} |" for m, r in b["runs"].items()]
     ppl_t = ev.get("ppl_teacher")
     card = [
         f"# {bh.gptq_dir(rj).name}", "",

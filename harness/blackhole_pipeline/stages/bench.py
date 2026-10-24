@@ -24,11 +24,13 @@ def run(bh, rj) -> None:
         emit(STAGE, "skipped", 100, "bench: none")
         return
     release = p["bench"].split("-")[-1] if p["bench"].startswith("lcb") else "v6"
-    models = [("original", rj.model_dir), ("int4", bh.gptq_dir(rj))]
+    dirs = {"original": rj.model_dir, "int4": bh.gptq_dir(rj), "reaq": bh.reaq_dir(rj)}
+    models = [(m, dirs[m]) for m in p["bench_models"].split(",") if m]
     res = {}
     for i, (label, path) in enumerate(models):
         out = rj.path("work", "bench", label)
-        if not (out / "summary.json").exists():
+        old = json.loads((out / "summary.json").read_text()) if (out / "summary.json").exists() else {}
+        if old.get("max_tokens") != p["bench_max_tokens"]:  # missing, or run with another token limit
             if not (path / "config.json").exists():
                 raise RuntimeError(f"no model to bench in {path}")
             cmd = [sys.executable, "-u", "-m", "blackhole_pipeline.bench", "--model", str(path), "--out", str(out),
@@ -43,15 +45,20 @@ def run(bh, rj) -> None:
                 raise RuntimeError(f"bench of the {label} model failed (exit {rc})")
         res[label] = json.loads((out / "summary.json").read_text())
         s = res[label]
-        print(f"bench: {label} pass@1 {s['pass@1']:.1%} ({s['problems']} problems, {s['bench']})", flush=True)
-    o, q = res["original"]["pass@1"], res["int4"]["pass@1"]
-    summary = {"bench": res["original"]["bench"], "problems": res["original"]["problems"],
-               "original": o, "int4": q, "retained": round(q / o, 4) if o else None, "runs": res}
+        print(f"bench: {label} pass@1 {s['pass@1']:.1%} ({s['problems']} problems, {s['bench']}), "
+              f"{s.get('tok_s', 0):.0f} tok/s", flush=True)
+    first = res[models[0][0]]
+    summary = {"bench": first["bench"], "problems": first["problems"], "runs": res,
+               **{m: r["pass@1"] for m, r in res.items()}, "tok_s": {m: r.get("tok_s") for m, r in res.items()}}
+    comp = [m for m in res if m != "original"]
+    if "original" in res and comp and res["original"]["pass@1"]:
+        summary["retained"] = round(res[comp[-1]]["pass@1"] / res["original"]["pass@1"], 4)
     rj.write("work/bench.json", summary)
     rj.path(".done", "package").unlink(missing_ok=True)
     rj.mark_done(STAGE, {k: v for k, v in summary.items() if k != "runs"})
-    msg = f"{summary['bench']}: original {o:.1%} → int4 {q:.1%} pass@1 on {summary['problems']} problems"
-    emit(STAGE, "done", 100, msg, lcb_original=o, lcb_int4=q, problems=summary["problems"])
+    msg = f"{summary['bench']} pass@1: " + " · ".join(f"{m} {r['pass@1']:.1%}" for m, r in res.items()) \
+        + f" on {summary['problems']} problems"
+    emit(STAGE, "done", 100, msg, problems=summary["problems"], **{f"lcb_{m}": r["pass@1"] for m, r in res.items()})
 
 
 if __name__ == "__main__":

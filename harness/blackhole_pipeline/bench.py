@@ -200,16 +200,41 @@ def run_problem(p: dict, code: str) -> dict:
 # --------------------------------------------------------------------------- generation
 
 
+def fit_batch(model, batch: int, tokens: int) -> int:
+    """Largest batch (up to `batch`) whose KV cache for `tokens` positions fits in 80% of free GPU
+    memory. Sliding-window layers only keep their window."""
+    import torch
+    cfg = model.config
+    if not torch.cuda.is_available() or not hasattr(cfg, "num_key_value_heads"):
+        return batch
+    torch.cuda.empty_cache()
+    free = torch.cuda.mem_get_info()[0]
+    types = getattr(cfg, "layer_types", None) or ["full_attention"] * cfg.num_hidden_layers
+    win = getattr(cfg, "sliding_window", None) or tokens
+    d = getattr(cfg, "head_dim", None) or cfg.hidden_size // cfg.num_attention_heads
+    per_pos = 2 * cfg.num_key_value_heads * d * 2
+    row = sum(per_pos * (min(win, tokens) if t == "sliding_attention" else tokens) for t in types)
+    row += cfg.num_attention_heads * tokens * 4 * 2  # attention scores of one layer while decoding
+    return max(1, min(batch, int(0.8 * free // row)))
+
+
 def generate(model, tok, probs: list[dict], max_tokens: int, batch: int, stage: str | None, pct: tuple):
     import torch
     texts = [tok.apply_chat_template(prompt(p), tokenize=False, add_generation_prompt=True) for p in probs]
     gc = getattr(model, "generation_config", None)
     e = getattr(gc, "eos_token_id", None) if gc is not None else None
     eos = sorted({t for t in [tok.eos_token_id, *([e] if isinstance(e, int) else (e or []))] if t is not None})
+    # the model's own sampling settings when its generation_config sets them, else 0.6 / 0.95
+    sampled = gc is not None and getattr(gc, "do_sample", False)
+    temp = float(gc.temperature) if sampled and gc.temperature else 0.6
+    top_p = float(gc.top_p) if sampled and gc.top_p else 0.95
+    batch = fit_batch(model, batch, max(len(t) for t in texts) // 3 + max_tokens)
+    print(f"bench: sampling at temperature {temp}, top_p {top_p}, {batch} answers at a time, "
+          f"up to {max_tokens} tokens each", flush=True)
     order = sorted(range(len(texts)), key=lambda i: len(texts[i]))
     out = [""] * len(texts)
     tok.padding_side = "left"
-    t0, done = time.time(), 0
+    t0, done, ntok = time.time(), 0, 0
     for b0 in range(0, len(order), batch):
         idx = order[b0:b0 + batch]
         enc = tok([texts[i] for i in idx], return_tensors="pt", padding=True, add_special_tokens=False)
@@ -220,19 +245,26 @@ def generate(model, tok, probs: list[dict], max_tokens: int, batch: int, stage: 
                  f"writing solutions {b0 + 1}–{b0 + n} of {len(order)}: token {t}/{max_tokens}, {active} still writing")
         with torch.no_grad():
             if hasattr(model, "fast_generate"):
-                new = model.fast_generate(enc["input_ids"], enc["attention_mask"], max_tokens, 0.2, 0.95, eos,
+                new = model.fast_generate(enc["input_ids"], enc["attention_mask"], max_tokens, temp, top_p, eos,
                                           on_step=step).tolist()
             else:
                 dev = model.get_input_embeddings().weight.device
-                g = model.generate(**enc.to(dev), max_new_tokens=max_tokens, do_sample=True, temperature=0.2,
-                                   top_p=0.95, pad_token_id=tok.pad_token_id)
+                g = model.generate(**enc.to(dev), max_new_tokens=max_tokens, do_sample=True, temperature=temp,
+                                   top_p=top_p, pad_token_id=tok.pad_token_id)
                 new = g[:, enc["input_ids"].shape[1]:].tolist()
         for i, r in zip(idx, new):
             cut = next((k for k, t in enumerate(r) if t in eos), len(r))
-            out[i] = tok.decode(r[:cut], skip_special_tokens=True)
+            ntok += cut
+            # the answer is what follows the reasoning (<think> can be a special token a plain decode drops)
+            text = tok.decode(r[:cut], skip_special_tokens=False).rsplit("</think>", 1)[-1]
+            for t in tok.all_special_tokens:
+                text = text.replace(t, "")
+            out[i] = text
         done += len(idx)
-        print(f"bench: {done}/{len(order)} solutions written in {time.time() - t0:.0f}s", flush=True)
-    return out
+        dt = time.time() - t0
+        print(f"bench: {done}/{len(order)} solutions written in {dt:.0f}s, {ntok:,} tokens, "
+              f"{ntok / dt:.0f} tok/s total", flush=True)
+    return out, temp, ntok
 
 
 def run(model_dir: Path, out: Path, release: str, file: str | None, limit: int, max_tokens: int, batch: int,
@@ -247,7 +279,7 @@ def run(model_dir: Path, out: Path, release: str, file: str | None, limit: int, 
     model, tok = serve.load(model_dir, "cuda" if torch.cuda.is_available() else "cpu")
     t0 = time.time()
     span = pct[1] - pct[0]
-    replies = generate(model, tok, probs, max_tokens, batch, stage, (pct[0] + 0.03 * span, pct[0] + 0.9 * span))
+    replies, temp, ntok = generate(model, tok, probs, max_tokens, batch, stage, (pct[0] + 0.03 * span, pct[0] + 0.9 * span))
     gen_s = time.time() - t0
     del model
     from reaper_pipeline.load import free
@@ -268,8 +300,9 @@ def run(model_dir: Path, out: Path, release: str, file: str | None, limit: int, 
     summary = {"model": str(model_dir), "bench": f"LiveCodeBench {release if not file else file}", "problems": len(rows),
                "pass@1": round(sum(r["passed"] for r in rows) / len(rows), 4),
                "by_difficulty": {k: {"passed": a, "total": n, "pass@1": round(a / n, 4)} for k, (a, n) in by.items()},
-               "no_code": sum(1 for c in codes if not c.strip()), "max_tokens": max_tokens,
-               "gen_s": round(gen_s, 1), "dates": [rows[0]["date"], rows[-1]["date"]]}
+               "no_code": sum(1 for c in codes if not c.strip()), "max_tokens": max_tokens, "temperature": temp,
+               "gen_s": round(gen_s, 1), "tokens": ntok, "tok_s": round(ntok / gen_s, 1),
+               "batch": batch, "dates": [rows[0]["date"], rows[-1]["date"]]}
     (out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     return summary
 
@@ -281,8 +314,8 @@ def main(argv=None) -> int:
     ap.add_argument("--release", default="v6")
     ap.add_argument("--file", default=None)
     ap.add_argument("--limit", type=int, default=0)
-    ap.add_argument("--max-tokens", type=int, default=4096)
-    ap.add_argument("--batch", type=int, default=int(os.environ.get("BLACKHOLE_BENCH_BATCH", "128")))
+    ap.add_argument("--max-tokens", type=int, default=32768)
+    ap.add_argument("--batch", type=int, default=int(os.environ.get("BLACKHOLE_BENCH_BATCH", "256")))
     ap.add_argument("--stage", default=None, help="emit TUI progress events as this stage")
     ap.add_argument("--pct", default="0,100")
     ap.add_argument("--label", default="")
