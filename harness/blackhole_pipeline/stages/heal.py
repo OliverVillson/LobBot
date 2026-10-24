@@ -136,19 +136,17 @@ def run(bh, rj, quantized: bool = False) -> None:
     prof = profile(rj)
     data_path = rj.path("work", "heal_data.jsonl")
     calib = p["heal_calib"] or rj.config.calib or "mix"
-    meta = {"calib": calib, "max_tokens": p["heal_max_tokens"]}
+    meta = {"calib": calib, "max_tokens": p["heal_max_tokens"], "samples": p["heal_samples"]}
     rows = read_jsonl(data_path) if (rj.read("work/heal_data_meta.json") or meta) == meta else []
     emit(stage, pct=1, msg="loading the teacher")
     teacher = load_model(rj.model_dir, prof, rj.config.trust_remote_code).eval()
     for q in teacher.parameters():
         q.requires_grad_(False)
     dev = input_device(teacher)
-    if len(rows) < p["heal_prompts"]:
-        prompts, note = load_prompts(calib, p["heal_prompts"], seed=1234)
-        emit(stage, pct=3, msg=f"teacher answers for {len(prompts)} {note}")
-        enc = [encode(tok, q, None, rj.config.max_seq)[0] for q in prompts]
-        ge = teacher.generation_config.eos_token_id
-        eos = sorted({t for t in [tok.eos_token_id, *(ge if isinstance(ge, list) else [ge])] if t is not None})
+    ge = teacher.generation_config.eos_token_id
+    eos = sorted({t for t in [tok.eos_token_id, *(ge if isinstance(ge, list) else [ge])] if t is not None})
+
+    def teacher_answers(enc, temperature, top_p, top_k, what):
         done = [0]
         answers = [None] * len(enc)
 
@@ -156,11 +154,12 @@ def run(bh, rj, quantized: bool = False) -> None:
             answers[i] = r
             done[0] += 1
             if done[0] % 16 == 0:
-                emit(stage, pct=3 + 27 * done[0] / len(enc), msg=f"teacher answered {done[0]}/{len(enc)}")
+                emit(stage, pct=3 + 27 * done[0] / len(enc), msg=f"teacher {what} {done[0]}/{len(enc)}")
         if hasattr(teacher, "generate_many"):
             from blackhole_pipeline.bench import fit_batch
             slots = fit_batch(teacher, min(len(enc), 256), max(map(len, enc)) + p["heal_max_tokens"])
-            teacher.generate_many(enc, p["heal_max_tokens"], 0.7, 0.95, eos, slots=slots, on_done=on_done)
+            teacher.generate_many(enc, p["heal_max_tokens"], temperature, top_p, eos, slots=slots, on_done=on_done,
+                                  top_k=top_k)
         else:  # any other model: plain HF generate, 16 prompts at a time
             for b0 in range(0, len(enc), 16):
                 grp = enc[b0:b0 + 16]
@@ -169,11 +168,46 @@ def run(bh, rj, quantized: bool = False) -> None:
                 am = torch.tensor([[0] * (T - len(e)) + [1] * len(e) for e in grp], device=dev)
                 with torch.no_grad():
                     g = teacher.generate(input_ids=ids, attention_mask=am, max_new_tokens=p["heal_max_tokens"],
-                                         do_sample=True, temperature=0.7, top_p=0.95)
+                                         do_sample=True, temperature=temperature, top_p=top_p, top_k=top_k or None)
                 for j, r in enumerate(g[:, T:].tolist()):
                     cut = next((i + 1 for i, t in enumerate(r) if t in eos), len(r))
                     on_done(b0 + j, r[:cut])
-        rows = [{"ids": e + a, "start": len(e)} for e, a in zip(enc, answers) if a]
+        return [a or [] for a in answers]
+
+    samples = p["heal_samples"]
+    if not rows or (samples <= 1 and len(rows) < p["heal_prompts"]):
+        if samples > 1:  # verified shortest-trace distillation (traces.py)
+            from blackhole_pipeline import traces
+            from blackhole_pipeline.bench import extract_code, prompt, run_problem
+            if calib != "contest":
+                raise RuntimeError("heal_samples > 1 needs heal_calib = contest (problems with tests)")
+            emit(stage, pct=2, msg=f"loading {p['heal_prompts']} code_contests problems")
+            probs = traces.contest_problems(p["heal_prompts"])
+            gc = teacher.generation_config
+            sampled = getattr(gc, "do_sample", False)
+            temp = (gc.temperature or 1.0) if sampled else 1.0
+            top_p = (gc.top_p or 0.95) if sampled else 0.95
+            top_k = int(gc.to_diff_dict().get("top_k") or 20)
+
+            def gen(jobs):
+                texts = [tok.apply_chat_template(prompt(pr), tokenize=False, add_generation_prompt=True) for pr, _ in jobs]
+                enc = [tok(t, add_special_tokens=False)["input_ids"][:rj.config.max_seq] for t in texts]
+                emit(stage, pct=3, msg=f"teacher solving {len(probs)} problems × {samples}")
+                ans = teacher_answers(enc, temp, top_p, top_k, "answers")
+                return [(e, a, tok.decode(a, skip_special_tokens=True)) for e, a in zip(enc, ans)]
+            rows, trace_stats = traces.shortest_passing(
+                probs, samples, gen, lambda pr, text: run_problem(pr, extract_code(text))["passed"])
+            rj.write("work/heal_traces.json", trace_stats)
+            emit(stage, pct=30, msg=f"teacher solved {trace_stats['solved']}/{len(probs)} problems; kept answers are "
+                                    f"{trace_stats['shorter_than_passing']:.0%} shorter than its average passing one")
+        else:
+            prompts, note = load_prompts(calib, p["heal_prompts"], seed=1234)
+            emit(stage, pct=3, msg=f"teacher answers for {len(prompts)} {note}")
+            enc = [encode(tok, q, None, rj.config.max_seq)[0] for q in prompts]
+            answers = teacher_answers(enc, 0.7, 0.95, 0, "answered")
+            rows = [{"ids": e + a, "start": len(e)} for e, a in zip(enc, answers) if a]
+        if not rows:
+            raise RuntimeError("the teacher produced no usable training sequences")
         write_jsonl(data_path, rows)
         rj.write("work/heal_data_meta.json", meta)
     free()
@@ -353,7 +387,7 @@ def run(bh, rj, quantized: bool = False) -> None:
            "kl_before": round(before.get("kl", float("nan")), 4), "kl_after": round(after.get("kl", float("nan")), 4),
            "top1_before": round(before.get("top1_agreement", float("nan")), 4),
            "top1_after": round(after.get("top1_agreement", float("nan")), 4), "kept": better,
-           "best_step": best["step"], "history": history,
+           "best_step": best["step"], "history": history, "traces": rj.read("work/heal_traces.json") or None,
            "total_minutes": round((time.time() - t_start) / 60, 1)}
     rj.write(f"work/{stage}.json", res)
     rj.mark_done(stage, res)

@@ -357,3 +357,27 @@ def test_mac_schema_heal_and_mlx_on_a_tiny_flint(tmp_path):
     got = np.array(mm(mx.array(ids.numpy()))[0].astype(mx.float32))
     assert np.abs(got - ref).max() < 1e-3 * np.abs(ref).max() + 1e-4
     assert np.array_equal(got.argmax(-1), ref.argmax(-1))
+
+
+def test_shortest_passing_keeps_the_shortest_correct_answer():
+    from blackhole_pipeline.bench import extract_code, run_problem
+    from blackhole_pipeline.traces import shortest_passing
+    add = {"id": "add", "question": "a+b", "starter": "", "func": None,
+           "tests": [{"input": "1 2\n", "output": "3\n"}, {"input": "5 5\n", "output": "10\n"}]}
+    neg = {"id": "neg", "question": "-a", "starter": "", "func": None, "tests": [{"input": "4\n", "output": "-4\n"}]}
+    good = "```python\na, b = map(int, input().split())\nprint(a + b)\n```"
+    replies = {("add", 0): ("long thinking " * 30, good), ("add", 1): ("short", good),
+               ("add", 2): ("x", "```python\nprint(0)\n```"), ("neg", 0): ("y", "no code"),
+               ("neg", 1): ("z", "```python\nprint(4)\n```"), ("neg", 2): ("w", "")}
+
+    def gen(jobs):
+        out = []
+        for p, s in jobs:
+            think, ans = replies[(p["id"], s)]
+            text = f"<think>{think}</think>{ans}"
+            out.append(([1, 2, 3], list(range(len(text.split()))), text))
+        return out
+    rows, st = shortest_passing([add, neg], 3, gen, lambda p, t: run_problem(p, extract_code(t))["passed"])
+    assert st["solved"] == 1 and st["passed"] == 2 and st["answers"] == 6
+    assert len(rows) == 1 and rows[0]["start"] == 3
+    assert st["tokens_mean_kept"] < st["tokens_mean_passing"] and st["shorter_than_passing"] > 0

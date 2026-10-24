@@ -67,6 +67,7 @@ DEFAULTS = {
     "heal_seq": 0,           # tokens per training sequence (0 = the job's max_seq); long traces need ~16k
     "heal_expert_rank": 0,   # > 0: the routed experts train too, as rank-r updates merged before quantization
     "heal_lora_lr": 1e-4,
+    "heal_samples": 0,       # > 1 (with heal_calib contest): answers per problem; train on the shortest that passes its tests
     "mlx_bits": 3,           # MLX export: routed experts (GPTQ)
     "mlx_group": 64,
     "mlx_hot": 0.0,          # share of each layer's experts (by REAP score) on mlx_hot_bits
