@@ -347,9 +347,22 @@ class FlintModel(nn.Module):
         return self.norm(x)
 
 
+def pin_memory() -> None:
+    """Let MLX wire (pin) up to the GPU working-set limit, so macOS cannot page the weights out:
+    on a 16 GB Mac a 9 GB model otherwise gets partly swapped and a long prompt, which touches
+    every expert, reloads them from disk (measured on an M5: 385 -> 777 tok/s prompt processing)."""
+    try:
+        info = mx.device_info() if hasattr(mx, "device_info") else mx.metal.device_info()
+        if mx.metal.is_available() and info.get("max_recommended_working_set_size"):
+            mx.set_wired_limit(int(info["max_recommended_working_set_size"]))
+    except Exception:  # noqa: BLE001  (older MLX, or no GPU)
+        pass
+
+
 class Model(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
+        pin_memory()
         self.args = args
         self.model_type = args.model_type
         self.model = FlintModel(args)
