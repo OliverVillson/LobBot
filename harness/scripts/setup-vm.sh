@@ -17,6 +17,11 @@ if [ ! -x ~/bh-venv/bin/pip ]; then
     python3 -m venv ~/bh-venv
   fi
 fi
+# Python headers + a C compiler: Triton builds a small CUDA helper with gcc on first use
+v=$(python3 -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")')
+if [ ! -f "/usr/include/python$v/Python.h" ] || ! command -v gcc >/dev/null; then
+  sudo apt-get update -qq && sudo apt-get install -y -qq "python$v-dev" build-essential
+fi
 source ~/bh-venv/bin/activate
 pip install -q -U pip
 drv=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1 | cut -d. -f1)
