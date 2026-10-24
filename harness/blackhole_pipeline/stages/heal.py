@@ -116,6 +116,9 @@ def run(bh, rj) -> None:
                 x = layer(x, pos, mask)
         return model.model.norm(x)
 
+    for mdl in (teacher, student):  # batched experts (two bmm per layer) instead of the per-expert loop
+        if hasattr(mdl, "stack_experts"):
+            mdl.stack_experts()
     student.train()
     emit(STAGE, pct=36, msg=f"distilling: {n_train / 1e9:.2f}B trainable, {len(rows)} sequences, {steps} steps")
     t0, step, seen, loss_avg = time.time(), 0, 0, None
@@ -130,13 +133,18 @@ def run(bh, rj) -> None:
             hs = hidden(student, ids, True)[0, a - 1:-1]
             n_tok = hs.shape[0]
             total = 0.0
-            for c in range(0, n_tok, T_CHUNK):  # [chunk, vocab] logits at a time
+            # the loss runs in [chunk, vocab] pieces against a detached copy of the hidden states,
+            # then one backward pass through the network (not one per chunk)
+            hd = hs.detach().requires_grad_(True)
+            for c in range(0, n_tok, T_CHUNK):
                 with torch.no_grad():
                     lt = teacher.lm_head(ht[c:c + T_CHUNK]).float().log_softmax(-1)
-                ls = student.lm_head(hs[c:c + T_CHUNK]).float().log_softmax(-1)
+                ls = student.lm_head(hd[c:c + T_CHUNK]).float().log_softmax(-1)
                 kl = F.kl_div(ls, lt, log_target=True, reduction="sum") / max(1, n_tok) / p["heal_accum"]
-                kl.backward(retain_graph=c + T_CHUNK < n_tok)
+                kl.backward()
                 total += kl.item() * p["heal_accum"]
+            hs.backward(hd.grad)
+            del hd
             del ht, hs
             loss_avg = total if loss_avg is None else 0.95 * loss_avg + 0.05 * total
             seen += 1
