@@ -49,6 +49,38 @@ def grid_codes(w, scales, biases, bits: int, group: int):
     return u.reshape(w.shape).to(torch.int64)
 
 
+class AddAux:
+    """y unchanged forward; backward also sends `weight` into the auxiliary loss, so a loss computed
+    inside a (checkpointed) layer trains without being returned from it."""
+
+    def __new__(cls):
+        raise TypeError("use AddAux.apply")
+
+    @staticmethod
+    def apply(y, aux, weight: float):
+        return _add_aux().apply(y, aux, weight)
+
+
+def _add_aux():
+    import torch
+
+    global _AddAuxFn
+    if "_AddAuxFn" not in globals():
+        class _AddAuxFn(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, y, aux, weight):
+                ctx.weight = weight
+                ctx.save_for_backward(aux)
+                return y.view_as(y)
+
+            @staticmethod
+            def backward(ctx, gy):
+                (aux,) = ctx.saved_tensors
+                return gy, torch.full_like(aux, ctx.weight), None
+        globals()["_AddAuxFn"] = _AddAuxFn
+    return globals()["_AddAuxFn"]
+
+
 class FakeQuant:
     """Parametrization: the weight rounded on the MLX folder's own grid (its scales and biases
     stay fixed), gradient straight through, so training starts as exactly the stored model and
@@ -267,108 +299,218 @@ def run(bh, rj, quantized: bool = False) -> None:
     for _, q in params:
         q.requires_grad_(True)
     master = [q.detach().float().clone().requires_grad_(True) for _, q in params]
-    lora = [i for i, (n, _) in enumerate(params) if ".lora_" in n]
-    groups = [{"params": [mq for i, mq in enumerate(master) if i not in set(lora)], "base": p["heal_lr"]}]
-    if lora:
-        groups.append({"params": [master[i] for i in lora], "base": p["heal_lora_lr"]})
-    opt = torch.optim.AdamW(groups, lr=p["heal_lr"], betas=(0.9, 0.95), weight_decay=0.0)
     seq = p["heal_seq"] or rj.config.max_seq
     n_train = sum(q.numel() for _, q in params)
 
-    m = student.model
     random.Random(0).shuffle(rows)
-    steps = max(1, math.ceil(len(rows) * p["heal_epochs"] / p["heal_accum"]))
-    limit = p["heal_minutes"] * 60
     T_CHUNK = 512
+    accum = p["heal_accum"]
+    W_LAYER, W_ROUTER, FOCUS = p["heal_layer_weight"], p["heal_router_weight"], p["heal_focus"]
 
-    def hidden(model, ids, grad: bool):
+    # router distillation: the student's router copies the teacher's preferences among the experts
+    # REAP kept (teacher router logits captured per layer, the loss rides on the routing weights)
+    kept = {}
+    if W_ROUTER and not quantized:
+        kept = {L["layer"]: L["kept"] for L in (rj.read("work/saliency.json") or {}).get("layers", [])}
+    kept_idx = {li: torch.tensor(v, device=dev) for li, v in kept.items()}
+    t_router, hooks = {}, []
+
+    def gate_of(layer):
+        g = getattr(getattr(layer, "mlp", None), "gate", None)
+        return g if isinstance(g, torch.nn.Module) else None
+    for li, (lt_, ls_) in enumerate(zip(teacher.model.layers, student.model.layers)):
+        gt, gs = gate_of(lt_), gate_of(ls_)
+        if li not in kept or gt is None or gs is None:
+            continue
+
+        def th(mod, args, out, li=li):
+            lg = out[0] if isinstance(out, tuple) else out
+            t_router[li] = lg.detach().float()[:, kept_idx[li]]
+
+        def sh(mod, args, out, li=li):
+            tl = t_router.get(li)
+            lg = out[0] if isinstance(out, tuple) else out
+            if not torch.is_grad_enabled() or tl is None or tl.shape[0] != lg.shape[0]:
+                return out
+            aux = F.kl_div(lg.float().log_softmax(-1), tl.log_softmax(-1), log_target=True,
+                           reduction="batchmean") * W_ROUTER / accum / len(kept)
+            if isinstance(out, tuple):
+                o = list(out)
+                j = 1 if len(o) > 1 else 0   # Flint: (logits, weights, ids); the weights reach the loss
+                o[j] = AddAux.apply(o[j], aux, 1.0)
+                return tuple(o)
+            return AddAux.apply(out, aux, 1.0)
+        hooks += [gt.register_forward_hook(th), gs.register_forward_hook(sh)]
+
+    def hidden(model, ids, grad: bool, layers: bool = False):
         x = model.model.embed_tokens(ids)
         pos = torch.arange(ids.shape[1], device=ids.device)[None]
         mask = torch.ones_like(ids, dtype=torch.bool)
+        outs = []
         for layer in model.model.layers:
             if grad:
                 x = torch.utils.checkpoint.checkpoint(layer, x, pos, mask, use_reentrant=False)
             else:
                 x = layer(x, pos, mask)
-        return model.model.norm(x)
+            if layers:
+                outs.append(x)
+        return model.model.norm(x), outs
 
-    student.train()
-    emit(stage, pct=36, msg=f"distilling: {n_train / 1e9:.2f}B trainable, {len(rows)} sequences, {steps} steps")
-    t0, step, seen, loss_avg = time.time(), 0, 0, None
+    def seq_loss(r, reverse: bool) -> float:
+        """One sequence: KL on the answer tokens (forward on teacher text, reverse on the student's
+        own), optionally focused on the tokens that disagree most, plus layer matching; one backward."""
+        ids = torch.tensor([r["ids"][:seq]], device=dev)
+        a = r["start"]
+        with torch.no_grad():
+            ht, t_layers = hidden(teacher, ids, False, W_LAYER > 0)
+        hs, s_layers = hidden(student, ids, True, W_LAYER > 0)
+        ht, hs = ht[0, a - 1:-1], hs[0, a - 1:-1]
+        n_tok = hs.shape[0]
+        total = 0.0
+        # the loss runs in [chunk, vocab] pieces against a detached copy of the hidden states,
+        # then one backward pass through the network (not one per chunk)
+        hd = hs.detach().requires_grad_(True)
+        for c in range(0, n_tok, T_CHUNK):
+            with torch.no_grad():
+                lt = teacher.lm_head(ht[c:c + T_CHUNK]).float().log_softmax(-1)
+            ls = student.lm_head(hd[c:c + T_CHUNK]).float().log_softmax(-1)
+            per = (ls.exp() * (ls - lt)).sum(-1) if reverse else (lt.exp() * (lt - ls)).sum(-1)
+            if FOCUS:
+                w = (per.detach() / per.detach().mean().clamp(min=1e-8)).clamp(max=4.0) ** FOCUS
+                w = w / w.mean()
+            else:
+                w = 1.0
+            kl = (per * w).sum() / max(1, n_tok) / accum
+            kl.backward()
+            total += (per.detach().sum() / max(1, n_tok)).item()
+        extra = None
+        if W_LAYER:  # each layer's residual stream against the teacher's (relative MSE on the answer tokens)
+            terms = [((xs[0, a - 1:-1].float() - xt[0, a - 1:-1].float()) ** 2).mean()
+                     / (xt[0, a - 1:-1].float() ** 2).mean().clamp(min=1e-8) for xs, xt in zip(s_layers, t_layers)]
+            extra = torch.stack(terms).mean() * W_LAYER / accum
+        if extra is not None:
+            torch.autograd.backward([hs, extra], [hd.grad, None])
+        else:
+            hs.backward(hd.grad)
+        t_router.clear()
+        return total
+
     best = {"kl": before.get("kl", float("inf")), "step": 0, "state": None, "r": None}
     history = []
-    k = 0
-    stopped = False
-    while step < steps and not stopped:
-        for r in rows:
-            ids = torch.tensor([r["ids"][:seq]], device=dev)
-            a = r["start"]
-            with torch.no_grad():
-                ht = hidden(teacher, ids, False)[0, a - 1:-1]
-            hs = hidden(student, ids, True)[0, a - 1:-1]
-            n_tok = hs.shape[0]
-            total = 0.0
-            # the loss runs in [chunk, vocab] pieces against a detached copy of the hidden states,
-            # then one backward pass through the network (not one per chunk)
-            hd = hs.detach().requires_grad_(True)
-            for c in range(0, n_tok, T_CHUNK):
-                with torch.no_grad():
-                    lt = teacher.lm_head(ht[c:c + T_CHUNK]).float().log_softmax(-1)
-                ls = student.lm_head(hd[c:c + T_CHUNK]).float().log_softmax(-1)
-                kl = F.kl_div(ls, lt, log_target=True, reduction="sum") / max(1, n_tok) / p["heal_accum"]
-                kl.backward()
-                total += kl.item() * p["heal_accum"]
-            hs.backward(hd.grad)
-            del hd
-            del ht, hs
-            loss_avg = total if loss_avg is None else 0.95 * loss_avg + 0.05 * total
-            seen += 1
-            k += 1
-            if k % p["heal_accum"]:
-                continue
-            ok = all(q.grad is None or torch.isfinite(q.grad).all() for _, q in params)
-            if ok:
-                for (_, q), mq in zip(params, master):
-                    mq.grad = q.grad.float() if q.grad is not None else None
-                torch.nn.utils.clip_grad_norm_(master, 1.0)
-                sched = min(1.0, (step + 1) / max(1, steps // 20)) * 0.5 * (1 + math.cos(math.pi * step / steps))
-                for g in opt.param_groups:
-                    g["lr"] = g["base"] * sched
-                opt.step()
-                with torch.no_grad():
+    run_ = {"step": 0, "seen": 0, "loss": None}
+    t0 = time.time()
+
+    def make_opt():
+        lora = [i for i, (n, _) in enumerate(params) if ".lora_" in n]
+        groups = [{"params": [mq for i, mq in enumerate(master) if i not in set(lora)], "base": p["heal_lr"]}]
+        if lora:
+            groups.append({"params": [master[i] for i in lora], "base": p["heal_lora_lr"]})
+        return torch.optim.AdamW(groups, lr=p["heal_lr"], betas=(0.9, 0.95), weight_decay=0.0)
+
+    def phase(rows_, epochs: float, limit: float, reverse: bool, label: str, pct0: float, span: float) -> None:
+        """Distil on rows_ with early stopping on the held-out KL (global best kept across phases)."""
+        steps = max(1, math.ceil(len(rows_) * epochs / accum))
+        t_phase, step, k, stopped = time.time(), 0, 0, False
+        student.train()
+        while step < steps and not stopped:
+            for r in rows_:
+                total = seq_loss(r, reverse)
+                run_["loss"] = total if run_["loss"] is None else 0.95 * run_["loss"] + 0.05 * total
+                run_["seen"] += 1
+                k += 1
+                if k % accum:
+                    continue
+                ok = all(q.grad is None or torch.isfinite(q.grad).all() for _, q in params)
+                if ok:
                     for (_, q), mq in zip(params, master):
-                        q.copy_(mq.to(q.dtype))
-            opt.zero_grad(set_to_none=True)
-            for _, q in params:
-                q.grad = None
-            step += 1
-            el = time.time() - t0
-            emit(stage, pct=36 + 50 * step / steps,
-                 msg=f"step {step}/{steps} · KL {loss_avg:.4f} · {seen} seqs · {el / 60:.0f} min"
-                     + ("" if ok else " · skipped a non-finite step"))
-            if refs and (step % p["heal_eval_every"] == 0 or step >= steps):
-                student.eval()
-                r_ = compare(student, refs)
-                student.train()
-                history.append({"step": step, "kl": round(r_["kl"], 4), "top1": round(r_["top1_agreement"], 4)})
-                if r_["kl"] < best["kl"]:
-                    best.update(kl=r_["kl"], step=step, r=r_,
-                                state=[q.detach().to("cpu", copy=True) for _, q in params])
-                emit(stage, pct=36 + 50 * step / steps,
-                     msg=f"step {step}: held-out KL {r_['kl']:.3f} (start {before['kl']:.3f}, best {best['kl']:.3f}"
-                         f" at step {best['step']})")
-                if step - best["step"] >= 3 * p["heal_eval_every"]:  # no better point for a while
+                        mq.grad = q.grad.float() if q.grad is not None else None
+                    torch.nn.utils.clip_grad_norm_(master, 1.0)
+                    sched = min(1.0, (step + 1) / max(1, steps // 20)) * 0.5 * (1 + math.cos(math.pi * step / steps))
+                    for g in opt.param_groups:
+                        g["lr"] = g["base"] * sched
+                    opt.step()
+                    with torch.no_grad():
+                        for (_, q), mq in zip(params, master):
+                            q.copy_(mq.to(q.dtype))
+                opt.zero_grad(set_to_none=True)
+                for _, q in params:
+                    q.grad = None
+                step += 1
+                run_["step"] += 1
+                el = time.time() - t_phase
+                emit(stage, pct=pct0 + span * step / steps,
+                     msg=f"{label} step {step}/{steps} · KL {run_['loss']:.4f} · {run_['seen']} seqs · "
+                         f"{(time.time() - t0) / 60:.0f} min" + ("" if ok else " · skipped a non-finite step"))
+                if refs and (step % p["heal_eval_every"] == 0 or step >= steps):
+                    student.eval()
+                    r_ = compare(student, refs)
+                    student.train()
+                    history.append({"step": run_["step"], "phase": label, "kl": round(r_["kl"], 4),
+                                    "top1": round(r_["top1_agreement"], 4)})
+                    if r_["kl"] < best["kl"]:
+                        best.update(kl=r_["kl"], step=run_["step"], r=r_,
+                                    state=[q.detach().to("cpu", copy=True) for _, q in params])
+                    emit(stage, pct=pct0 + span * step / steps,
+                         msg=f"{label} step {step}: held-out KL {r_['kl']:.3f} (start {before['kl']:.3f}, "
+                             f"best {best['kl']:.3f} at step {best['step']})")
+                    if run_["step"] - max(best["step"], phase_start[0]) >= 3 * p["heal_eval_every"]:
+                        stopped = True
+                        break
+                if step >= steps:
+                    break
+                if limit and el > limit:
                     stopped = True
                     break
-            if step >= steps:
-                break
-            if limit and el > limit:
-                stopped = True
-                break
+
+    def restore_best() -> None:
+        if best.get("state") is not None:
+            with torch.no_grad():
+                for (_, q), mq, saved in zip(params, master, best["state"]):
+                    q.copy_(saved.to(q.device))
+                    mq.copy_(q.float())
+
+    opt = make_opt()
+    emit(stage, pct=36, msg=f"distilling: {n_train / 1e9:.2f}B trainable, {len(rows)} sequences")
+    phase_start = [0]
+    opd_rounds = 0 if quantized else p["heal_opd_rounds"]
+    phase(rows, p["heal_epochs"], (p["qheal_minutes"] if quantized else p["heal_minutes"]) * 60, False, "distil", 36,
+          50 if not opd_rounds else 25)
+    opd = []
+    if opd_rounds and hasattr(student, "generate_many"):
+        # on-policy distillation: the student writes the answers, the teacher grades every token
+        # (reverse KL), so it learns to recover from its own mistakes instead of only copying
+        restore_best()
+        if hasattr(student, "merge_expert_lora") and any(".lora_" in n for n, _ in params):
+            student.merge_expert_lora()     # the student's fast decoder runs merged weights
+            params = [(n, q) for n, q in params if ".lora_" not in n]
+            master = [q.detach().float().clone().requires_grad_(True) for _, q in params]
+            if best.get("state") is not None:
+                best["state"] = [q.detach().to("cpu", copy=True) for _, q in params]
+        opt = make_opt()
+        prompts = [r["ids"][:r["start"]] for r in rows]
+        gc = teacher.generation_config
+        top_k = int(gc.to_diff_dict().get("top_k") or 20)
+        n_opd = min(len(prompts), p["heal_opd_prompts"])
+        for rnd in range(opd_rounds):
+            batch = random.Random(100 + rnd).sample(prompts, n_opd)
+            emit(stage, pct=61 + 25 * rnd / opd_rounds, msg=f"on-policy round {rnd + 1}/{opd_rounds}: "
+                                                            f"the student answers {n_opd} prompts")
+            student.eval()
+            from blackhole_pipeline.bench import fit_batch
+            with torch.no_grad():
+                slots = fit_batch(student, min(n_opd, 256), max(map(len, batch)) + p["heal_max_tokens"])
+                outs = student.generate_many(batch, p["heal_max_tokens"], 1.0, 0.95, eos, slots=slots, top_k=top_k)
+            roll = [{"ids": list(pr) + list(o), "start": len(pr)} for pr, o in zip(batch, outs) if len(o) > 1]
+            opd.append({"round": rnd + 1, "rollouts": len(roll),
+                        "tokens_mean": round(sum(len(r["ids"]) - r["start"] for r in roll) / max(1, len(roll)), 1)})
+            phase_start[0] = run_["step"]
+            phase(roll, 1.0, p["heal_opd_minutes"] * 60 / opd_rounds, True, f"on-policy {rnd + 1}",
+                  61 + 25 * rnd / opd_rounds, 25 / opd_rounds)
+    for h in hooks:
+        h.remove()
+    step = run_["step"]
     if best.get("state") is not None:  # back to the best point seen on the held-out answers
-        with torch.no_grad():
-            for (_, q), saved in zip(params, best["state"]):
-                q.copy_(saved.to(q.device))
+        restore_best()
     elif refs:  # never better than the start: the unhealed weights stand (nothing is written)
         best["r"] = None
     del opt, master
@@ -411,7 +553,7 @@ def run(bh, rj, quantized: bool = False) -> None:
            "kl_before": round(before.get("kl", float("nan")), 4), "kl_after": round(after.get("kl", float("nan")), 4),
            "top1_before": round(before.get("top1_agreement", float("nan")), 4),
            "top1_after": round(after.get("top1_agreement", float("nan")), 4), "kept": better,
-           "best_step": best["step"], "history": history, "traces": rj.read("work/heal_traces.json") or None,
+           "best_step": best["step"], "history": history, "on_policy": opd, "traces": rj.read("work/heal_traces.json") or None,
            "total_minutes": round((time.time() - t_start) / 60, 1)}
     rj.write(f"work/{stage}.json", res)
     rj.mark_done(stage, res)

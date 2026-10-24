@@ -67,6 +67,13 @@ DEFAULTS = {
     "heal_seq": 0,           # tokens per training sequence (0 = the job's max_seq); long traces need ~16k
     "heal_expert_rank": 0,   # > 0: the routed experts train too, as rank-r updates merged before quantization
     "heal_lora_lr": 1e-4,
+    "heal_layer_weight": 0.0,  # > 0: also match every layer's residual stream to the teacher's
+    "heal_router_weight": 0.0, # > 0: routers copy the teacher's preferences among the kept experts
+    "heal_focus": 0.0,       # > 0: weight tokens by how much student and teacher disagree (power)
+    "heal_opd_rounds": 0,    # on-policy distillation rounds after the first pass (student writes, teacher grades)
+    "heal_opd_prompts": 256, # student answers per round
+    "heal_opd_minutes": 60,
+    "qheal_minutes": 45,     # training cap of the heal around the quantized model
     "heal_samples": 0,       # > 1 (with heal_calib contest): answers per problem; train on the shortest that passes its tests
     "mlx_bits": 3,           # MLX export: routed experts (GPTQ)
     "mlx_group": 64,

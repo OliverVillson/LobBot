@@ -281,7 +281,7 @@ def test_mac_schema_heal_and_mlx_on_a_tiny_flint(tmp_path):
         "model": str(model), "schema": sc.id, "target": "mac", "purpose": "",
         "steps": [s.__dict__ for s in sc.steps], "quant": sc.quant, "calib_samples": 8, **small,
         "mlx_group": 32, "mlx_hot": 0.5, "mlx_qo_bits": 3, "mlx_head_vocab": 190, "heal_prompts": 6, "heal_max_tokens": 10, "heal_accum": 2,
-        "heal_lr": 1e-3, "heal_expert_rank": 2, "bench_file": str(probs), "bench_max_tokens": 16}))
+        "heal_lr": 1e-3, "heal_expert_rank": 2, "heal_layer_weight": 1.0, "heal_router_weight": 1.0, "heal_opd_rounds": 1, "heal_opd_prompts": 3, "bench_file": str(probs), "bench_max_tokens": 16}))
     p = subprocess.run([sys.executable, "-m", "blackhole_pipeline", "--job", str(job)], env=env, cwd=tmp_path,
                        capture_output=True, text=True, timeout=900)
     events = [e for e in map(parse_event, p.stdout.splitlines()) if e]
@@ -328,6 +328,8 @@ def test_mac_schema_heal_and_mlx_on_a_tiny_flint(tmp_path):
     assert rcfg["calib"] == "code" and rcfg["prune"] == 0.5
     heal = json.loads((job / "reaper" / "work" / "heal.json").read_text())
     assert heal["steps"] >= 1 and heal["sequences"] == 6
+    assert heal["on_policy"] and heal["on_policy"][0]["rollouts"] >= 1      # the student wrote, the teacher graded
+    assert any(h["phase"].startswith("on-policy") for h in heal["history"])
     rec = json.loads((job / "receipt.json").read_text())
     xdir = Path(rec["model"])
     assert "-MLX-" in xdir.name and (xdir / "flint_mlx.py").exists()
