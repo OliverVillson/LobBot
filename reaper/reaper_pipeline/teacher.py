@@ -58,6 +58,12 @@ class HfTeacher:
         self.tok.padding_side = "left"
         self.model = load_model(model_dir, prof, trust_remote_code)
         self.batch = max(1, int((prof.get("reap") or {}).get("batch_seqs", 1)) * 4)
+        # models with their own cached generation (REAPer's Flint) take far bigger batches
+        self.fast = hasattr(self.model, "fast_generate")
+        if self.fast:
+            self.batch = int(os.environ.get("REAPER_HF_TEACHER_BATCH", "128" if prof.get("device") == "cuda" else "8"))
+        self.eos = [t for t in {self.tok.eos_token_id, *_as_list(getattr(self.model.generation_config,
+                                                                        "eos_token_id", None))} if t is not None]
 
     def _render(self, conv: list[dict]) -> str:
         if getattr(self.tok, "chat_template", None):
@@ -73,6 +79,16 @@ class HfTeacher:
             texts = [self._render(c) for c in convs[i:i + self.batch]]
             enc = self.tok(texts, return_tensors="pt", padding=True, add_special_tokens=False).to(input_device(self.model))
             with torch.no_grad():
+                if self.fast:
+                    new = self.model.fast_generate(enc["input_ids"], enc["attention_mask"], max_tokens, temperature,
+                                                   0.95, self.eos)
+                    rows = []
+                    for r in new.tolist():
+                        cut = next((i for i, t in enumerate(r) if t in self.eos), len(r))
+                        rows.append(r[:cut])
+                    out += self.tok.batch_decode(rows, skip_special_tokens=True)
+                    log(f"teacher: {min(i + self.batch, len(convs))}/{len(convs)} answered (cached generation)")
+                    continue
                 gen = self.model.generate(**enc, max_new_tokens=max_tokens, do_sample=temperature > 0,
                                           temperature=max(temperature, 1e-5), top_p=0.95,
                                           pad_token_id=self.tok.pad_token_id)
@@ -82,6 +98,10 @@ class HfTeacher:
 
     def close(self) -> None:
         del self.model
+
+
+def _as_list(x) -> list:
+    return [] if x is None else ([x] if isinstance(x, int) else list(x))
 
 
 def make_teacher(model_dir: str, prof: dict, backend: str = "auto", trust_remote_code: bool = False, seed: int = 0):

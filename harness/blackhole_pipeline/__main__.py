@@ -161,7 +161,8 @@ def seed_from_previous(bh: BHJob, rj) -> None:
 def teacher_check(rj) -> None:
     """When calibrate must run: if the installed vLLM has no model class for this architecture (current
     vLLM releases have no Flint), use REAPer's PyTorch model as the teacher instead of failing, with
-    shorter answers and fewer samples so it finishes in reasonable time (it has no KV cache)."""
+    shorter answers and fewer samples so it finishes in reasonable time (Flint's PyTorch port generates
+    with a KV cache in batches of 128; other models fall back to transformers generate)."""
     if rj.config.teacher_backend != "auto":
         return
     mc = json.loads((rj.model_dir / "config.json").read_text()) if (rj.model_dir / "config.json").exists() else {}
@@ -178,11 +179,11 @@ def teacher_check(rj) -> None:
     if not out or out[-1] != "no":
         return
     raw = json.loads(rj.path("config.json").read_text())
-    raw.update(teacher_backend="hf", answer_max_tokens=min(raw.get("answer_max_tokens", 1024), 320),
-               calib_samples=min(raw.get("calib_samples", 256), 96))
+    raw.update(teacher_backend="hf", answer_max_tokens=min(raw.get("answer_max_tokens", 1024), 512),
+               calib_samples=min(raw.get("calib_samples", 256), 160))
     rj.path("config.json").write_text(json.dumps(raw, indent=2) + "\n")
     log(f"teacher: this vLLM has no {arch}; using REAPer's PyTorch model as the teacher "
-        f"({raw['calib_samples']} samples, answers up to {raw['answer_max_tokens']} tokens; slower, no KV cache)")
+        f"({raw['calib_samples']} samples, answers up to {raw['answer_max_tokens']} tokens)")
 
 
 def rekeep(rj) -> None:

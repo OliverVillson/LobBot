@@ -25,7 +25,7 @@ def answer_chunk(prof: dict, backend: str, n: int) -> int:
     pay a full 1024-token straggler tail per call. Submit ~4x the batch the engine can hold
     (still >= 10 progress updates on big sets), which keeps the GPU full until the end."""
     if backend != "vllm":
-        return CHUNK
+        return max(CHUNK, min(n, 128))  # the hf teacher batches internally (128 with cached generation)
     seqs = int((prof.get("teacher") or {}).get("max_num_seqs") or 256)
     return max(CHUNK, min(n, max(4 * seqs, -(-n // 10))))
 

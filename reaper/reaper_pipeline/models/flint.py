@@ -32,6 +32,7 @@ from transformers import GenerationMixin, PreTrainedConfig, PreTrainedModel
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 Q_CHUNK = 1024  # query rows per attention chunk (bounds the [heads, q, k] score matrix)
+Q_CHUNK_CACHED = 256  # the same for cached generation, where the batch is large
 
 
 class FlintConfig(PreTrainedConfig):
@@ -166,13 +167,15 @@ class FlintAttention(nn.Module):
         self.window = config.sliding_window if sliding else None
         self.scale = D ** -0.5
 
-    def forward(self, x, pos, key_mask):
+    def forward(self, x, pos, key_mask, kv=None):
         B, T, _ = x.shape
         q = self.q_norm(self.q_proj(x).view(B, T, self.nh, self.d)).transpose(1, 2)
         k = self.k_norm(self.k_proj(x).view(B, T, self.nkv, self.d)).transpose(1, 2)
         v = self.v_proj(x).view(B, T, self.nkv, self.d).transpose(1, 2)
         if self.rope:
             q, k = _rope(q, pos, self.theta), _rope(k, pos, self.theta)
+        if kv is not None:
+            return self._cached(q, k, v, key_mask, kv)
         rep = self.nh // self.nkv
         k = k.repeat_interleave(rep, 1).float()
         v = v.repeat_interleave(rep, 1).float()
@@ -194,6 +197,40 @@ class FlintAttention(nn.Module):
         out = out.to(x.dtype).transpose(1, 2).reshape(B, T, self.nh * self.d)
         return self.o_proj(out)
 
+    def _cached(self, q, k, v, key_mask, kv: dict):
+        """Attention for generation with a KV cache (kv holds this layer's k, v [B, nkv, Tk, D]).
+        key_mask [B, Tk] covers cache + new tokens. Query heads are grouped onto their KV head, so
+        the cache is never repeated per head; same masking, window and sink as forward()."""
+        if "k" in kv:
+            k, v = torch.cat([kv["k"], k], 2), torch.cat([kv["v"], v], 2)
+        kv["k"], kv["v"] = k, v
+        B, H, T, D = q.shape
+        G, rep, Tk = self.nkv, self.nh // self.nkv, k.shape[2]
+        off = Tk - T
+        qg = q.reshape(B, G, rep, T, D)
+        kt = k.transpose(-1, -2)
+        kpos = torch.arange(Tk, device=q.device)
+        sink = self.softmax_offset.float().view(1, G, rep, 1, 1)
+        out = torch.empty(B, G, rep, T, D, device=q.device, dtype=q.dtype)
+        for a in range(0, T, Q_CHUNK_CACHED):
+            b = min(T, a + Q_CHUNK_CACHED)
+            t = b - a
+            s = torch.matmul(qg[:, :, :, a:b].reshape(B, G, rep * t, D), kt).float() * self.scale
+            s = s.view(B, G, rep, t, Tk)
+            qpos = kpos[off + a:off + b, None]
+            allowed = kpos[None, :] <= qpos
+            if self.window:
+                allowed &= kpos[None, :] > qpos - self.window
+            allowed = allowed[None, None, None] & key_mask[:, None, None, None, :]
+            s = s.masked_fill(~allowed, float("-inf"))
+            m = torch.maximum(s.amax(-1, keepdim=True), sink)
+            p = torch.exp(s - m)
+            den = p.sum(-1, keepdim=True) + torch.exp(sink - m)
+            o = torch.matmul((p / den).to(v.dtype).view(B, G, rep * t, Tk), v)
+            out[:, :, :, a:b] = o.view(B, G, rep, t, D)
+        out = out.reshape(B, H, T, D).transpose(1, 2).reshape(B, T, H * D)
+        return self.o_proj(out)
+
 
 class FlintDecoderLayer(nn.Module):
     def __init__(self, config: FlintConfig, layer_idx: int):
@@ -204,8 +241,8 @@ class FlintDecoderLayer(nn.Module):
         self.input_layernorm = FlintRMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_attention_layernorm = FlintRMSNorm(config.hidden_size, config.rms_norm_eps)
 
-    def forward(self, x, pos, key_mask):
-        x = x + self.self_attn(self.input_layernorm(x), pos, key_mask)
+    def forward(self, x, pos, key_mask, kv=None):
+        x = x + self.self_attn(self.input_layernorm(x), pos, key_mask, kv)
         return x + self.mlp(self.post_attention_layernorm(x))
 
 
@@ -281,8 +318,59 @@ class FlintForCausalLM(FlintPreTrainedModel, GenerationMixin):
                                    ignore_index=-100)
         return CausalLMOutputWithPast(loss=loss, logits=logits)
 
+    @torch.no_grad()
+    def fast_generate(self, input_ids, attention_mask=None, max_new_tokens: int = 256, temperature: float = 0.0,
+                      top_p: float = 1.0, eos_token_id=None, generator=None):
+        """Batched sampling with a KV cache (generate() recomputes the whole sequence every step).
+        input_ids [B, T] left-padded. Returns new tokens [B, n]; a row is padded with its first
+        eos token after it finishes."""
+        m = self.model
+        B = input_ids.shape[0]
+        dev = m.embed_tokens.weight.device
+        input_ids = input_ids.to(dev)
+        key_mask = (attention_mask.to(dev).bool() if attention_mask is not None
+                    else torch.ones_like(input_ids, dtype=torch.bool))
+        pos = (key_mask.long().cumsum(-1) - 1).clamp(min=0)
+        eos = torch.tensor(sorted({eos_token_id} if isinstance(eos_token_id, int) else set(eos_token_id or [])),
+                           dtype=torch.long, device=dev)
+        caches = [{} for _ in m.layers]
+        x = m.embed_tokens(input_ids)
+        for layer, kv in zip(m.layers, caches):
+            x = layer(x, pos, key_mask, kv)
+        last = pos[:, -1]
+        done = torch.zeros(B, dtype=torch.bool, device=dev)
+        fill = eos[0] if len(eos) else torch.tensor(0, device=dev)
+        out = []
+        for step in range(max_new_tokens):
+            logits = self.lm_head(m.norm(x[:, -1])).float()
+            nxt = _sample(logits, temperature, top_p, generator)
+            nxt = torch.where(done, fill, nxt)
+            out.append(nxt)
+            if len(eos):
+                done |= torch.isin(nxt, eos)
+            if bool(done.all()) or step == max_new_tokens - 1:
+                break
+            last = last + 1
+            key_mask = torch.cat([key_mask, torch.ones(B, 1, dtype=torch.bool, device=dev)], 1)
+            x = m.embed_tokens(nxt[:, None])
+            for layer, kv in zip(m.layers, caches):
+                x = layer(x, last[:, None], key_mask, kv)
+        return torch.stack(out, 1) if out else input_ids.new_zeros(B, 0)
+
     def prepare_inputs_for_generation(self, input_ids, attention_mask=None, **_):
         return {"input_ids": input_ids, "attention_mask": attention_mask}
+
+
+def _sample(logits, temperature: float, top_p: float, generator=None):
+    if temperature <= 0:
+        return logits.argmax(-1)
+    probs = torch.softmax(logits / temperature, -1)
+    if top_p < 1.0:
+        sp, si = probs.sort(-1, descending=True)
+        keep = sp.cumsum(-1) - sp < top_p
+        sp = sp * keep
+        return si.gather(1, torch.multinomial(sp / sp.sum(-1, keepdim=True), 1, generator=generator))[:, 0]
+    return torch.multinomial(probs, 1, generator=generator)[:, 0]
 
 
 def register() -> bool:

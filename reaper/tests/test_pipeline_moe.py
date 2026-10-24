@@ -350,3 +350,24 @@ def test_expert_fp8_quant(models, tmp_path):
     assert q["quant_method"] == "fp8" and q["weight_block_size"] == [128, 128]
     assert "model.layers.1.mlp.gate" in q["ignored_layers"] and "lm_head" in q["ignored_layers"]
     assert not any(".experts." in m for m in q["ignored_layers"])
+
+
+def test_flint_cached_generation_matches_full_recompute(models):
+    """fast_generate (KV cache, grouped heads) gives the same greedy tokens as recomputing the
+    whole left-padded sequence every step, through the sliding window and the no-RoPE layer."""
+    model = load(models["flint"])
+    x = ids(10)
+    mask = torch.ones_like(x)
+    x[1, :3], mask[1, :3] = 0, 0  # left padding on the second row
+    new = model.fast_generate(x, mask, max_new_tokens=8)
+    seq, m = x.clone(), mask.clone()
+    for _ in range(8):
+        with torch.no_grad():
+            nxt = model(input_ids=seq, attention_mask=m).logits[:, -1].argmax(-1)
+        seq, m = torch.cat([seq, nxt[:, None]], 1), torch.cat([m, torch.ones_like(m[:, :1])], 1)
+    assert torch.equal(new, seq[:, 10:])
+    # sampling runs and respects eos padding
+    g = torch.Generator().manual_seed(0)
+    s = model.fast_generate(x, mask, max_new_tokens=6, temperature=0.7, top_p=0.9, eos_token_id=[int(new[0, 0])],
+                            generator=g)
+    assert s.shape[0] == 2 and s.shape[1] <= 6
