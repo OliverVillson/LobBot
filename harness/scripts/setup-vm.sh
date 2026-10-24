@@ -8,7 +8,15 @@ if [ ! -d ~/LobBot ]; then
   git clone -b claude/flint-tui-run https://github.com/OliverVillson/LobBot.git ~/LobBot
 fi
 git -C ~/LobBot pull --ff-only
-[ -d ~/bh-venv ] || python3 -m venv ~/bh-venv
+if [ ! -x ~/bh-venv/bin/pip ]; then
+  rm -rf ~/bh-venv
+  if ! python3 -m venv ~/bh-venv 2>/dev/null; then  # Ubuntu images without ensurepip
+    rm -rf ~/bh-venv
+    v=$(python3 -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")')
+    sudo apt-get update -qq && sudo apt-get install -y -qq "python$v-venv" python3-venv
+    python3 -m venv ~/bh-venv
+  fi
+fi
 source ~/bh-venv/bin/activate
 pip install -q -U pip
 drv=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1 | cut -d. -f1)
