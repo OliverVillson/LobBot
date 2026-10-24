@@ -28,7 +28,7 @@ def main():
     path = Path(sys.argv[1]).expanduser()
     nums = [a for a in sys.argv[2:] if a.isdigit()]
     T = int(nums[0]) if nums else 1024
-    info = mx.metal.device_info() if hasattr(mx.metal, "device_info") else mx.device_info()
+    info = mx.device_info() if hasattr(mx, "device_info") else mx.metal.device_info()
     rec = int(info.get("max_recommended_working_set_size", 0))
     print(f"RAM {info.get('memory_size', 0) / 2**30:.1f} GB, GPU working set limit {rec / 2**30:.1f} GB")
     if "--wire" in sys.argv:   # pin the model in memory (what mlx_lm.generate does for big models)
