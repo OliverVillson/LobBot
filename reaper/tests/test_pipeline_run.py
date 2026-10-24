@@ -108,3 +108,21 @@ def test_not_a_moe_fails_in_plan(tmp_path):
     assert any(e["stage"] == "plan" and e["status"] == "error" and "not a mixture-of-experts" in e["msg"]
                for e in events)
     assert events[-1]["stage"] == "pipeline" and events[-1]["status"] == "error"
+
+
+def test_preset_prompts_are_cached(tmp_path, monkeypatch):
+    """The first load streams a pool and caches it; the next load never touches the network."""
+    import types
+    calls = []
+
+    class FakeDS:
+        def shuffle(self, seed, buffer_size):
+            calls.append(buffer_size)
+            return iter([{"question": f"What is {i} plus {i}, step by step?"} for i in range(2000)])
+
+    monkeypatch.setenv("REAPER_HOME", str(tmp_path))
+    monkeypatch.setitem(sys.modules, "datasets", types.SimpleNamespace(load_dataset=lambda *a, **k: FakeDS()))
+    a, note = calib.load_prompts("math", 40)
+    assert len(a) == 40 and "gsm8k" in note and calls == [4 * calib.POOL]
+    b, _ = calib.load_prompts("math", 40)
+    assert b == a and len(calls) == 1

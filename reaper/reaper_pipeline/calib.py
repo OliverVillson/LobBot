@@ -79,9 +79,28 @@ STYLES = [
 # --------------------------------------------------------------------------- presets and files
 
 
+POOL = 512  # prompts streamed per preset on first use and cached; later runs read the cache
+
+
+def _cache_path(name: str, seed: int) -> Path:
+    from reaper_pipeline.job import home
+    return home() / "cache" / "prompts" / f"{name.replace('/', '--')}-s{seed}.json"
+
+
 def _stream(name: str, config: str | None, split: str, get, n: int, seed: int) -> list[str]:
+    """n prompts from a public dataset. The first call streams a pool of max(n, POOL) through a small
+    shuffle buffer (enough to mix rows, without downloading tens of thousands first) and caches
+    it under <REAPER_HOME>/cache/prompts, so later runs start instantly."""
+    cache = _cache_path(name, seed)
+    try:
+        pool = json.loads(cache.read_text())
+        if len(pool) >= n:
+            return pool[:n]
+    except (OSError, ValueError):
+        pass
     from datasets import load_dataset
-    ds = load_dataset(name, config, split=split, streaming=True).shuffle(seed=seed, buffer_size=10_000)
+    want = max(n, POOL)
+    ds = load_dataset(name, config, split=split, streaming=True).shuffle(seed=seed, buffer_size=min(10_000, 4 * want))
     out = []
     for row in ds:
         try:
@@ -90,9 +109,14 @@ def _stream(name: str, config: str | None, split: str, get, n: int, seed: int) -
             continue
         if 20 <= len(p) <= 6000:
             out.append(p)
-        if len(out) >= n:
+        if len(out) >= want:
             break
-    return out
+    try:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_text(json.dumps(out))
+    except OSError:
+        pass
+    return out[:n]
 
 
 def _from_file(path: Path) -> list[str]:
@@ -129,8 +153,10 @@ def load_prompts(calib: str, n: int, seed: int = 0) -> tuple[list[str], str]:
     out: list[str] = []
     try:
         per = -(-n // len(names))
-        for c in names:
-            out += _stream(*PRESETS[c], n=per, seed=seed)
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(len(names)) as ex:  # the presets download in parallel
+            for part in ex.map(lambda c: _stream(*PRESETS[c], n=per, seed=seed), names):
+                out += part
         random.Random(seed).shuffle(out)
         return out[:n], f"{min(n, len(out))} prompts from {calib} ({', '.join(PRESETS[c][0] for c in names)})"
     except Exception as e:  # offline, dataset moved, datasets not installed
