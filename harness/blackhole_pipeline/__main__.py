@@ -113,8 +113,10 @@ def seed_from_previous(bh: BHJob, rj) -> None:
     cfg = rj.config
     jobs = home() / "jobs"
     data_ok, score_ok = [], []
-    for d in sorted(jobs.glob("*")) if jobs.is_dir() else []:
-        if d.resolve() == rj.root or not d.is_dir():
+    cands = sorted(jobs.glob("*")) if jobs.is_dir() else []
+    cands += sorted(bh.root.parent.glob("*/reaper"))  # other BlackHole jobs' REAPer parts
+    for d in cands:
+        if d.resolve() == rj.root.resolve() or not d.is_dir():
             continue
         try:
             c = json.loads((d / "config.json").read_text())
@@ -126,6 +128,9 @@ def seed_from_previous(bh: BHJob, rj) -> None:
             continue
         if c.get("purpose", "") != cfg.purpose:
             log(f"reuse: {d.name}: other purpose ({c.get('purpose')!r} vs {cfg.purpose!r})")
+            continue
+        if not cfg.purpose and c.get("calib", "mix") != cfg.calib:
+            log(f"reuse: {d.name}: other calibration set ({c.get('calib', 'mix')!r} vs {cfg.calib!r})")
             continue
         missing = [n for n in ("data/calib.jsonl", "data/heldout.jsonl") if not (d / n).exists()]
         if missing:
@@ -203,15 +208,27 @@ def rekeep(rj) -> None:
     rj.write("work/reap.json", r)
 
 
+def schema_stages(schema: str | None) -> set[str]:
+    """The stages a schema runs (its stage_list); empty = every stage."""
+    try:
+        from blackhole_tui.catalog import SCHEMAS
+    except ImportError:
+        return set()
+    s = next((s for s in SCHEMAS if s.id == schema), None)
+    return set(s.stage_list) if s is not None and s.stage_list else set()
+
+
 def run(bh: BHJob, start: str | None = None) -> int:
     rj = bh.reaper()
     if start:
         rj.clear_from(STAGES, start)
     p = bh.params
     emit("pipeline", "running", 0, f"started {time.strftime('%Y-%m-%d %H:%M:%S')}")
-    log(f"job {bh.root.name}: {bh.config['model']} · schema {bh.config.get('schema')} · REAP {p['prune']:.0%} "
-        f"→ GPTQ int4 + REAQ codebooks (top {p['reaq_top']:.0%} 16-level, rest 8-level)")
+    log(f"job {bh.root.name}: {bh.config['model']} · schema {bh.config.get('schema')} · REAP {p['prune']:.0%}")
+    wanted = schema_stages(bh.config.get("schema"))
     for name, stages, who in PROCESSES:
+        if wanted and not any(s in wanted for s in stages):
+            continue
         if name == "calibrate":
             seed_from_previous(bh, rj)
             if not rj.is_done("calibrate"):

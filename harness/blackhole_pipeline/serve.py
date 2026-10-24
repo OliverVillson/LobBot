@@ -34,6 +34,8 @@ THINK_RE = re.compile(r"^\s*<think>(.*?)</think>\s*", re.S)
 
 def _quant_method(path: Path) -> str:
     cfg = json.loads((path / "config.json").read_text())
+    if cfg.get("model_file") == "flint_mlx.py":
+        return "mlx"
     return str((cfg.get("quantization_config") or {}).get("quant_method", "")).lower()
 
 
@@ -80,6 +82,42 @@ def _unpacked_state(path: Path, dtype):
         yield out
 
 
+def _mlx_state(path: Path, dtype):
+    """bf16 tensors (Hugging Face Flint names) of a BlackHole MLX folder: quantized modules are
+    dequantized, the stacked hot/cold expert tensors split back into one module per expert (the
+    router rows are already in the stacked order)."""
+    import torch
+    from safetensors.torch import load_file
+
+    from blackhole_pipeline.pack import mlx_dequant, mlx_unpack
+    cfg = json.loads((path / "config.json").read_text())
+    q = cfg.get("quantization") or {}
+    tiers = {int(k): v for k, v in (cfg.get("expert_tiers") or {}).items()}
+    raw = {}
+    for f in sorted(path.glob("model*.safetensors")):
+        raw.update(load_file(str(f)))
+    out = {}
+    for k in list(raw):
+        if not k.endswith(".weight") or k not in raw:
+            continue
+        mod = k[:-len(".weight")]
+        if f"{mod}.scales" not in raw:
+            continue
+        spec = q.get(mod, {"bits": q.get("bits", 4), "group_size": q.get("group_size", 64)})
+        u = mlx_unpack(raw.pop(k), spec["bits"])
+        raw[k] = mlx_dequant(u, raw.pop(f"{mod}.scales"), raw.pop(f"{mod}.biases"), spec["group_size"]).to(dtype)
+    for k, v in raw.items():
+        m = re.match(r"model\.layers\.(\d+)\.mlp\.(experts_hot|experts)\.(gate_proj|up_proj|down_proj)\.weight$", k)
+        if not m:
+            out[k] = v.to(dtype) if v.is_floating_point() and not k.endswith("softmax_offset") else v
+            continue
+        layer, tier, name = int(m.group(1)), m.group(2), m.group(3)
+        base = 0 if tier == "experts_hot" else tiers.get(layer, 0)
+        for j in range(v.shape[0]):
+            out[f"model.layers.{layer}.mlp.experts.{base + j}.{name}.weight"] = v[j].to(dtype)
+    return out
+
+
 def load(path: Path, device: str):
     """Model and tokenizer; quantized folders are unpacked to bf16 on the way in."""
     import torch
@@ -89,14 +127,16 @@ def load(path: Path, device: str):
     from reaper_pipeline.models import register_all
     register_all()
     tok = load_tokenizer(path)
-    if _quant_method(path) not in ("compressed-tensors", "blackhole-reaq-codebook"):
+    method = _quant_method(path)
+    if method not in ("compressed-tensors", "blackhole-reaq-codebook", "mlx"):
         prof = {"device": device, "dtype": "bfloat16" if device == "cuda" else "float32"}
         return load_model(path, prof), tok
     dtype = torch.bfloat16 if device == "cuda" else torch.float32
     cfg = AutoConfig.from_pretrained(path)
     for c in (cfg, getattr(cfg, "text_config", None)):
-        if c is not None and hasattr(c, "quantization_config"):
-            delattr(c, "quantization_config")
+        for a in ("quantization_config", "quantization", "model_file", "expert_tiers"):
+            if c is not None and hasattr(c, a):
+                delattr(c, a)
     try:
         from transformers.initialization import no_init_weights
     except ImportError:  # transformers 4.x
@@ -104,7 +144,7 @@ def load(path: Path, device: str):
     with no_init_weights(), torch.device(device):
         model = AutoModelForCausalLM.from_config(cfg, dtype=dtype)
     missing = {n for n, _ in model.named_parameters()}
-    for part in _unpacked_state(path, dtype):
+    for part in ([_mlx_state(path, dtype)] if method == "mlx" else _unpacked_state(path, dtype)):
         model.load_state_dict(part, strict=False, assign=False)
         missing -= set(part)
     if missing - {"lm_head.weight"}:

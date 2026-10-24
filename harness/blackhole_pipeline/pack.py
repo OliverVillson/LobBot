@@ -26,6 +26,13 @@ def int_codes(Q: torch.Tensor, scales: torch.Tensor, group: int) -> torch.Tensor
     return (Q / s).round().clamp(-8, 7).to(torch.int8)
 
 
+def int_codes_bits(Q: torch.Tensor, scales: torch.Tensor, group: int, bits: int) -> torch.Tensor:
+    """int_codes for any symmetric GPTQ width: codes in [-2^(b-1), 2^(b-1) - 1]."""
+    s = scales.repeat_interleave(group, -1)[..., :Q.shape[-1]]
+    h = 2 ** (bits - 1)
+    return (Q / s).round().clamp(-h, h - 1).to(torch.int8)
+
+
 def pack_int4(codes: torch.Tensor) -> torch.Tensor:
     """[out, in] int8 codes in [-8, 7] -> [out, ceil(in / 8)] int32 (compressed-tensors layout)."""
     out, n = codes.shape
@@ -87,3 +94,53 @@ def codebook_dequant(packed: torch.Tensor, n: int, codes: torch.Tensor, es: torc
 
 def bpw(levels: int, block: int) -> float:
     return math.log2(levels) + 8 / block
+
+
+# --------------------------------------------------------------------------- MLX (Apple silicon)
+# MLX affine quantization: weight = u * scale + bias per group of `group` inputs, u in
+# [0, 2^bits - 1], codes packed as one little-endian bit stream into uint32 words (code i at
+# bits i*bits .. i*bits+bits-1 of the stream), scale and bias in the model dtype.
+
+def mlx_pack(u: torch.Tensor, bits: int) -> torch.Tensor:
+    """[..., n] integer codes (n * bits divisible by 32) -> [..., n * bits / 32] uint32."""
+    shp = u.shape
+    b = ((u.to(torch.int64)[..., None] >> torch.arange(bits, device=u.device)) & 1).to(torch.uint8)
+    b = b.reshape(*shp[:-1], -1, 32).to(torch.int64)
+    words = (b << torch.arange(32, device=u.device)).sum(-1)
+    return torch.where(words >= 2 ** 31, words - 2 ** 32, words).to(torch.int32).view(torch.uint32)
+
+
+def mlx_unpack(words: torch.Tensor, bits: int) -> torch.Tensor:
+    """Inverse of mlx_pack: [..., w] uint32 -> [..., w * 32 / bits] int64 codes."""
+    x = words.view(torch.int32).to(torch.int64) & 0xFFFFFFFF
+    b = (x[..., None] >> torch.arange(32, device=x.device)) & 1
+    b = b.reshape(*x.shape[:-1], -1, bits)
+    return (b << torch.arange(bits, device=x.device)).sum(-1)
+
+
+def mlx_from_symmetric(codes: torch.Tensor, scales: torch.Tensor, bits: int, dtype):
+    """Signed GPTQ codes [..., out, in] in [-2^(b-1), 2^(b-1)-1] with group scales [..., out, in/g]
+    -> MLX (u, scale, bias) with the same grid: u = code + 2^(b-1), bias = -2^(b-1) * scale."""
+    half = 2 ** (bits - 1)
+    s = scales.to(dtype)
+    return (codes.to(torch.int64) + half), s, (-half * s.float()).to(dtype)
+
+
+def mlx_rtn(w: torch.Tensor, bits: int, group: int, dtype):
+    """Round-to-nearest MLX affine quantization of w [..., out, in] (min/max per group)."""
+    x = w.float().reshape(*w.shape[:-1], -1, group)
+    lo, hi = x.amin(-1, keepdim=True), x.amax(-1, keepdim=True)
+    s = ((hi - lo) / (2 ** bits - 1)).clamp(min=1e-8).to(dtype).float()
+    b = lo.to(dtype).float()
+    u = ((x - b) / s).round().clamp(0, 2 ** bits - 1)
+    return u.reshape(w.shape).to(torch.int64), s[..., 0].to(dtype), b[..., 0].to(dtype)
+
+
+def mlx_dequant(u: torch.Tensor, scale: torch.Tensor, bias: torch.Tensor, group: int) -> torch.Tensor:
+    """u [..., out, in], scale/bias [..., out, in/g] -> fp32 weights."""
+    x = u.float().reshape(*u.shape[:-1], -1, group)
+    return (x * scale.float()[..., None] + bias.float()[..., None]).reshape(u.shape)
+
+
+def mlx_bpw(bits: int, group: int, dtype_bits: int = 16) -> float:
+    return bits + 2 * dtype_bits / group

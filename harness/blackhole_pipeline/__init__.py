@@ -11,9 +11,13 @@ calibrate → REAP → eval, plus two stages of our own on the pruned model:
          rest on 8 (block 32, fp8 block scales). No kernel serves this yet, so it is a
          measured stage: KL / top-1 / size against int4, and the packed indices, tables
          and scales are saved for a future kernel.
+  heal   distillation of the pruned model from the teacher on fresh calibration prompts
+  mlx    an MLX folder for Apple silicon: GPTQ 3-bit experts (optionally a REAQ 4-bit hot tier),
+         4-bit attention and embeddings, flint_mlx.py for mlx-lm
   bench  LiveCodeBench pass@1 and tok/s of the original and the REAQ model (bench_models) (one sample, up to 32k tokens)
 
-Events are REAPer's JSON lines; stage names are STAGES.
+Events are REAPer's JSON lines; stage names are STAGES. A schema's stage_list (blackhole_tui.catalog)
+picks which of them a job runs.
 """
 
 from __future__ import annotations
@@ -21,7 +25,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-STAGES = ["detect", "plan", "weights", "calibrate", "score", "prune", "eval", "gptq", "reaq", "bench", "quant", "package"]
+STAGES = ["detect", "plan", "weights", "calibrate", "score", "prune", "eval", "heal", "gptq", "reaq", "mlx", "bench",
+          "quant", "package"]
 
 # (process, stages it reports, who runs it): REAPer processes are reaper_pipeline.stages.<name>,
 # ours blackhole_pipeline.stages.<name>. Each process frees the GPU when it exits.
@@ -32,8 +37,10 @@ PROCESSES = [
     ("calibrate", ["calibrate"], "reaper"),
     ("reap", ["score", "prune"], "reaper"),
     ("eval", ["eval"], "reaper"),
+    ("heal", ["heal"], "bh"),
     ("gptq", ["gptq"], "bh"),
     ("reaq", ["reaq"], "bh"),
+    ("mlx", ["mlx"], "bh"),
     ("bench", ["bench"], "bh"),
     ("quant", ["quant"], "reaper"),
     ("package", ["package"], "bh"),
@@ -46,8 +53,21 @@ DEFAULTS = {
     "layer_chunk": 12,       # MoE layers per sequential GPTQ chunk
     "reaq_top": 0.5,         # share of each layer's experts (by REAP score) on 16-level tables
     "reaq_block": 32,
+    "heal_prompts": 1024,    # fresh calibration-set prompts the teacher answers for distillation
+    "heal_max_tokens": 1536,
+    "heal_epochs": 1.0,
+    "heal_accum": 8,         # sequences per optimizer step
+    "heal_lr": 1e-5,
+    "heal_minutes": 45,      # wall-clock cap on training (0 = none)
+    "mlx_bits": 3,           # MLX export: routed experts (GPTQ)
+    "mlx_group": 64,
+    "mlx_hot": 0.0,          # share of each layer's experts (by REAP score) on mlx_hot_bits
+    "mlx_hot_bits": 4,
+    "mlx_attn_bits": 4,      # attention, shared experts, dense MLPs (round-to-nearest)
+    "mlx_embed_bits": 4,
+    "mlx_head_bits": 6,
     "bench": "lcb-v6",       # LiveCodeBench release (problems new in it) for original vs int4; "none" skips
-    "bench_models": "original,reaq",  # any of original, int4, reaq
+    "bench_models": "original,reaq",  # any of original, int4, reaq, mlx
     "bench_limit": 0,        # 0 = every problem of the release
     "bench_max_tokens": 32768,  # reasoning models think for tens of thousands of tokens; 4k cut most off
     "bench_file": "",        # a local jsonl in LiveCodeBench's format instead of the download

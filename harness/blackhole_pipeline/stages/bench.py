@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from pathlib import Path
 
 from blackhole_pipeline.common import emit, stage_main
 
@@ -24,11 +25,16 @@ def run(bh, rj) -> None:
         emit(STAGE, "skipped", 100, "bench: none")
         return
     release = p["bench"].split("-")[-1] if p["bench"].startswith("lcb") else "v6"
-    dirs = {"original": rj.model_dir, "int4": bh.gptq_dir(rj), "reaq": bh.reaq_dir(rj)}
+    dirs = {"original": rj.model_dir, "int4": bh.gptq_dir(rj), "reaq": bh.reaq_dir(rj),
+            "mlx": Path((rj.read("work/mlx.json") or {}).get("out", rj.path("work", "no-mlx-model")))}
     models = [(m, dirs[m]) for m in p["bench_models"].split(",") if m]
     res = {}
     for i, (label, path) in enumerate(models):
         out = rj.path("work", "bench", label)
+        if label == "original":  # the same for every job on this model: one run per model and settings
+            from blackhole_tui.jobs import home
+            slug = "".join(c if c.isalnum() or c in "-." else "-" for c in str(bh.config["model"]))[-80:]
+            out = home() / "bench" / f"{slug}-{p['bench']}-{p['bench_max_tokens']}-{p['bench_limit']}"
         old = json.loads((out / "summary.json").read_text()) if (out / "summary.json").exists() else {}
         if old.get("max_tokens") != p["bench_max_tokens"]:  # missing, or run with another token limit
             if not (path / "config.json").exists():

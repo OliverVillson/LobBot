@@ -36,14 +36,14 @@ def stage_main(run, stage: str) -> None:
 class Pruned:
     """The REAP-pruned bf16 model, its MoE blocks, per-expert weight views and checkpoint names."""
 
-    def __init__(self, rj, n_calib: int):
+    def __init__(self, rj, n_calib: int, src: Path | None = None):
         from bench_b200 import expert_views
         from reaper_pipeline import moe
         from reaper_pipeline.load import input_device, load_model, load_tokenizer
         from reaper_pipeline.stages._common import batches, encode, pad_batch, profile, read_jsonl
 
         self.rj = rj
-        self.src = rj.out_dir
+        self.src = src or rj.out_dir
         if not (self.src / "config.json").exists():
             raise RuntimeError(f"no pruned model in {self.src}")
         prof = profile(rj)

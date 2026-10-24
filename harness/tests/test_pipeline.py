@@ -60,8 +60,27 @@ def test_codebook_roundtrip():
 
 
 def test_lab_schema_stages_match_the_pipeline():
-    sc = find_schema("reaq-codebook")
-    assert sc.stages() == STAGES and "lab" in sc.tags
+    for name in ("reaq-codebook", "mac-16gb", "mac-16gb-375"):
+        sc = find_schema(name)
+        assert sc.stages() == [s for s in STAGES if s in sc.stages()] and "detect" in sc.stages()
+    assert "lab" in find_schema("reaq-codebook").tags
+
+
+def test_mlx_packing_matches_mlx():
+    mx = pytest.importorskip("mlx.core")
+    import numpy as np
+    for bits in (3, 4, 6, 8):
+        w = torch.randn(3, 5, 128)
+        u, s, b = pack.mlx_rtn(w, bits, 64, torch.float32)
+        words = pack.mlx_pack(u, bits)
+        assert torch.equal(pack.mlx_unpack(words, bits), u)
+        got = mx.dequantize(mx.array(words.numpy()), mx.array(s.numpy()), mx.array(b.numpy()), group_size=64, bits=bits)
+        assert np.allclose(np.array(got), pack.mlx_dequant(u, s, b, 64).numpy(), atol=1e-5)
+    # GPTQ's symmetric grid maps exactly onto MLX's affine one
+    codes = torch.randint(-4, 4, (2, 64))
+    sc = torch.rand(2, 1) + 0.1
+    u, s, b = pack.mlx_from_symmetric(codes, sc, 3, torch.float32)
+    assert torch.allclose(pack.mlx_dequant(u, s, b, 64), codes * sc)
 
 
 @pytest.mark.parametrize("donor", ["scores", "data-only"])
@@ -72,7 +91,8 @@ def test_full_run_on_a_tiny_flint(tmp_path, donor):
     model = build("flint", tmp_path / "flint-tiny")
     home = tmp_path / "home"
     env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(REAPER), str(HARNESS)]), "REAPER_HW": "builtin",
-           "HF_HUB_OFFLINE": "1", "HF_DATASETS_OFFLINE": "1", "REAPER_HOME": str(home)}
+           "HF_HUB_OFFLINE": "1", "HF_DATASETS_OFFLINE": "1", "REAPER_HOME": str(home),
+           "BLACKHOLE_HOME": str(tmp_path / "bhhome")}
     small = {"calib": "mix", "heldout": 4, "max_seq": 96, "answer_max_tokens": 12, "writer_max_tokens": 24,
              "teacher_backend": "hf"}
 
@@ -237,3 +257,71 @@ def test_parse_reply_tool_calls_and_reasoning():
     m = to_template_messages([{"role": "assistant", "content": None, "tool_calls": [
         {"id": "x", "type": "function", "function": {"name": "read", "arguments": '{"path": "a"}'}}]}])
     assert m[0]["content"] == "" and m[0]["tool_calls"][0]["function"]["arguments"] == {"path": "a"}
+
+
+def test_mac_schema_heal_and_mlx_on_a_tiny_flint(tmp_path):
+    """mac-16gb: REAP 50% on code, distillation heal, MLX export (GPTQ experts with a REAQ hot tier),
+    bench of the MLX model; the MLX folder loads in blackhole-serve (dequantized) and, when mlx is
+    installed, in mlx-lm with the same logits."""
+    pytest.importorskip("transformers")
+    sys.path.insert(0, str(REAPER / "tests"))
+    from tiny_moe import build
+    model = build("flint", tmp_path / "flint-tiny")
+    home = tmp_path / "home"
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(REAPER), str(HARNESS)]), "REAPER_HW": "builtin",
+           "HF_HUB_OFFLINE": "1", "HF_DATASETS_OFFLINE": "1", "REAPER_HOME": str(home),
+           "BLACKHOLE_HOME": str(tmp_path / "bhhome")}
+    small = {"heldout": 4, "max_seq": 96, "answer_max_tokens": 12, "writer_max_tokens": 24, "teacher_backend": "hf"}
+    probs = tmp_path / "lcb.jsonl"
+    probs.write_text("".join(json.dumps(r) + "\n" for r in LCB_ROWS))
+    sc = find_schema("mac-16gb")
+    job = tmp_path / "bh" / "flint-tiny-mac"
+    job.mkdir(parents=True)
+    (job / "config.json").write_text(json.dumps({
+        "model": str(model), "schema": sc.id, "target": "mac", "purpose": "",
+        "steps": [s.__dict__ for s in sc.steps], "quant": sc.quant, "calib_samples": 8, **small,
+        "mlx_group": 32, "mlx_hot": 0.5, "heal_prompts": 6, "heal_max_tokens": 10, "heal_accum": 2,
+        "heal_lr": 1e-3, "bench_file": str(probs), "bench_max_tokens": 16}))
+    p = subprocess.run([sys.executable, "-m", "blackhole_pipeline", "--job", str(job)], env=env, cwd=tmp_path,
+                       capture_output=True, text=True, timeout=900)
+    events = [e for e in map(parse_event, p.stdout.splitlines()) if e]
+    assert p.returncode == 0, p.stdout[-4000:] + p.stderr[-3000:]
+    by = {}
+    for e in events:
+        by.setdefault(e["stage"], []).append(e)
+    for s in ("prune", "eval", "heal", "mlx", "bench", "package"):
+        assert by[s][-1]["status"] == "done", (s, by[s][-1])
+    assert "gptq" not in by and "reaq" not in by and "quant" not in by  # not in this schema
+    rcfg = json.loads((job / "reaper" / "config.json").read_text())
+    assert rcfg["calib"] == "code" and rcfg["prune"] == 0.5
+    heal = json.loads((job / "reaper" / "work" / "heal.json").read_text())
+    assert heal["steps"] >= 1 and heal["sequences"] == 6
+    rec = json.loads((job / "receipt.json").read_text())
+    xdir = Path(rec["model"])
+    assert "-MLX-" in xdir.name and (xdir / "flint_mlx.py").exists()
+    cfg = json.loads((xdir / "config.json").read_text())
+    assert cfg["model_file"] == "flint_mlx.py" and cfg["num_experts"] == 4
+    assert all(v == 2 for v in cfg["expert_tiers"].values())  # half of the 4 kept experts on the hot tier
+    q = cfg["quantization"]
+    hot = next(k for k in q if k.endswith("experts_hot.gate_proj"))
+    assert q[hot]["bits"] == 4 and q[hot.replace("experts_hot", "experts")]["bits"] == 3
+    assert q["lm_head"]["bits"] == 6 and q["model.embed_tokens"]["bits"] == 4
+    assert rec["results"]["mlx"]["kl"] >= 0 and "mlx" in rec["results"]["bench"]
+    assert "mlx_lm.server" in (job / "RESULTS.md").read_text()
+
+    from blackhole_pipeline import serve
+    tm, tok = serve.load(xdir, "cpu")
+    ids = torch.randint(5, 300, (1, 12))
+    with torch.no_grad():
+        ref = tm(input_ids=ids).logits[0].float().numpy()
+    try:
+        import mlx.core as mx
+        from mlx_lm.utils import load_model
+    except ImportError:
+        return
+    import numpy as np
+    mm, _ = load_model(xdir, trust_remote_code=True)
+    mm.set_dtype(mx.float32)  # bf16 activations would hide a real mismatch on a tiny random model
+    got = np.array(mm(mx.array(ids.numpy()))[0].astype(mx.float32))
+    assert np.abs(got - ref).max() < 1e-3 * np.abs(ref).max() + 1e-4
+    assert np.array_equal(got.argmax(-1), ref.argmax(-1))

@@ -10,7 +10,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 # bytes per parameter after the final quant step
-QUANT_BYTES = {"bf16": 2.0, "fp8": 1.0, "int4": 0.52, "Q8_0": 1.06, "Q5_K": 0.69, "Q4_K": 0.56, "Q3_K": 0.43, "mixed-3bpw": 0.40}
+QUANT_BYTES = {"bf16": 2.0, "fp8": 1.0, "int4": 0.52, "Q8_0": 1.06, "Q5_K": 0.69, "Q4_K": 0.56, "Q3_K": 0.43, "mixed-3bpw": 0.40,
+               "mlx-3bit": 0.45}
 
 
 @dataclass(frozen=True)
@@ -124,6 +125,27 @@ SCHEMAS = [
            quant="int4", tags=("lab", "experimental", "moe"),
            stage_list=("detect", "plan", "weights", "calibrate", "score", "prune", "eval", "gptq", "reaq", "bench",
                        "quant", "package")),
+    Schema("mac-16gb", "Mac 16 GB coder", "blackhole", "A coding model that fits a 16 GB Apple-silicon Mac "
+           "(~9.5 GB): REAP drops half the routed experts, calibrated on code; the pruned model is distilled from "
+           "the teacher on coding prompts; then an MLX folder with GPTQ 3-bit experts (top 12.5% by REAP on 4-bit, "
+           "REAQ), 4-bit attention and embeddings, served by mlx_lm.server.",
+           (Step("reap", "drop 50% of routed experts, calibrated on code", {"prune": 0.5, "calib": "code"}),
+            Step("heal", "distil from the unpruned teacher on 1k coding prompts", {"heal_prompts": 1024}),
+            Step("mlx", "MLX: GPTQ 3-bit experts, REAQ 4-bit hot tier, 4-bit attention",
+                 {"mlx_bits": 3, "mlx_group": 64, "mlx_hot": 0.125, "mlx_hot_bits": 4, "bench_models": "original,mlx"})),
+           quant="mlx-3bit", tags=("mac", "code", "moe", "lab"),
+           stage_list=("detect", "plan", "weights", "calibrate", "score", "prune", "eval", "heal", "mlx", "bench",
+                       "package")),
+    Schema("mac-16gb-375", "Mac 16 GB coder, lighter prune", "blackhole", "Like Mac 16 GB coder but REAP drops "
+           "37.5% of routed experts and the MLX groups are 128 wide (~11 GB): better quality, needs the Mac's GPU "
+           "memory limit raised (sudo sysctl iogpu.wired_limit_mb=12288) and few other apps open.",
+           (Step("reap", "drop 37.5% of routed experts, calibrated on code", {"prune": 0.375, "calib": "code"}),
+            Step("heal", "distil from the unpruned teacher on 1k coding prompts", {"heal_prompts": 1024}),
+            Step("mlx", "MLX: GPTQ 3-bit g128 experts, 4-bit attention",
+                 {"mlx_bits": 3, "mlx_group": 128, "mlx_hot": 0.0, "bench_models": "original,mlx"})),
+           quant="mlx-3bit", tags=("mac", "code", "moe", "lab"),
+           stage_list=("detect", "plan", "weights", "calibrate", "score", "prune", "eval", "heal", "mlx", "bench",
+                       "package")),
     Schema("reap-classic", "REAP classic", "blackhole", "REAPer's pipeline: prune experts by router-weighted "
            "activation on purpose-built calibration data, then store experts in fp8.",
            (Step("reap", "drop 50% of routed experts per layer", {"prune": 0.5}),), quant="fp8",

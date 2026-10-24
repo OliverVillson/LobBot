@@ -52,15 +52,20 @@ class BHJob:
             c = Config(model=self.config["model"], purpose=self.config.get("purpose", ""),
                        prune=self.params["prune"], calib_samples=self.params["calib_samples"],
                        quant="fp8-experts")
-            for f in fields(Config):  # REAPer settings given in the job config (calib, heldout, max_seq, ...)
-                if f.name in self.config and f.name not in ("model", "purpose", "prune", "quant", "calib_samples"):
-                    setattr(c, f.name, self.config[f.name])
+            given = {k: v for st in self.config.get("steps") or [] for k, v in (st.get("params") or {}).items()}
+            given.update(self.config)
+            for f in fields(Config):  # REAPer settings in the job config or schema steps (calib, max_seq, ...)
+                if f.name in given and f.name not in ("model", "purpose", "prune", "quant", "calib_samples"):
+                    setattr(c, f.name, given[f.name])
             self.reaper_root.mkdir(parents=True, exist_ok=True)
             cfg_p.write_text(json.dumps(asdict(c), indent=2) + "\n")
         return Job(self.reaper_root)
 
     def gptq_dir(self, rj) -> Path:
         return rj.out_dir.with_name(rj.out_dir.name + "-GPTQ-W4A16")
+
+    def healed_dir(self, rj) -> Path:
+        return rj.out_dir.with_name(rj.out_dir.name + "-healed")
 
     def reaq_dir(self, rj) -> Path:
         return rj.out_dir.with_name(rj.out_dir.name + "-REAQ-codebook")
