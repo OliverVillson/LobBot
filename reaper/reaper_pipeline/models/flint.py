@@ -148,16 +148,49 @@ class FlintSparseMoeBlock(nn.Module):
             e.down_proj.weight = nn.Parameter(dn[j], requires_grad=False)
         self._gu, self._dn, self._I, self._fixed_c = gu, dn, I, False
 
+    def add_expert_lora(self, rank: int) -> None:
+        """Trainable low-rank updates on the stacked experts (gate/up and down), zero at the start;
+        merge_expert_lora folds them into the weights. Needs stack_experts first."""
+        E, I2, H = self._gu.shape
+        dev, dt = self._gu.device, self._gu.dtype
+        g = torch.Generator(device="cpu").manual_seed(0)
+        self.lora_gu_A = nn.Parameter((torch.randn(E, rank, H, generator=g) / H ** 0.5).to(dev, dt))
+        self.lora_gu_B = nn.Parameter(torch.zeros(E, I2, rank, device=dev, dtype=dt))
+        self.lora_dn_A = nn.Parameter((torch.randn(E, rank, I2 // 2, generator=g) / (I2 // 2) ** 0.5).to(dev, dt))
+        self.lora_dn_B = nn.Parameter(torch.zeros(E, H, rank, device=dev, dtype=dt))
+
+    @torch.no_grad()
+    def merge_expert_lora(self) -> None:
+        if not hasattr(self, "lora_gu_A"):
+            return
+        self._gu.add_(torch.bmm(self.lora_gu_B.float(), self.lora_gu_A.float()).to(self._gu.dtype))
+        self._dn.add_(torch.bmm(self.lora_dn_B.float(), self.lora_dn_A.float()).to(self._dn.dtype))
+        for n in ("lora_gu_A", "lora_gu_B", "lora_dn_A", "lora_dn_B"):
+            delattr(self, n)
+
+    def _lora(self, x, name: str, sel=None):
+        """x [N or E, C, in] -> the low-rank update [.., C, out] (sel: per-row expert ids)."""
+        A, B = getattr(self, f"lora_{name}_A"), getattr(self, f"lora_{name}_B")
+        if sel is not None:
+            A, B = A[sel], B[sel]
+        return torch.bmm(torch.bmm(x, A.transpose(1, 2)), B.transpose(1, 2))
+
     def _stacked_forward(self, h, w, ids):
         """All experts at once: tokens scattered into a [E, C, H] buffer (C = most tokens any
         expert got), two bmm's, gathered back. Chunked so prefill buffers stay a few GB."""
         E, k, I = self._gu.shape[0], ids.shape[1], self._I
+        lora = hasattr(self, "lora_gu_A")
         if h.shape[0] * k * 2 <= E:  # few tokens (small-batch decode): read only the chosen experts
             flat = ids.reshape(-1)
             x = h.repeat_interleave(k, 0)[:, None, :]                              # [N, 1, H]
             g = torch.bmm(x, self._gu[flat].transpose(1, 2))
+            if lora:
+                g = g + self._lora(x, "gu", flat)
             a = F.silu(g[..., :I].float()).to(h.dtype) * g[..., I:]
-            y = torch.bmm(a, self._dn[flat].transpose(1, 2))[:, 0].float()         # [N, H]
+            y = torch.bmm(a, self._dn[flat].transpose(1, 2))
+            if lora:
+                y = y + self._lora(a, "dn", flat)
+            y = y[:, 0].float()                                                    # [N, H]
             return (y * w.reshape(-1, 1).float()).view(h.shape[0], k, -1).sum(1)
         out = torch.zeros(h.shape, dtype=torch.float32, device=h.device)
         for c0 in range(0, h.shape[0], STACKED_CHUNK):
@@ -178,8 +211,12 @@ class FlintSparseMoeBlock(nn.Module):
             X = torch.zeros(E, C, h.shape[1], dtype=h.dtype, device=h.device)
             X[e_sorted, rank] = hc[tok]
             g = torch.bmm(X, self._gu.transpose(1, 2))
+            if lora:
+                g = g + self._lora(X, "gu")
             a = F.silu(g[..., :I].float()).to(h.dtype) * g[..., I:]
             Y = torch.bmm(a, self._dn.transpose(1, 2))
+            if lora:
+                Y = Y + self._lora(a, "dn")
             out[c0:c0 + STACKED_CHUNK].index_add_(0, tok, Y[e_sorted, rank].float() * wc.reshape(-1)[order, None].float())
         return out
 
@@ -430,6 +467,17 @@ class FlintForCausalLM(FlintPreTrainedModel, GenerationMixin):
         for layer in self.model.layers:
             if isinstance(layer.mlp, FlintSparseMoeBlock):
                 layer.mlp.stack_experts()
+
+    def add_expert_lora(self, rank: int) -> None:
+        self.stack_experts()
+        for layer in self.model.layers:
+            if isinstance(layer.mlp, FlintSparseMoeBlock):
+                layer.mlp.add_expert_lora(rank)
+
+    def merge_expert_lora(self) -> None:
+        for layer in self.model.layers:
+            if isinstance(layer.mlp, FlintSparseMoeBlock):
+                layer.mlp.merge_expert_lora()
 
     @torch.no_grad()
     def fast_generate(self, input_ids, attention_mask=None, max_new_tokens: int = 256, temperature: float = 0.0,

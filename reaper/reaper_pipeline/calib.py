@@ -10,6 +10,8 @@ Without a purpose, Config.calib picks a preset:
   chat  HuggingFaceH4/ultrachat_200k      first user turn of multi-turn chats
   code  theblackcat102/evol-codealpaca-v1 coding instructions (what the REAP paper calibrated on)
   math  openai/gsm8k                      grade-school word problems
+  contest  deepmind/code_contests         competitive-programming problems (pre-2022, so not in
+                                          LiveCodeBench's newer releases); for reasoning distillation
   mix   equal parts of the three
   builtin  the small set below (offline)
 or a path to a .jsonl ({"prompt": ...} or {"messages": [...]}) or .txt (one per line).
@@ -27,6 +29,7 @@ PRESETS = {
     "chat": ("HuggingFaceH4/ultrachat_200k", None, "train_sft", lambda r: r["messages"][0]["content"]),
     "code": ("theblackcat102/evol-codealpaca-v1", None, "train", lambda r: r["instruction"]),
     "math": ("openai/gsm8k", "main", "train", lambda r: r["question"]),
+    "contest": ("deepmind/code_contests", None, "train", lambda r: r["description"]),
 }
 
 KEYWORDS = {
@@ -147,7 +150,7 @@ def load_prompts(calib: str, n: int, seed: int = 0) -> tuple[list[str], str]:
         return ps[:n], f"{len(ps[:n])} prompts from {path}"
     if calib == "builtin":
         return _builtin(n), f"built-in prompts ({len(FALLBACK)} unique)"
-    names = list(PRESETS) if calib == "mix" else [calib]
+    names = ["chat", "code", "math"] if calib == "mix" else [calib]
     if any(c not in PRESETS for c in names):
         raise ValueError(f"unknown calibration set {calib!r}: use mix, builtin, {', '.join(PRESETS)} or a file path")
     out: list[str] = []

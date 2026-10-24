@@ -63,6 +63,10 @@ DEFAULTS = {
     "heal_lr": 3e-6,         # 1e-5 overfit Flint's attention (held-out KL 0.31 -> 0.40)
     "heal_eval_every": 8,    # optimizer steps between held-out checks (early stopping, best point kept)
     "heal_minutes": 45,      # wall-clock cap on training (0 = none)
+    "heal_calib": "",        # prompts for the teacher's answers ("" = the job's calibration set; contest = code_contests)
+    "heal_seq": 0,           # tokens per training sequence (0 = the job's max_seq); long traces need ~16k
+    "heal_expert_rank": 0,   # > 0: the routed experts train too, as rank-r updates merged before quantization
+    "heal_lora_lr": 1e-4,
     "mlx_bits": 3,           # MLX export: routed experts (GPTQ)
     "mlx_group": 64,
     "mlx_hot": 0.0,          # share of each layer's experts (by REAP score) on mlx_hot_bits

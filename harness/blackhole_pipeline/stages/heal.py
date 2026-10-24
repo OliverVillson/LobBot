@@ -135,14 +135,15 @@ def run(bh, rj, quantized: bool = False) -> None:
     tok = load_tokenizer(rj.model_dir, rj.config.trust_remote_code)
     prof = profile(rj)
     data_path = rj.path("work", "heal_data.jsonl")
-    rows = read_jsonl(data_path)
+    calib = p["heal_calib"] or rj.config.calib or "mix"
+    meta = {"calib": calib, "max_tokens": p["heal_max_tokens"]}
+    rows = read_jsonl(data_path) if (rj.read("work/heal_data_meta.json") or meta) == meta else []
     emit(stage, pct=1, msg="loading the teacher")
     teacher = load_model(rj.model_dir, prof, rj.config.trust_remote_code).eval()
     for q in teacher.parameters():
         q.requires_grad_(False)
     dev = input_device(teacher)
     if len(rows) < p["heal_prompts"]:
-        calib = rj.config.calib or "mix"
         prompts, note = load_prompts(calib, p["heal_prompts"], seed=1234)
         emit(stage, pct=3, msg=f"teacher answers for {len(prompts)} {note}")
         enc = [encode(tok, q, None, rj.config.max_seq)[0] for q in prompts]
@@ -157,7 +158,9 @@ def run(bh, rj, quantized: bool = False) -> None:
             if done[0] % 16 == 0:
                 emit(stage, pct=3 + 27 * done[0] / len(enc), msg=f"teacher answered {done[0]}/{len(enc)}")
         if hasattr(teacher, "generate_many"):
-            teacher.generate_many(enc, p["heal_max_tokens"], 0.7, 0.95, eos, slots=min(len(enc), 128), on_done=on_done)
+            from blackhole_pipeline.bench import fit_batch
+            slots = fit_batch(teacher, min(len(enc), 256), max(map(len, enc)) + p["heal_max_tokens"])
+            teacher.generate_many(enc, p["heal_max_tokens"], 0.7, 0.95, eos, slots=slots, on_done=on_done)
         else:  # any other model: plain HF generate, 16 prompts at a time
             for b0 in range(0, len(enc), 16):
                 grp = enc[b0:b0 + 16]
@@ -172,6 +175,7 @@ def run(bh, rj, quantized: bool = False) -> None:
                     on_done(b0 + j, r[:cut])
         rows = [{"ids": e + a, "start": len(e)} for e, a in zip(enc, answers) if a]
         write_jsonl(data_path, rows)
+        rj.write("work/heal_data_meta.json", meta)
     free()
 
     fq, mlx_info = {}, {}
@@ -193,13 +197,24 @@ def run(bh, rj, quantized: bool = False) -> None:
     before = compare(student, refs, lambda i, n: emit(stage, pct=31 + 4 * i / n, msg=f"KL before {i}/{n}")) \
         if refs else {}
 
+    for mdl in (teacher, student):  # batched experts (two bmm per layer) instead of the per-expert loop
+        if hasattr(mdl, "stack_experts"):
+            mdl.stack_experts()
+    rank = 0 if quantized else p["heal_expert_rank"]
+    if rank and hasattr(student, "add_expert_lora"):  # the routed experts learn too, as low-rank updates
+        student.add_expert_lora(rank)
     params = [(n, q) for n, q in student.named_parameters() if trainable(n)]
     for n, q in student.named_parameters():
         q.requires_grad_(False)
     for _, q in params:
         q.requires_grad_(True)
     master = [q.detach().float().clone().requires_grad_(True) for _, q in params]
-    opt = torch.optim.AdamW(master, lr=p["heal_lr"], betas=(0.9, 0.95), weight_decay=0.0)
+    lora = [i for i, (n, _) in enumerate(params) if ".lora_" in n]
+    groups = [{"params": [mq for i, mq in enumerate(master) if i not in set(lora)], "base": p["heal_lr"]}]
+    if lora:
+        groups.append({"params": [master[i] for i in lora], "base": p["heal_lora_lr"]})
+    opt = torch.optim.AdamW(groups, lr=p["heal_lr"], betas=(0.9, 0.95), weight_decay=0.0)
+    seq = p["heal_seq"] or rj.config.max_seq
     n_train = sum(q.numel() for _, q in params)
 
     m = student.model
@@ -219,9 +234,6 @@ def run(bh, rj, quantized: bool = False) -> None:
                 x = layer(x, pos, mask)
         return model.model.norm(x)
 
-    for mdl in (teacher, student):  # batched experts (two bmm per layer) instead of the per-expert loop
-        if hasattr(mdl, "stack_experts"):
-            mdl.stack_experts()
     student.train()
     emit(stage, pct=36, msg=f"distilling: {n_train / 1e9:.2f}B trainable, {len(rows)} sequences, {steps} steps")
     t0, step, seen, loss_avg = time.time(), 0, 0, None
@@ -231,7 +243,7 @@ def run(bh, rj, quantized: bool = False) -> None:
     stopped = False
     while step < steps and not stopped:
         for r in rows:
-            ids = torch.tensor([r["ids"][:rj.config.max_seq]], device=dev)
+            ids = torch.tensor([r["ids"][:seq]], device=dev)
             a = r["start"]
             with torch.no_grad():
                 ht = hidden(teacher, ids, False)[0, a - 1:-1]
@@ -261,10 +273,9 @@ def run(bh, rj, quantized: bool = False) -> None:
                 for (_, q), mq in zip(params, master):
                     mq.grad = q.grad.float() if q.grad is not None else None
                 torch.nn.utils.clip_grad_norm_(master, 1.0)
-                lr = p["heal_lr"] * (min(1.0, (step + 1) / max(1, steps // 20)) *
-                                     0.5 * (1 + math.cos(math.pi * step / steps)))
+                sched = min(1.0, (step + 1) / max(1, steps // 20)) * 0.5 * (1 + math.cos(math.pi * step / steps))
                 for g in opt.param_groups:
-                    g["lr"] = lr
+                    g["lr"] = g["base"] * sched
                 opt.step()
                 with torch.no_grad():
                     for (_, q), mq in zip(params, master):
@@ -331,6 +342,8 @@ def run(bh, rj, quantized: bool = False) -> None:
         shutil.rmtree(dst, ignore_errors=True)
         if better:
             emit(stage, pct=93, msg=f"writing {dst.name}")
+            if hasattr(student, "merge_expert_lora"):
+                student.merge_expert_lora()
             student.save_pretrained(dst, safe_serialization=True)
             tok.save_pretrained(dst)
             for f in rj.out_dir.iterdir():

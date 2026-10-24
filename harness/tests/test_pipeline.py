@@ -281,7 +281,7 @@ def test_mac_schema_heal_and_mlx_on_a_tiny_flint(tmp_path):
         "model": str(model), "schema": sc.id, "target": "mac", "purpose": "",
         "steps": [s.__dict__ for s in sc.steps], "quant": sc.quant, "calib_samples": 8, **small,
         "mlx_group": 32, "mlx_hot": 0.5, "heal_prompts": 6, "heal_max_tokens": 10, "heal_accum": 2,
-        "heal_lr": 1e-3, "bench_file": str(probs), "bench_max_tokens": 16}))
+        "heal_lr": 1e-3, "heal_expert_rank": 2, "bench_file": str(probs), "bench_max_tokens": 16}))
     p = subprocess.run([sys.executable, "-m", "blackhole_pipeline", "--job", str(job)], env=env, cwd=tmp_path,
                        capture_output=True, text=True, timeout=900)
     events = [e for e in map(parse_event, p.stdout.splitlines()) if e]

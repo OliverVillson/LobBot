@@ -412,3 +412,35 @@ def test_flint_continuous_batching_matches_one_at_a_time(models):
     stop = alone[1][2]
     got = model.generate_many(prompts, max_new_tokens=10, slots=2, eos_token_id=stop)
     assert got[1] == alone[1][:alone[1].index(stop) + 1]
+
+
+def test_flint_expert_lora_trains_and_merges():
+    """Low-rank expert updates start at zero, get gradients, and merge into the same outputs."""
+    import torch
+    from tiny_moe import build
+    from transformers import AutoModelForCausalLM
+    from reaper_pipeline.models import register_all
+    import tempfile
+    from pathlib import Path
+    register_all()
+    with tempfile.TemporaryDirectory() as d:
+        m = AutoModelForCausalLM.from_pretrained(build("flint", Path(d) / "f"), dtype=torch.float32).eval()
+    ids = torch.randint(5, 300, (1, 20))
+    with torch.no_grad():
+        ref = m(input_ids=ids).logits
+    m.add_expert_lora(4)
+    with torch.no_grad():
+        assert torch.allclose(m(input_ids=ids).logits, ref, atol=1e-5)
+    blk = next(l.mlp for l in m.model.layers if hasattr(l.mlp, "lora_gu_A"))
+    m(input_ids=ids).logits.square().mean().backward()
+    assert blk.lora_gu_B.grad is not None and blk.lora_gu_B.grad.abs().sum() > 0
+    with torch.no_grad():
+        for l in m.model.layers:
+            if hasattr(l.mlp, "lora_gu_B"):
+                l.mlp.lora_gu_B.normal_(0, 0.05)
+                l.mlp.lora_dn_B.normal_(0, 0.05)
+        want = m(input_ids=ids).logits
+        m.merge_expert_lora()
+        assert not any("lora" in n for n, _ in m.named_parameters())
+        assert torch.allclose(m(input_ids=ids).logits, want, atol=1e-4)
+        assert (want - ref).abs().max() > 1e-3
