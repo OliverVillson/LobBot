@@ -123,59 +123,109 @@ HEX_BLOCK = 32
 HEX_SKIP = 0xFFFFFFFF   # expert id of a (token, slot) another tier serves: output 0, no weights read
 _HEX_KERNELS = {}
 
-_HEX_SOURCE = """
-    // one simdgroup per (output row, token-slot); lanes walk 8-weight chunks so neighbouring
-    // lanes read neighbouring index words and inputs
-    uint lane = thread_position_in_threadgroup.x;
-    uint row = threadgroup_position_in_grid.x;
-    uint r = thread_position_in_grid.y;
-    uint e = experts[r];
-    if (e == 0xFFFFFFFFu) {            // this (token, slot) belongs to the other tier
-        if (lane == 0) y[(ulong)r * OUT + row] = static_cast<T>(0.0f);
-        return;
-    }
-    uint xr = r / XDIV;
-    const uint nblk = IN / 32;
-    const uint mask = (1u << BITS) - 1u;
-    float es = expert_scale[e];
-    ulong base = ((ulong)e * OUT + row) * nblk;
-    const device float* lv = levels + (ulong)e * (1u << BITS);
-    const device T* xrow = x + (ulong)xr * IN;
-    float acc = 0.0f;
-    for (uint u = lane; u < nblk * 4; u += 32) {
-        uint b = u >> 2;
-        uint c = u & 3u;
-        uint8_t code = block_scale[base + b];
-        uint ex = (code >> 3) & 15u;
-        uint mt = code & 7u;
-        float s = ex == 0 ? (float(mt) / 8.0f) * 0.015625f : (1.0f + float(mt) / 8.0f) * exp2(float(ex) - 7.0f);
-        s = (code & 128u) ? -s : s;
-        const device uint32_t* w = idx + (base + b) * BITS;
-        uint off = c * 8u * BITS;
-        uint wi = off >> 5;
-        uint sh = off & 31u;
-        ulong bitsv = (ulong)w[wi];
-        if (wi + 1 < BITS) bitsv |= ((ulong)w[wi + 1]) << 32;
-        bitsv >>= sh;
-        const device T* xv = xrow + b * 32 + c * 8;
-        float part = 0.0f;
-        for (uint j = 0; j < 8; j++) {
-            part += lv[(uint)(bitsv >> (j * BITS)) & mask] * float(xv[j]);
-        }
-        acc += part * s;
-    }
-    acc = simd_sum(acc) * es;
-    if (lane == 0) y[(ulong)r * OUT + row] = static_cast<T>(acc);
+_HEX_HEADER = """
+inline float hex_fp8(uint code) {          // e4m3 block scale
+    uint ex = (code >> 3) & 15u, mt = code & 7u;
+    float s = ex == 0 ? float(mt) * 0.001953125f : as_type<float>(((ex + 120u) << 23) | (mt << 20));
+    return (code & 128u) ? -s : s;
+}
+"""
+
+# One threadgroup = SG simdgroups x RPS output rows of one (token, slot). Each lane owns 16-weight
+# chunks (half a block: two aligned index words), keeps its inputs in registers across the rows,
+# and looks values up in the expert's level table held in threadgroup memory.
+_HEX_DOT = """
+        float acc{s} = 0.0f;
+        for (uint t = 0; t < CPL; t++) {{
+            uint c = lane + 32u * t;
+            if (c < NCH) {{
+                ulong b = base + (c >> 1);
+                float sc = hex_fp8(block_scale{s}[b]);
+                const device uint32_t* w = idx{s} + b * BITS;
+                uint off = (c & 1u) * (16u * BITS);
+                uint wi = off >> 5;
+                ulong v = ((ulong)w[wi] | ((ulong)w[wi + 1] << 32)) >> (off & 31u);
+                float part = 0.0f;
+                for (uint j = 0; j < 16; j++) part += tlv{s}[(uint)(v >> (j * BITS)) & MASK] * xv[t][j];
+                acc{s} += part * sc;
+            }}
+        }}
+        acc{s} = simd_sum(acc{s}) * es{s};
 """
 
 
-def _hex_kernel():
-    if "k" not in _HEX_KERNELS:
-        _HEX_KERNELS["k"] = mx.fast.metal_kernel(
-            name="blackhole_hex_gather_matvec_v2",
-            input_names=["x", "idx", "block_scale", "expert_scale", "levels", "experts"],
-            output_names=["y"], source=_HEX_SOURCE)
-    return _HEX_KERNELS["k"]
+def _hex_source(glu: bool) -> str:
+    sets = ("", "2") if glu else ("",)
+    tl = "".join(f"""
+    threadgroup float tlv{s}[1u << BITS];
+    if (tid < (1u << BITS)) tlv{s}[tid] = levels{s}[e * (1u << BITS) + tid];
+    float es{s} = expert_scale{s}[e];""" for s in sets)
+    dots = "".join(_HEX_DOT.format(s=s) for s in sets)
+    out = "acc / (1.0f + metal::exp(-acc)) * acc2" if glu else "acc"
+    return """
+    constexpr uint NCH = IN / 16;
+    constexpr uint CPL = (NCH + 31) / 32;
+    constexpr uint NBLK = IN / 32;
+    constexpr uint MASK = (1u << BITS) - 1u;
+    uint tid = thread_position_in_threadgroup.x;
+    uint lane = tid & 31u;
+    uint r = threadgroup_position_in_grid.y;
+    uint row0 = threadgroup_position_in_grid.x * (SG * RPS) + (tid >> 5) * RPS;
+    uint e = experts[r];
+    if (e == 0xFFFFFFFFu) {            // this (token, slot) belongs to the other tier
+        if (lane < RPS && row0 + lane < OUT) y[(ulong)r * OUT + row0 + lane] = static_cast<T>(0.0f);
+        return;
+    }""" + tl + """
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const device T* xrow = x + (ulong)(r / XDIV) * IN;
+    float xv[CPL][16];
+    for (uint t = 0; t < CPL; t++) {
+        uint c = lane + 32u * t;
+        for (uint j = 0; j < 16; j++) xv[t][j] = c < NCH ? float(xrow[c * 16 + j]) : 0.0f;
+    }
+    for (uint q = 0; q < RPS; q++) {
+        uint row = row0 + q;
+        if (row >= OUT) break;
+        ulong base = ((ulong)e * OUT + row) * NBLK;""" + dots + f"""
+        if (lane == 0) y[(ulong)r * OUT + row] = static_cast<T>({out});
+    }}
+"""
+
+
+_HEX_DEQUANT = """
+    constexpr uint NBLK = IN / 32;
+    constexpr uint MASK = (1u << BITS) - 1u;
+    uint c = thread_position_in_grid.x, row = thread_position_in_grid.y, e = thread_position_in_grid.z;
+    if (c >= IN / 16) return;
+    ulong b = ((ulong)e * OUT + row) * NBLK + (c >> 1);
+    float sc = hex_fp8(block_scale[b]) * expert_scale[e];
+    const device uint32_t* w = idx + b * BITS;
+    uint off = (c & 1u) * (16u * BITS);
+    uint wi = off >> 5;
+    ulong v = ((ulong)w[wi] | ((ulong)w[wi + 1] << 32)) >> (off & 31u);
+    const device float* lv = levels + e * (1u << BITS);
+    device T* o = w_out + ((ulong)e * OUT + row) * IN + c * 16;
+    for (uint j = 0; j < 16; j++) o[j] = static_cast<T>(lv[(uint)(v >> (j * BITS)) & MASK] * sc);
+"""
+
+HEX_SG, HEX_RPS = 4, 4
+
+
+def _hex_kernel(kind: str):
+    if kind not in _HEX_KERNELS:
+        parts = ["idx", "block_scale", "expert_scale", "levels"]
+        if kind == "dequant":
+            names, out, src = parts, ["w_out"], _HEX_DEQUANT
+        else:
+            names = ["x"] + parts + ([p + "2" for p in parts] if kind == "glu" else []) + ["experts"]
+            out, src = ["y"], _hex_source(kind == "glu")
+        _HEX_KERNELS[kind] = mx.fast.metal_kernel(
+            name=f"blackhole_hex_{kind}_v3", input_names=names, output_names=out, source=src, header=_HEX_HEADER)
+    return _HEX_KERNELS[kind]
+
+
+def _on_gpu() -> bool:
+    return mx.metal.is_available() and mx.default_device() == mx.gpu
 
 
 def hex_dequant(idx, block_scale, expert_scale, levels, bits: int):
@@ -216,17 +266,35 @@ class HexSwitchLinear(nn.Module):
         self.expert_scale = mx.ones((num_experts,), dtype=mx.float32)
         self.levels = mx.zeros((num_experts, 2 ** bits), dtype=mx.float32)
 
-    def __call__(self, x, experts, shared_x: bool):
+    def parts(self):
+        return [self.idx, self.block_scale, self.expert_scale, self.levels]
+
+    def _matvec(self, x, experts, other=None):
+        """Metal: one output row per (token, slot); `other` (the up projection) fuses silu(self) * other."""
+        R = experts.shape[0]
+        ntg = -(-self.out_dims // (HEX_SG * HEX_RPS))
+        return _hex_kernel("glu" if other is not None else "matvec")(
+            inputs=[x, *self.parts(), *(other.parts() if other is not None else []), experts.astype(mx.uint32)],
+            template=[("T", x.dtype), ("BITS", self.bits), ("IN", self.in_dims), ("OUT", self.out_dims),
+                      ("XDIV", R // x.shape[0]), ("SG", HEX_SG), ("RPS", HEX_RPS)],
+            grid=(32 * HEX_SG * ntg, R, 1), threadgroup=(32 * HEX_SG, 1, 1),
+            output_shapes=[(R, self.out_dims)], output_dtypes=[x.dtype])[0]
+
+    def dequant(self, dtype=mx.bfloat16):
+        """All experts as dense [E, out, in] weights (Metal), for prompt processing."""
+        E = self.idx.shape[0]
+        return _hex_kernel("dequant")(
+            inputs=self.parts(), template=[("T", dtype), ("BITS", self.bits), ("IN", self.in_dims),
+                                           ("OUT", self.out_dims)],
+            grid=(self.in_dims // 16, self.out_dims, E), threadgroup=(min(32, self.in_dims // 16), 1, 1),
+            output_shapes=[(E, self.out_dims, self.in_dims)], output_dtypes=[dtype])[0]
+
+    def __call__(self, x, experts, shared_x: bool = True):
         """x [R or N, in] (shared_x: one row per token for all its k slots), experts [N*k] -> [N*k, out]."""
+        if _on_gpu():
+            return self._matvec(x, experts)
         R = experts.shape[0]
         xdiv = R // x.shape[0]
-        if mx.metal.is_available() and mx.default_device() == mx.gpu:
-            return _hex_kernel()(
-                inputs=[x, self.idx, self.block_scale, self.expert_scale, self.levels, experts.astype(mx.uint32)],
-                template=[("T", x.dtype), ("BITS", self.bits), ("IN", self.in_dims), ("OUT", self.out_dims),
-                          ("XDIV", xdiv)],
-                grid=(32 * self.out_dims, R, 1), threadgroup=(32, 1, 1),
-                output_shapes=[(R, self.out_dims)], output_dtypes=[x.dtype])[0]
         live = experts != HEX_SKIP
         e = mx.where(live, experts, 0)
         W = hex_dequant(self.idx[e], self.block_scale[e], self.expert_scale[e], self.levels[e], self.bits)
@@ -236,19 +304,43 @@ class HexSwitchLinear(nn.Module):
 
 
 class HexSwitchGLU(nn.Module):
+    # (token, slot) pairs per expert from which prompt processing dequantizes the tier once and
+    # runs sorted dense expert matmuls instead of one matrix-vector product per pair
+    dequant_min_per_expert = 8
+
     def __init__(self, hidden: int, inter: int, num_experts: int, bits: int):
         super().__init__()
         self.gate_proj = HexSwitchLinear(hidden, inter, num_experts, bits)
         self.up_proj = HexSwitchLinear(hidden, inter, num_experts, bits)
         self.down_proj = HexSwitchLinear(inter, hidden, num_experts, bits)
 
+    def _dense(self, xf, ids, k):
+        E = self.gate_proj.idx.shape[0]
+        live = ids != HEX_SKIP
+        order = mx.argsort(mx.where(live, ids, E - 1))
+        sid = mx.minimum(ids[order], E - 1)
+        xs = xf[order // k][:, None].astype(mx.bfloat16)                                  # [R, 1, H]
+        mm = lambda a, lin: mx.gather_mm(a, lin.dequant().swapaxes(-1, -2), rhs_indices=sid,  # noqa: E731
+                                         sorted_indices=True)
+        a = nn.silu(mm(xs, self.gate_proj)) * mm(xs, self.up_proj)
+        y = mm(a, self.down_proj)[:, 0]
+        y = y[mx.argsort(order)]
+        return mx.where(live[:, None], y, 0).astype(xf.dtype)
+
     def __call__(self, x, indices):
         """x [..., H], indices [..., k] -> [..., k, H] (like SwitchGLU)."""
         shp, k = x.shape, indices.shape[-1]
         xf = x.reshape(-1, shp[-1])
         ids = indices.reshape(-1).astype(mx.uint32)   # HEX_SKIP marks slots another tier serves
-        a = nn.silu(self.gate_proj(xf, ids, True)) * self.up_proj(xf, ids, True)      # [N*k, I]
-        y = self.down_proj(a, ids, False)                                              # [N*k, H]
+        if _on_gpu():
+            if ids.size >= self.dequant_min_per_expert * self.gate_proj.idx.shape[0]:
+                y = self._dense(xf, ids, k)
+            else:
+                a = self.gate_proj._matvec(xf, ids, self.up_proj)                       # silu(gate) * up, fused
+                y = self.down_proj._matvec(a, ids)
+        else:
+            a = nn.silu(self.gate_proj(xf, ids, True)) * self.up_proj(xf, ids, True)      # [N*k, I]
+            y = self.down_proj(a, ids, False)                                              # [N*k, H]
         return y.reshape(*shp[:-1], k, shp[-1])
 
 
@@ -291,14 +383,14 @@ class MoE(nn.Module):
         if self.norm:
             w = w / (w.sum(-1, keepdims=True) + 1e-20)
         w = w.astype(x.dtype)
-        if self.n_hot and isinstance(self.experts, HexSwitchGLU) and isinstance(self.experts_hot, HexSwitchGLU):
+        if self.n_hot and ids.size >= self.split_min:
+            y = self._split_tiers(x, ids)
+        elif self.n_hot and isinstance(self.experts, HexSwitchGLU) and isinstance(self.experts_hot, HexSwitchGLU):
             hot = ids < self.n_hot   # each (token, slot) is computed by its own tier only
             skip = mx.array(HEX_SKIP, dtype=mx.uint32)
             u = ids.astype(mx.uint32)
             y = (self.experts_hot(x, mx.where(hot, u, skip))
                  + self.experts(x, mx.where(hot, skip, u - self.n_hot)))
-        elif self.n_hot and ids.size >= self.split_min:
-            y = self._split_tiers(x, ids)
         elif self.n_hot:
             hot = ids < self.n_hot
             y = mx.where(hot[..., None], self.experts_hot(x, mx.where(hot, ids, 0)),
