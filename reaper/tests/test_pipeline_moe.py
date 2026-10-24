@@ -396,3 +396,19 @@ def test_flint_stacked_experts_match_the_loop(models):
         blk._fixed_c = True
         assert torch.allclose(blk._stacked_forward(many, *blk.gate(many)[1:]), ref, atol=1e-5, rtol=1e-4)
         blk._fixed_c = False
+
+
+def test_flint_continuous_batching_matches_one_at_a_time(models):
+    """generate_many with fewer slots than prompts (finished slots take the next prompt, slots at
+    different positions, ring caches reused) gives each prompt the greedy tokens it gets alone."""
+    model = load(models["flint"])
+    prompts = [ids(n)[0].tolist() for n in (3, 9, 5, 12, 7)]
+    alone = [model.generate_many([p], max_new_tokens=6 + i)[0] for i, p in enumerate(prompts)]
+    lens = {i: 6 + i for i in range(5)}
+    got = model.generate_many(prompts, max_new_tokens=10, slots=2)
+    for i in range(5):
+        assert got[i][:lens[i]] == alone[i]
+    # eos ends an answer early (it is kept) and frees the slot
+    stop = alone[1][2]
+    got = model.generate_many(prompts, max_new_tokens=10, slots=2, eos_token_id=stop)
+    assert got[1] == alone[1][:alone[1].index(stop) + 1]

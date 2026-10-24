@@ -231,40 +231,55 @@ def generate(model, tok, probs: list[dict], max_tokens: int, batch: int, stage: 
     batch = fit_batch(model, batch, max(len(t) for t in texts) // 3 + max_tokens)
     print(f"bench: sampling at temperature {temp}, top_p {top_p}, {batch} answers at a time, "
           f"up to {max_tokens} tokens each", flush=True)
-    order = sorted(range(len(texts)), key=lambda i: len(texts[i]))
     out = [""] * len(texts)
-    tok.padding_side = "left"
-    t0, done, ntok = time.time(), 0, 0
-    for b0 in range(0, len(order), batch):
-        idx = order[b0:b0 + batch]
-        enc = tok([texts[i] for i in idx], return_tensors="pt", padding=True, add_special_tokens=False)
+    t0, ntok, finished = time.time(), 0, 0
 
-        def step(t, active, b0=b0, n=len(idx)):
-            frac = (b0 + n * t / max_tokens) / len(order)
-            emit(stage, pct[0] + (pct[1] - pct[0]) * frac,
-                 f"writing solutions {b0 + 1}–{b0 + n} of {len(order)}: token {t}/{max_tokens}, {active} still writing")
-        with torch.no_grad():
-            if hasattr(model, "fast_generate"):
-                new = model.fast_generate(enc["input_ids"], enc["attention_mask"], max_tokens, temp, top_p, eos,
-                                          on_step=step).tolist()
-            else:
-                dev = model.get_input_embeddings().weight.device
-                g = model.generate(**enc.to(dev), max_new_tokens=max_tokens, do_sample=True, temperature=temp,
+    def answer(r: list[int]) -> str:
+        cut = next((k for k, t in enumerate(r) if t in eos), len(r))
+        # the answer is what follows the reasoning (<think> can be a special token a plain decode drops)
+        text = tok.decode(r[:cut], skip_special_tokens=False).rsplit("</think>", 1)[-1]
+        for t in tok.all_special_tokens:
+            text = text.replace(t, "")
+        return text
+
+    with torch.no_grad():
+        if hasattr(model, "generate_many"):
+            # continuous batching: a finished answer's slot takes the next problem at once
+            # hard problems first: their long answers start early instead of forming the tail
+            rank = {"hard": 0, "medium": 1, "easy": 2}
+            order = sorted(range(len(texts)), key=lambda i: rank.get(probs[i].get("difficulty"), 1))
+            enc = [tok(texts[i], add_special_tokens=False).input_ids for i in order]
+            last = [0.0]
+
+            def done(j, r):
+                nonlocal ntok, finished
+                out[order[j]] = answer(r)
+                ntok += len(r)
+                finished += 1
+                if finished % 10 == 0 or finished == len(texts):
+                    dt = time.time() - t0
+                    print(f"bench: {finished}/{len(texts)} solutions written in {dt:.0f}s, {ntok:,} tokens, "
+                          f"{ntok / dt:.0f} tok/s total", flush=True)
+
+            def step(t, active):
+                if time.time() - last[0] > 2:
+                    last[0] = time.time()
+                    emit(stage, pct[0] + (pct[1] - pct[0]) * finished / len(texts),
+                         f"{finished}/{len(texts)} solutions written, {active} writing now, step {t}")
+            model.generate_many(enc, max_tokens, temp, top_p, eos, slots=batch, on_step=step, on_done=done)
+        else:
+            tok.padding_side = "left"
+            dev = model.get_input_embeddings().weight.device
+            for b0 in range(0, len(texts), batch):
+                idx = list(range(b0, min(b0 + batch, len(texts))))
+                e = tok([texts[i] for i in idx], return_tensors="pt", padding=True, add_special_tokens=False)
+                g = model.generate(**e.to(dev), max_new_tokens=max_tokens, do_sample=True, temperature=temp,
                                    top_p=top_p, pad_token_id=tok.pad_token_id)
-                new = g[:, enc["input_ids"].shape[1]:].tolist()
-        for i, r in zip(idx, new):
-            cut = next((k for k, t in enumerate(r) if t in eos), len(r))
-            ntok += cut
-            # the answer is what follows the reasoning (<think> can be a special token a plain decode drops)
-            text = tok.decode(r[:cut], skip_special_tokens=False).rsplit("</think>", 1)[-1]
-            for t in tok.all_special_tokens:
-                text = text.replace(t, "")
-            out[i] = text
-        done += len(idx)
-        dt = time.time() - t0
-        print(f"bench: {done}/{len(order)} solutions written in {dt:.0f}s, {ntok:,} tokens, "
-              f"{ntok / dt:.0f} tok/s total", flush=True)
-    return out, temp, ntok
+                for i, r in zip(idx, g[:, e["input_ids"].shape[1]:].tolist()):
+                    out[i] = answer(r)
+                    ntok += next((k for k, t in enumerate(r) if t in eos), len(r))
+                print(f"bench: {idx[-1] + 1}/{len(texts)} solutions written in {time.time() - t0:.0f}s", flush=True)
+    return out, temp, ntok, batch
 
 
 def run(model_dir: Path, out: Path, release: str, file: str | None, limit: int, max_tokens: int, batch: int,
@@ -279,7 +294,7 @@ def run(model_dir: Path, out: Path, release: str, file: str | None, limit: int, 
     model, tok = serve.load(model_dir, "cuda" if torch.cuda.is_available() else "cpu")
     t0 = time.time()
     span = pct[1] - pct[0]
-    replies, temp, ntok = generate(model, tok, probs, max_tokens, batch, stage, (pct[0] + 0.03 * span, pct[0] + 0.9 * span))
+    replies, temp, ntok, batch = generate(model, tok, probs, max_tokens, batch, stage, (pct[0] + 0.03 * span, pct[0] + 0.9 * span))
     gen_s = time.time() - t0
     del model
     from reaper_pipeline.load import free
@@ -321,7 +336,11 @@ def main(argv=None) -> int:
     ap.add_argument("--label", default="")
     a = ap.parse_args(argv)
     lo, hi = (float(x) for x in a.pct.split(","))
-    s = run(Path(a.model).expanduser().resolve(), Path(a.out), a.release, a.file, a.limit, a.max_tokens, a.batch,
+    model = Path(a.model).expanduser()
+    if not model.exists():  # a Hugging Face id
+        from huggingface_hub import snapshot_download
+        model = Path(snapshot_download(a.model))
+    s = run(model.resolve(), Path(a.out), a.release, a.file, a.limit, a.max_tokens, a.batch,
             a.stage, (lo, hi), a.label or Path(a.model).name)
     print(json.dumps(s), flush=True)
     return 0

@@ -265,34 +265,40 @@ class FlintAttention(nn.Module):
         out = out.to(x.dtype).transpose(1, 2).reshape(B, T, self.nh * self.d)
         return self.o_proj(out)
 
-    def static_step(self, x, pos, st: dict, li: int):
-        """One decode token per row against a preallocated cache (st["k"][li], st["v"][li]
-        [B, nkv, Tmax, D]); position index st["t"] [1], valid keys st["mask"] [B, Tmax]. Fixed
-        shapes and no host syncs, so the whole decode step can be captured as a CUDA graph."""
-        B = x.shape[0]
-        q = self.q_norm(self.q_proj(x).view(B, 1, self.nh, self.d)).transpose(1, 2)
-        k = self.k_norm(self.k_proj(x).view(B, 1, self.nkv, self.d)).transpose(1, 2)
-        v = self.v_proj(x).view(B, 1, self.nkv, self.d).transpose(1, 2)
+    def static_step(self, x, st: dict, li: int):
+        """One decode token per slot against preallocated caches, every slot at its own position
+        st["t"] [S] (a slot's tokens sit at cache index = position, no padding). Full-attention
+        caches st["k"][li] [S, nkv, Lmax, D] are read only up to st["L"] (a bucket covering every
+        slot's position); sliding layers use a ring of `window` slots with positions
+        st["ring_pos"] [S, W]. Fixed shapes and no host syncs: one CUDA graph per bucket."""
+        S, t, ar = x.shape[0], st["t"], st["ar"]
+        q = self.q_norm(self.q_proj(x).view(S, 1, self.nh, self.d)).transpose(1, 2)
+        k = self.k_norm(self.k_proj(x).view(S, 1, self.nkv, self.d)).transpose(1, 2)
+        v = self.v_proj(x).view(S, 1, self.nkv, self.d).transpose(1, 2)
         if self.rope:
-            q, k = _rope(q, pos, self.theta), _rope(k, pos, self.theta)
+            q, k = _rope(q, t[:, None], self.theta), _rope(k, t[:, None], self.theta)
         kc, vc = st["k"][li], st["v"][li]
-        ring = self.window is not None and "W" in st
-        at = st["slot"] if ring else st["t"]
-        kc.index_copy_(2, at, k.to(kc.dtype))
-        vc.index_copy_(2, at, v.to(vc.dtype))
+        if st["ring"][li]:
+            at = t % kc.shape[2]
+            kpos = st["ring_pos"]
+        else:
+            at = t
+            kc, vc = kc[:, :, :st["L"]], vc[:, :, :st["L"]]
+            kpos = st["kpos"][:st["L"]].expand(S, -1)
+        st["k"][li][ar, :, at] = k[:, :, 0].to(kc.dtype)
+        st["v"][li][ar, :, at] = v[:, :, 0].to(vc.dtype)
         G, rep = self.nkv, self.nh // self.nkv
-        s = torch.matmul(q.reshape(B, G, rep, self.d).to(kc.dtype), kc.transpose(-1, -2)).float() * self.scale
-        kpos, kmask = (st["ring_pos"], st["ring_mask"]) if ring else (st["kpos"], st["mask"])
-        allowed = kmask & (kpos[None, :] <= st["t"])
+        sc = torch.matmul(q.reshape(S, G, rep, self.d).to(kc.dtype), kc.transpose(-1, -2)).float() * self.scale
+        allowed = (kpos <= t[:, None]) & (kpos >= 0)
         if self.window:
-            allowed = allowed & (kpos[None, :] > st["t"] - self.window)
-        s = s.masked_fill(~allowed[:, None, None, :], float("-inf"))
+            allowed = allowed & (kpos > t[:, None] - self.window)
+        sc = sc.masked_fill(~allowed[:, None, None, :], float("-inf"))
         sink = self.softmax_offset.float().view(1, G, rep, 1)
-        m = torch.maximum(s.amax(-1, keepdim=True), sink)
-        p = torch.exp(s - m)
-        p = p / (p.sum(-1, keepdim=True) + torch.exp(sink - m))
-        o = torch.matmul(p.to(vc.dtype), vc)                               # [B, G, rep, D]
-        return self.o_proj(o.reshape(B, 1, self.nh * self.d).to(x.dtype))
+        m = torch.maximum(sc.amax(-1, keepdim=True), sink)
+        pr = torch.exp(sc - m)
+        pr = pr / (pr.sum(-1, keepdim=True) + torch.exp(sink - m))
+        o = torch.matmul(pr.to(vc.dtype), vc)                              # [S, G, rep, D]
+        return self.o_proj(o.reshape(S, 1, self.nh * self.d).to(x.dtype))
 
     def _cached(self, q, k, v, key_mask, kv: dict):
         """Attention for generation with a KV cache (kv holds this layer's k, v [B, nkv, Tk, D]).
@@ -338,8 +344,8 @@ class FlintDecoderLayer(nn.Module):
         self.input_layernorm = FlintRMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_attention_layernorm = FlintRMSNorm(config.hidden_size, config.rms_norm_eps)
 
-    def static_step(self, x, pos, st: dict, li: int):
-        x = x + self.self_attn.static_step(self.input_layernorm(x), pos, st, li)
+    def static_step(self, x, st: dict, li: int):
+        x = x + self.self_attn.static_step(self.input_layernorm(x), st, li)
         return x + self.mlp(self.post_attention_layernorm(x))
 
     def forward(self, x, pos, key_mask, kv=None):
@@ -432,117 +438,185 @@ class FlintForCausalLM(FlintPreTrainedModel, GenerationMixin):
         input_ids [B, T] left-padded. Returns new tokens [B, n]; a row is padded with its first
         eos token after it finishes. on_step(step, still_writing) is called every 16 tokens and
         on_token(tokens [B]) after every token; on_token returning True stops generation."""
+        mask = attention_mask.bool() if attention_mask is not None else torch.ones_like(input_ids, dtype=torch.bool)
+        prompts = [r[mk].tolist() for r, mk in zip(input_ids, mask)]
+        outs = self.generate_many(prompts, max_new_tokens, temperature, top_p, eos_token_id, generator,
+                                  slots=len(prompts), on_step=on_step, on_token=on_token)
+        n = max((len(o) for o in outs), default=0)
+        eos = sorted({eos_token_id} if isinstance(eos_token_id, int) else set(eos_token_id or []))
+        fill = eos[0] if eos else 0
+        return torch.tensor([o + [fill] * (n - len(o)) for o in outs], dtype=torch.long).view(len(outs), n)
+
+    @torch.no_grad()
+    def generate_many(self, prompts: list[list[int]], max_new_tokens: int = 256, temperature: float = 0.0,
+                      top_p: float = 1.0, eos_token_id=None, generator=None, slots: int | None = None,
+                      on_step=None, on_token=None, on_done=None) -> list[list[int]]:
+        """Continuous batching: `slots` sequences decode together and a finished slot takes the next
+        prompt at once (a batch never waits for its longest answer). Returns each prompt's new
+        tokens, ending with its eos token if it produced one. on_step(tokens so far, still writing);
+        on_done(prompt index, tokens) as each answer finishes; on_token(tokens [S]) after every step
+        (only meaningful when every prompt has its own slot; True stops generation)."""
         m = self.model
         self.stack_experts()
-        B = input_ids.shape[0]
         dev = m.embed_tokens.weight.device
-        input_ids = input_ids.to(dev)
-        key_mask = (attention_mask.to(dev).bool() if attention_mask is not None
-                    else torch.ones_like(input_ids, dtype=torch.bool))
-        pos = (key_mask.long().cumsum(-1) - 1).clamp(min=0)
-        eos = torch.tensor(sorted({eos_token_id} if isinstance(eos_token_id, int) else set(eos_token_id or [])),
-                           dtype=torch.long, device=dev)
-        caches = [{} for _ in m.layers]
-        x = m.embed_tokens(input_ids)
-        for layer, kv in zip(m.layers, caches):
-            x = layer(x, pos, key_mask, kv)
-        logits = self.lm_head(m.norm(x[:, -1])).float()
-        del x
-        T = input_ids.shape[1]
-        Tmax = T + max_new_tokens
-        k0 = caches[0]["k"]
-        st = {"k": [], "v": [], "t": torch.tensor([T - 1], device=dev), "pos": pos[:, -1].clone(),
-              "kpos": torch.arange(Tmax, device=dev), "tok": torch.zeros(B, dtype=torch.long, device=dev),
-              "mask": torch.zeros(B, Tmax, dtype=torch.bool, device=dev)}
-        st["mask"][:, :T] = key_mask
-        # sliding-window layers keep a ring of `window` slots (position p in slot p % window), so
-        # long answers only grow the cache of the full-attention layers
-        W = next((l.self_attn.window for l in m.layers if l.self_attn.window), None)
-        if W is not None and W < Tmax:
-            keep = torch.arange(max(0, T - W), T, device=dev)
-            slots = keep % W
-            st["W"] = torch.tensor(W, device=dev)
-            st["ring_pos"] = torch.full((W,), -(1 << 40), dtype=torch.long, device=dev).index_copy_(0, slots, keep)
-            st["ring_mask"] = torch.zeros(B, W, dtype=torch.bool, device=dev).index_copy_(1, slots, key_mask[:, keep])
-        for layer, kv in zip(m.layers, caches):
-            ring = "W" in st and layer.self_attn.window is not None
-            for name in ("k", "v"):
-                buf = torch.zeros(B, k0.shape[1], W if ring else Tmax, k0.shape[3], dtype=kv[name].dtype, device=dev)
-                if ring:
-                    buf.index_copy_(2, slots, kv[name][:, :, keep])
-                else:
-                    buf[:, :, :T] = kv[name]
-                st[name].append(buf)
-            kv.clear()
-        del caches
-        logits_buf = torch.empty_like(logits)
+        N = len(prompts)
+        S = max(1, min(slots or N, N))
+        eos_l = sorted({eos_token_id} if isinstance(eos_token_id, int) else set(eos_token_id or []))
+        eos = torch.tensor(eos_l, dtype=torch.long, device=dev)
+        K = 1 if on_token is not None else 8                                # steps between host checks
+        Lmax = max(len(p) for p in prompts) + max_new_tokens + K + 1
+        attn = [l.self_attn for l in m.layers]
+        W = next((a.window for a in attn if a.window), None)
+        ring = [bool(a.window) and W is not None and W < Lmax for a in attn]
+        cfg = self.config
+        nkv, D = cfg.num_key_value_heads, cfg.head_dim
+        dt = m.embed_tokens.weight.dtype
+        st = {"k": [torch.zeros(S, nkv, W if r else Lmax, D, dtype=dt, device=dev) for r in ring],
+              "ring": ring, "t": torch.zeros(S, dtype=torch.long, device=dev),
+              "ar": torch.arange(S, device=dev), "kpos": torch.arange(Lmax, device=dev),
+              "tok": torch.zeros(S, dtype=torch.long, device=dev), "L": Lmax}
+        st["v"] = [torch.zeros_like(k) for k in st["k"]]
+        if any(ring):
+            st["ring_pos"] = torch.full((S, W), -1, dtype=torch.long, device=dev)
+        logits = torch.zeros(S, cfg.vocab_size, dtype=torch.float32, device=dev)
+        out_buf = torch.zeros(S, max_new_tokens + K + 1, dtype=torch.long, device=dev)
+        n_gen = torch.zeros(S, dtype=torch.long, device=dev)
+        done = torch.ones(S, dtype=torch.bool, device=dev)
+        owner = [-1] * S                      # prompt index per slot (-1: free)
+        t_host = [0] * S
+        results: list[list[int] | None] = [None] * N
+        queue = list(range(N))
         moe = [l.mlp for l in m.layers if isinstance(l.mlp, FlintSparseMoeBlock)]
 
-        def step():
-            st["t"].add_(1)
-            st["pos"].add_(1)
-            st["mask"].index_fill_(1, st["t"], True)
-            if "W" in st:
-                st["slot"] = st["t"] % st["W"]
-                st["ring_pos"].index_copy_(0, st["slot"], st["t"])
-                st["ring_mask"].index_fill_(1, st["slot"], True)
-            h = m.embed_tokens(st["tok"][:, None])
-            p = st["pos"][:, None]
-            for li, layer in enumerate(m.layers):
-                h = layer.static_step(h, p, st, li)
-            logits_buf.copy_(self.lm_head(m.norm(h[:, -1])).float())
+        def prefill(free: list[int]) -> None:
+            """Fill free slots with the next prompts: one batched forward per group of prompts."""
+            while free and queue:
+                grp = []
+                while free and queue and len(grp) < 32:
+                    grp.append((free.pop(0), queue.pop(0)))
+                ps = [prompts[i] for _, i in grp]
+                T = max(len(p) for p in ps)
+                ids = torch.tensor([[0] * (T - len(p)) + p for p in ps], device=dev)
+                km = torch.tensor([[False] * (T - len(p)) + [True] * len(p) for p in ps], device=dev)
+                pos = (km.long().cumsum(-1) - 1).clamp(min=0)
+                caches = [{} for _ in m.layers]
+                x = m.embed_tokens(ids)
+                for layer, kv in zip(m.layers, caches):
+                    x = layer(x, pos, km, kv)
+                lg = self.lm_head(m.norm(x[:, -1])).float()
+                del x
+                for j, (slot, i) in enumerate(grp):
+                    n = len(ps[j])
+                    for li, kv in enumerate(caches):
+                        kk, vv = kv["k"][j, :, T - n:], kv["v"][j, :, T - n:]
+                        if ring[li]:
+                            keep = torch.arange(max(0, n - W), n, device=dev)
+                            st["k"][li][slot, :, keep % W] = kk[:, keep]
+                            st["v"][li][slot, :, keep % W] = vv[:, keep]
+                        else:
+                            st["k"][li][slot, :, :n] = kk
+                            st["v"][li][slot, :, :n] = vv
+                    if any(ring):
+                        keep = torch.arange(max(0, n - W), n, device=dev)
+                        st["ring_pos"][slot] = -1
+                        st["ring_pos"][slot, keep % W] = keep
+                    st["t"][slot] = n - 1
+                    t_host[slot] = n - 1
+                    logits[slot] = lg[j]
+                    n_gen[slot] = 0
+                    done[slot] = False
+                    owner[slot] = i
+                del caches
 
-        for b in moe:
-            b._fixed_c = True
-        graph = None
-        try:
-            if dev.type == "cuda" and max_new_tokens > 8 and not os.environ.get("REAPER_NO_CUDA_GRAPH"):
-                snap = (st["t"].clone(), st["pos"].clone(), st["mask"].clone())
-                side = torch.cuda.Stream()
-                side.wait_stream(torch.cuda.current_stream())
-                with torch.cuda.stream(side):
-                    for _ in range(2):  # warm-up (allocations, kernel selection) before capture
-                        step()
-                torch.cuda.current_stream().wait_stream(side)
-                st["t"].copy_(snap[0]), st["pos"].copy_(snap[1]), st["mask"].copy_(snap[2])
-                graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph):
-                    step()
-                del snap
-        except Exception as e:  # anything the capture does not support: run the same step eagerly
-            print(f"flint: CUDA graph capture failed ({type(e).__name__}: {e}); decoding eagerly", flush=True)
-            graph = None
-            torch.cuda.synchronize()
-
-        done = torch.zeros(B, dtype=torch.bool, device=dev)
-        fill = eos[0] if len(eos) else torch.tensor(0, device=dev)
-        out = []
-        try:
-            for step_i in range(max_new_tokens):
-                nxt = _sample(logits, temperature, top_p, generator)
-                nxt = torch.where(done, fill, nxt)
-                out.append(nxt)
-                if len(eos):
-                    done |= torch.isin(nxt, eos)
-                if on_token is not None and on_token(nxt):
-                    break
-                if on_step is not None and step_i % 16 == 15:
-                    on_step(step_i + 1, int((~done).sum()))
-                if step_i == max_new_tokens - 1 or ((on_token is not None or step_i % 8 == 7) and bool(done.all())):
-                    break
-                st["tok"].copy_(nxt)
-                if graph is not None:
-                    graph.replay()
-                else:
-                    step()
-                logits = logits_buf.clone()
-        finally:
+        def step() -> None:
             for b in moe:
-                b._fixed_c = False
-        return torch.stack(out, 1) if out else input_ids.new_zeros(B, 0)
+                b._fixed_c = True
+            try:
+                st["t"].add_(1).clamp_(max=Lmax - 1)
+                if "ring_pos" in st:
+                    st["ring_pos"][st["ar"], st["t"] % W] = st["t"]
+                h = m.embed_tokens(st["tok"][:, None])
+                for li, layer in enumerate(m.layers):
+                    h = layer.static_step(h, st, li)
+                logits.copy_(self.lm_head(m.norm(h[:, -1])).float())
+            finally:
+                for b in moe:
+                    b._fixed_c = False
 
-    def prepare_inputs_for_generation(self, input_ids, attention_mask=None, **_):
-        return {"input_ids": input_ids, "attention_mask": attention_mask}
+        BUCKET = 1024
+        graphs: dict[int, object] = {}
+        use_graphs = dev.type == "cuda" and max_new_tokens > 8 and not os.environ.get("REAPER_NO_CUDA_GRAPH")
+        pool = torch.cuda.graph_pool_handle() if use_graphs else None
+
+        def run_step(L: int) -> None:
+            nonlocal use_graphs
+            st["L"] = L
+            if not use_graphs:
+                return step()
+            if L not in graphs:
+                try:
+                    snap = [x.clone() for x in (st["t"], logits)]
+                    side = torch.cuda.Stream()
+                    side.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(side):
+                        step()  # warm-up before capture
+                    torch.cuda.current_stream().wait_stream(side)
+                    st["t"].copy_(snap[0])
+                    g = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(g, pool=pool):
+                        step()
+                    graphs[L] = g
+                    st["t"].copy_(snap[0])  # the capture does not run the step; replay below does
+                    del snap
+                except Exception as e:  # anything the capture does not support: decode eagerly
+                    print(f"flint: CUDA graph capture failed ({type(e).__name__}: {e}); decoding eagerly", flush=True)
+                    use_graphs = False
+                    torch.cuda.synchronize()
+                    return step()
+            graphs[L].replay()
+
+        def harvest(everything: bool = False) -> None:
+            d = done.tolist()
+            fin = [s_ for s_ in range(S) if owner[s_] >= 0 and (d[s_] or everything)]
+            if not fin:
+                return
+            ng = n_gen.tolist()
+            for s_, r in zip(fin, out_buf[fin].tolist()):
+                r = r[:ng[s_]]
+                cut = next((k_ + 1 for k_, tk in enumerate(r) if tk in eos_l), len(r))
+                results[owner[s_]] = r[:cut]
+                if on_done is not None:
+                    on_done(owner[s_], r[:cut])
+                owner[s_] = -1
+                t_host[s_] = 0
+                st["t"][s_] = 0
+
+        prefill(list(range(S)))
+        steps = 0
+        while True:
+            # finished slots hand over to the next prompts (checked every K steps: a host sync)
+            if steps and steps % K == 0:
+                harvest()
+                prefill([s_ for s_ in range(S) if owner[s_] < 0])
+                if all(o < 0 for o in owner):
+                    break
+            nxt = _sample(logits, temperature, top_p, generator)
+            out_buf[st["ar"], n_gen.clamp(max=out_buf.shape[1] - 1)] = nxt
+            n_gen.add_((~done).long())
+            if len(eos):
+                done |= torch.isin(nxt, eos)
+            done |= n_gen >= max_new_tokens
+            steps += 1
+            if on_token is not None and on_token(nxt):
+                harvest(everything=True)
+                break
+            if on_step is not None and steps % 16 == 0:
+                on_step(steps, int((~done).sum()))
+            st["tok"].copy_(nxt)
+            for s_ in range(S):
+                t_host[s_] = min(t_host[s_] + 1, Lmax - 1)
+            run_step(min(Lmax, (max(t_host) // BUCKET + 1) * BUCKET))
+        return [r if r is not None else [] for r in results]
 
 
 def _sample(logits, temperature: float, top_p: float, generator=None):
