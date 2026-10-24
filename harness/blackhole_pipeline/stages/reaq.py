@@ -64,7 +64,7 @@ def run(bh, rj) -> None:
     work = rj.path("work", "reaq")
     shutil.rmtree(work, ignore_errors=True)
     work.mkdir(parents=True)
-    nL, done, t0, worst = len(m.blocks), 0, time.time(), 0.0
+    nL, done, t0, worst, off, total = len(m.blocks), 0, time.time(), 0.0, 0, 0
     for chunk in m.chunks(p["layer_chunk"]):
         emit(STAGE, pct=5 + 75 * done / nL, msg=f"Hessians for layers {chunk[0].layer}–{chunk[-1].layer}")
         hs = m.hessians(chunk)
@@ -88,7 +88,14 @@ def run(bh, rj) -> None:
                     codes = block_codes(S, es, block)
                     packed = pack_nibbles(idx)
                     back = codebook_dequant(packed, W.shape[-1], codes, es, Lv, block)
+                    # Elements GPTQ zeroed (dead input columns: no calibration token ever lit them) and
+                    # all-zero blocks have no exact code in the saved format; measure the saved weights,
+                    # so the reported KL is the KL of what is on disk, and count how many differ.
+                    diff = (back - Q).abs() > 1e-3 * Q.abs().amax(dim=(1, 2), keepdim=True).clamp(min=1e-30)
+                    off += int(diff.sum())
+                    total += diff.numel()
                     worst = max(worst, float((back - Q).abs().max() / Q.abs().max().clamp(min=1e-30)))
+                    Q = back
                     t = f"{prefix}.tier{L}.{mat}"
                     out[f"{t}.idx"] = packed.cpu()
                     out[f"{t}.block_scale"] = codes.cpu()
@@ -106,8 +113,11 @@ def run(bh, rj) -> None:
         del hs
         free()
     quant_s = time.time() - t0
-    if worst > 1e-2:
-        raise RuntimeError(f"saved codebooks do not reproduce the measured weights (max rel err {worst:.2e})")
+    frac = off / max(total, 1)
+    print(f"reaq: {off:,} of {total:,} weights ({frac:.4%}) differ from the GPTQ result in the saved format "
+          f"(dead columns / zero blocks); max rel diff {worst:.2e}; the measurement uses the saved weights", flush=True)
+    if frac > 0.02:
+        raise RuntimeError(f"saved codebooks differ from the GPTQ result on {frac:.2%} of weights: a packing bug")
     emit(STAGE, pct=81, msg="REAQ codebook model vs teacher on held-out answers")
     r = m.compare(lambda i, n: emit(STAGE, pct=81 + 12 * i / n, msg=f"held-out {i}/{n} vs teacher"))
     replace = expert_keys(m.names)
@@ -135,7 +145,7 @@ def run(bh, rj) -> None:
     nonexpert_gb = g["size_gb"] - g["expert_gb"] if g.get("size_gb") else None
     res = {"format": f"REAQ codebooks: top {top:.0%} of experts by REAP 16-level, rest 8-level, b{block}, GPTQ",
            "bpw": round(b, 3), "expert_gb": round(gib(params * b / 8), 2), "file_gb": round(gib(total), 2),
-           "tiers": n_per, "out": str(dst), "quant_s": round(quant_s, 1), "roundtrip_max_rel_err": worst,
+           "tiers": n_per, "out": str(dst), "quant_s": round(quant_s, 1), "roundtrip_max_rel_err": worst, "roundtrip_diff_frac": frac,
            "calib_seqs": n_calib}
     if nonexpert_gb is not None:
         res["size_gb"] = round(res["expert_gb"] + nonexpert_gb, 2)  # at the format's real bit width
