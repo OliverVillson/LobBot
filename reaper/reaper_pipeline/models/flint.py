@@ -25,6 +25,8 @@ REAP reads Flint's routing exactly as the model applies it.
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -32,6 +34,7 @@ from transformers import GenerationMixin, PreTrainedConfig, PreTrainedModel
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 Q_CHUNK = 1024  # query rows per attention chunk (bounds the [heads, q, k] score matrix)
+STACKED_CHUNK = 4096  # tokens per batched-experts pass (bounds the [E, C, H] buffer)
 Q_CHUNK_CACHED = 256  # the same for cached generation, where the batch is large
 
 
@@ -128,10 +131,64 @@ class FlintSparseMoeBlock(nn.Module):
                                      for _ in range(config.num_experts))
         self.shared_expert = FlintMLP(config.hidden_size, config.shared_expert_intermediate_size)
 
+    @torch.no_grad()
+    def stack_experts(self) -> None:
+        """Put the experts' weights into stacked [E, 2I, H] (gate rows, then up) and [E, H, I]
+        tensors, with each expert's Linear weights becoming views into them (no extra memory
+        once done), so forward can run all experts as two batched matmuls instead of a loop."""
+        if hasattr(self, "_gu"):
+            return
+        ex = self.experts
+        I = ex[0].gate_proj.weight.shape[0]
+        gu = torch.stack([torch.cat([e.gate_proj.weight, e.up_proj.weight]) for e in ex])
+        dn = torch.stack([e.down_proj.weight for e in ex])
+        for j, e in enumerate(ex):
+            e.gate_proj.weight = nn.Parameter(gu[j, :I], requires_grad=False)
+            e.up_proj.weight = nn.Parameter(gu[j, I:], requires_grad=False)
+            e.down_proj.weight = nn.Parameter(dn[j], requires_grad=False)
+        self._gu, self._dn, self._I, self._fixed_c = gu, dn, I, False
+
+    def _stacked_forward(self, h, w, ids):
+        """All experts at once: tokens scattered into a [E, C, H] buffer (C = most tokens any
+        expert got), two bmm's, gathered back. Chunked so prefill buffers stay a few GB."""
+        E, k, I = self._gu.shape[0], ids.shape[1], self._I
+        if h.shape[0] * k * 2 <= E:  # few tokens (small-batch decode): read only the chosen experts
+            flat = ids.reshape(-1)
+            x = h.repeat_interleave(k, 0)[:, None, :]                              # [N, 1, H]
+            g = torch.bmm(x, self._gu[flat].transpose(1, 2))
+            a = F.silu(g[..., :I].float()).to(h.dtype) * g[..., I:]
+            y = torch.bmm(a, self._dn[flat].transpose(1, 2))[:, 0].float()         # [N, H]
+            return (y * w.reshape(-1, 1).float()).view(h.shape[0], k, -1).sum(1)
+        out = torch.zeros(h.shape, dtype=torch.float32, device=h.device)
+        for c0 in range(0, h.shape[0], STACKED_CHUNK):
+            hc, wc, ic = h[c0:c0 + STACKED_CHUNK], w[c0:c0 + STACKED_CHUNK], ids[c0:c0 + STACKED_CHUNK]
+            flat = ic.reshape(-1)
+            order = torch.argsort(flat, stable=True)
+            e_sorted = flat[order]
+            if self._fixed_c:  # decode under a CUDA graph: no host sync, C = tokens (an expert gets a token once)
+                counts = torch.zeros(E, dtype=torch.long, device=h.device).scatter_add_(0, flat, torch.ones_like(flat))
+                C = hc.shape[0]
+            else:
+                counts = torch.bincount(flat, minlength=E)
+            start = torch.cumsum(counts, 0) - counts
+            rank = torch.arange(flat.numel(), device=h.device) - start[e_sorted]
+            if not self._fixed_c:
+                C = int(counts.max())
+            tok = order // k
+            X = torch.zeros(E, C, h.shape[1], dtype=h.dtype, device=h.device)
+            X[e_sorted, rank] = hc[tok]
+            g = torch.bmm(X, self._gu.transpose(1, 2))
+            a = F.silu(g[..., :I].float()).to(h.dtype) * g[..., I:]
+            Y = torch.bmm(a, self._dn.transpose(1, 2))
+            out[c0:c0 + STACKED_CHUNK].index_add_(0, tok, Y[e_sorted, rank].float() * wc.reshape(-1)[order, None].float())
+        return out
+
     def forward(self, x):
         shape = x.shape
         h = x.reshape(-1, shape[-1])
         _, w, ids = self.gate(h)
+        if hasattr(self, "_gu"):
+            return (self._stacked_forward(h, w, ids).to(x.dtype) + self.shared_expert(h)).reshape(shape)
         # group the (token, slot) pairs by expert with one sort and one host sync per layer
         # (a torch.where per expert syncs 256 times per layer, which dominates decoding)
         k = ids.shape[1]
@@ -208,6 +265,32 @@ class FlintAttention(nn.Module):
         out = out.to(x.dtype).transpose(1, 2).reshape(B, T, self.nh * self.d)
         return self.o_proj(out)
 
+    def static_step(self, x, pos, st: dict, li: int):
+        """One decode token per row against a preallocated cache (st["k"][li], st["v"][li]
+        [B, nkv, Tmax, D]); position index st["t"] [1], valid keys st["mask"] [B, Tmax]. Fixed
+        shapes and no host syncs, so the whole decode step can be captured as a CUDA graph."""
+        B = x.shape[0]
+        q = self.q_norm(self.q_proj(x).view(B, 1, self.nh, self.d)).transpose(1, 2)
+        k = self.k_norm(self.k_proj(x).view(B, 1, self.nkv, self.d)).transpose(1, 2)
+        v = self.v_proj(x).view(B, 1, self.nkv, self.d).transpose(1, 2)
+        if self.rope:
+            q, k = _rope(q, pos, self.theta), _rope(k, pos, self.theta)
+        kc, vc = st["k"][li], st["v"][li]
+        kc.index_copy_(2, st["t"], k.to(kc.dtype))
+        vc.index_copy_(2, st["t"], v.to(vc.dtype))
+        G, rep = self.nkv, self.nh // self.nkv
+        s = torch.matmul(q.reshape(B, G, rep, self.d).to(kc.dtype), kc.transpose(-1, -2)).float() * self.scale
+        allowed = st["mask"] & (st["kpos"][None, :] <= st["t"])
+        if self.window:
+            allowed = allowed & (st["kpos"][None, :] > st["t"] - self.window)
+        s = s.masked_fill(~allowed[:, None, None, :], float("-inf"))
+        sink = self.softmax_offset.float().view(1, G, rep, 1)
+        m = torch.maximum(s.amax(-1, keepdim=True), sink)
+        p = torch.exp(s - m)
+        p = p / (p.sum(-1, keepdim=True) + torch.exp(sink - m))
+        o = torch.matmul(p.to(vc.dtype), vc)                               # [B, G, rep, D]
+        return self.o_proj(o.reshape(B, 1, self.nh * self.d).to(x.dtype))
+
     def _cached(self, q, k, v, key_mask, kv: dict):
         """Attention for generation with a KV cache (kv holds this layer's k, v [B, nkv, Tk, D]).
         key_mask [B, Tk] covers cache + new tokens. Query heads are grouped onto their KV head, so
@@ -251,6 +334,10 @@ class FlintDecoderLayer(nn.Module):
                     else FlintSparseMoeBlock(config))
         self.input_layernorm = FlintRMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_attention_layernorm = FlintRMSNorm(config.hidden_size, config.rms_norm_eps)
+
+    def static_step(self, x, pos, st: dict, li: int):
+        x = x + self.self_attn.static_step(self.input_layernorm(x), pos, st, li)
+        return x + self.mlp(self.post_attention_layernorm(x))
 
     def forward(self, x, pos, key_mask, kv=None):
         x = x + self.self_attn(self.input_layernorm(x), pos, key_mask, kv)
@@ -329,6 +416,12 @@ class FlintForCausalLM(FlintPreTrainedModel, GenerationMixin):
                                    ignore_index=-100)
         return CausalLMOutputWithPast(loss=loss, logits=logits)
 
+    def stack_experts(self) -> None:
+        """Batched experts for inference (FlintSparseMoeBlock.stack_experts); memory neutral."""
+        for layer in self.model.layers:
+            if isinstance(layer.mlp, FlintSparseMoeBlock):
+                layer.mlp.stack_experts()
+
     @torch.no_grad()
     def fast_generate(self, input_ids, attention_mask=None, max_new_tokens: int = 256, temperature: float = 0.0,
                       top_p: float = 1.0, eos_token_id=None, generator=None, on_step=None, on_token=None):
@@ -337,6 +430,7 @@ class FlintForCausalLM(FlintPreTrainedModel, GenerationMixin):
         eos token after it finishes. on_step(step, still_writing) is called every 16 tokens and
         on_token(tokens [B]) after every token; on_token returning True stops generation."""
         m = self.model
+        self.stack_experts()
         B = input_ids.shape[0]
         dev = m.embed_tokens.weight.device
         input_ids = input_ids.to(dev)
@@ -349,28 +443,82 @@ class FlintForCausalLM(FlintPreTrainedModel, GenerationMixin):
         x = m.embed_tokens(input_ids)
         for layer, kv in zip(m.layers, caches):
             x = layer(x, pos, key_mask, kv)
-        last = pos[:, -1]
+        logits = self.lm_head(m.norm(x[:, -1])).float()
+        del x
+        T = input_ids.shape[1]
+        Tmax = T + max_new_tokens
+        k0 = caches[0]["k"]
+        st = {"k": [], "v": [], "t": torch.tensor([T - 1], device=dev), "pos": pos[:, -1].clone(),
+              "kpos": torch.arange(Tmax, device=dev), "tok": torch.zeros(B, dtype=torch.long, device=dev),
+              "mask": torch.zeros(B, Tmax, dtype=torch.bool, device=dev)}
+        st["mask"][:, :T] = key_mask
+        for kv in caches:
+            for name in ("k", "v"):
+                buf = torch.zeros(B, k0.shape[1], Tmax, k0.shape[3], dtype=kv[name].dtype, device=dev)
+                buf[:, :, :T] = kv[name]
+                st[name].append(buf)
+            kv.clear()
+        del caches
+        logits_buf = torch.empty_like(logits)
+        moe = [l.mlp for l in m.layers if isinstance(l.mlp, FlintSparseMoeBlock)]
+
+        def step():
+            st["t"].add_(1)
+            st["pos"].add_(1)
+            st["mask"].index_fill_(1, st["t"], True)
+            h = m.embed_tokens(st["tok"][:, None])
+            p = st["pos"][:, None]
+            for li, layer in enumerate(m.layers):
+                h = layer.static_step(h, p, st, li)
+            logits_buf.copy_(self.lm_head(m.norm(h[:, -1])).float())
+
+        for b in moe:
+            b._fixed_c = True
+        graph = None
+        try:
+            if dev.type == "cuda" and max_new_tokens > 8 and not os.environ.get("REAPER_NO_CUDA_GRAPH"):
+                snap = (st["t"].clone(), st["pos"].clone(), st["mask"].clone())
+                side = torch.cuda.Stream()
+                side.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(side):
+                    for _ in range(2):  # warm-up (allocations, kernel selection) before capture
+                        step()
+                torch.cuda.current_stream().wait_stream(side)
+                st["t"].copy_(snap[0]), st["pos"].copy_(snap[1]), st["mask"].copy_(snap[2])
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    step()
+                del snap
+        except Exception as e:  # anything the capture does not support: run the same step eagerly
+            print(f"flint: CUDA graph capture failed ({type(e).__name__}: {e}); decoding eagerly", flush=True)
+            graph = None
+            torch.cuda.synchronize()
+
         done = torch.zeros(B, dtype=torch.bool, device=dev)
         fill = eos[0] if len(eos) else torch.tensor(0, device=dev)
         out = []
-        for step in range(max_new_tokens):
-            logits = self.lm_head(m.norm(x[:, -1])).float()
-            nxt = _sample(logits, temperature, top_p, generator)
-            nxt = torch.where(done, fill, nxt)
-            out.append(nxt)
-            if len(eos):
-                done |= torch.isin(nxt, eos)
-            if on_token is not None and on_token(nxt):
-                break
-            if on_step is not None and step % 16 == 15:
-                on_step(step + 1, int((~done).sum()))
-            if bool(done.all()) or step == max_new_tokens - 1:
-                break
-            last = last + 1
-            key_mask = torch.cat([key_mask, torch.ones(B, 1, dtype=torch.bool, device=dev)], 1)
-            x = m.embed_tokens(nxt[:, None])
-            for layer, kv in zip(m.layers, caches):
-                x = layer(x, last[:, None], key_mask, kv)
+        try:
+            for step_i in range(max_new_tokens):
+                nxt = _sample(logits, temperature, top_p, generator)
+                nxt = torch.where(done, fill, nxt)
+                out.append(nxt)
+                if len(eos):
+                    done |= torch.isin(nxt, eos)
+                if on_token is not None and on_token(nxt):
+                    break
+                if on_step is not None and step_i % 16 == 15:
+                    on_step(step_i + 1, int((~done).sum()))
+                if step_i == max_new_tokens - 1 or ((on_token is not None or step_i % 8 == 7) and bool(done.all())):
+                    break
+                st["tok"].copy_(nxt)
+                if graph is not None:
+                    graph.replay()
+                else:
+                    step()
+                logits = logits_buf.clone()
+        finally:
+            for b in moe:
+                b._fixed_c = False
         return torch.stack(out, 1) if out else input_ids.new_zeros(B, 0)
 
     def prepare_inputs_for_generation(self, input_ids, attention_mask=None, **_):

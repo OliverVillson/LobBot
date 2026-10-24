@@ -371,3 +371,28 @@ def test_flint_cached_generation_matches_full_recompute(models):
     s = model.fast_generate(x, mask, max_new_tokens=6, temperature=0.7, top_p=0.9, eos_token_id=[int(new[0, 0])],
                             generator=g)
     assert s.shape[0] == 2 and s.shape[1] <= 6
+
+
+def test_flint_stacked_experts_match_the_loop(models):
+    """stack_experts: same logits as the per-expert loop, and the expert Linears become views
+    into the stacked tensors (so REAP/GPTQ code that edits them still sees one copy)."""
+    model = load(models["flint"])
+    x = ids(16)
+    with torch.no_grad():
+        ref = model(input_ids=x).logits
+        model.stack_experts()
+        got = model(input_ids=x).logits
+    assert torch.allclose(ref, got, atol=1e-5, rtol=1e-4)
+    blk = next(l.mlp for l in model.model.layers if hasattr(l.mlp, "_gu"))
+    assert blk.experts[1].up_proj.weight.data_ptr() == blk._gu[1, blk._I:].data_ptr()
+    # the decode paths: few tokens read the chosen experts, and the graph-safe fixed-size scatter
+    h = torch.randn(1, model.config.hidden_size)
+    many = torch.randn(9, model.config.hidden_size)
+    with torch.no_grad():
+        _, w, e = blk.gate(h)
+        loop = sum(blk.experts[int(j)](h) * w[0, i] for i, j in enumerate(e[0]))
+        assert torch.allclose(blk._stacked_forward(h, w, e), loop, atol=1e-5, rtol=1e-4)
+        ref = blk._stacked_forward(many, *blk.gate(many)[1:])
+        blk._fixed_c = True
+        assert torch.allclose(blk._stacked_forward(many, *blk.gate(many)[1:]), ref, atol=1e-5, rtol=1e-4)
+        blk._fixed_c = False
