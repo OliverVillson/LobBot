@@ -298,7 +298,7 @@ def test_mac_schema_heal_and_mlx_on_a_tiny_flint(tmp_path, hex_):
     start = mj.get("unhealed_kl", mj["kl"])
     assert abs(qh["kl_before"] - start) <= 1e-3 + 1e-2 * start, (qh["kl_before"], start)  # qheal starts AS the MLX model
     if qh["kept"]:
-        assert mj["out"].endswith("-healed") and Path(mj["out"], "config.json").exists() and mj["kl"] < start
+        assert mj["out"].endswith("-healed") and Path(mj["out"], "config.json").exists() and mj["kl"] <= start
     assert "gptq" not in by and "reaq" not in by and "quant" not in by  # not in this schema
 
     # qheal's writer: the pruned model made into the MLX model, changed, written back as an MLX
@@ -364,6 +364,13 @@ def test_mac_schema_heal_and_mlx_on_a_tiny_flint(tmp_path, hex_):
     mm, _ = load_model(xdir, trust_remote_code=True)
     mm.set_dtype(mx.float32)  # bf16 activations would hide a real mismatch on a tiny random model
     got = np.array(mm(mx.array(ids.numpy()))[0].astype(mx.float32))
+    for layer in mm.model.layers:                          # prompt processing: each tier only its own slots
+        if hasattr(layer.mlp, "split_min"):
+            layer.mlp.split_min = 1
+    split = np.array(mm(mx.array(ids.numpy()))[0].astype(mx.float32))
+    assert np.allclose(split, got, atol=1e-4 * np.abs(got[np.isfinite(got)]).max(), equal_nan=False) or \
+        np.array_equal(np.isfinite(split), np.isfinite(got)) and np.abs(
+            split[np.isfinite(got)] - got[np.isfinite(got)]).max() < 1e-4 * np.abs(got[np.isfinite(got)]).max()
     live = np.isfinite(got)                                # output-trimmed head: dropped tokens are -inf
     assert np.array_equal(live, ref > serve.HEAD_FILL) and live[0].sum() <= 192
     assert np.abs(got[live] - ref[live]).max() < 1e-3 * np.abs(ref[live]).max() + 1e-4

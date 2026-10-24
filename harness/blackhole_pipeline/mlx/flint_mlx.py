@@ -249,6 +249,25 @@ class HexSwitchGLU(nn.Module):
 
 
 class MoE(nn.Module):
+    split_min = 64   # (token, slot) pairs from which the tiers get only their own pairs (prompt processing)
+
+    def _split_tiers(self, x, ids):
+        """Each (token, slot) through its own tier only: one host sync per layer for the tier sizes,
+        then every tier sees just its pairs (sorted by expert inside SwitchGLU). Decoding a single
+        token keeps the sync-free path that runs both tiers on all slots."""
+        shp, k = x.shape, ids.shape[-1]
+        xf = x.reshape(-1, shp[-1])
+        flat = ids.reshape(-1)
+        hot = flat < self.n_hot
+        n_h = int(hot.sum().item())
+        order = mx.argsort(mx.logical_not(hot).astype(mx.int32))
+        y = mx.zeros((flat.size, shp[-1]), dtype=x.dtype)
+        for tier, pos, off in ((self.experts_hot, order[:n_h], 0), (self.experts, order[n_h:], self.n_hot)):
+            if pos.size:
+                yt = tier(xf[pos // k], (flat[pos] - off)[:, None])[:, 0]
+                y = y.at[pos].add(yt)
+        return y.reshape(*shp[:-1], k, shp[-1])
+
     def __init__(self, args: ModelArgs, n_hot: int = 0, hex_bits: Optional[dict] = None):
         super().__init__()
         H, I, E = args.hidden_size, args.moe_intermediate_size, args.num_experts
@@ -274,6 +293,8 @@ class MoE(nn.Module):
             u = ids.astype(mx.uint32)
             y = (self.experts_hot(x, mx.where(hot, u, skip))
                  + self.experts(x, mx.where(hot, skip, u - self.n_hot)))
+        elif self.n_hot and ids.size >= self.split_min:
+            y = self._split_tiers(x, ids)
         elif self.n_hot:
             hot = ids < self.n_hot
             y = mx.where(hot[..., None], self.experts_hot(x, mx.where(hot, ids, 0)),
