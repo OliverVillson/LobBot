@@ -106,6 +106,14 @@ def _mlx_state(path: Path, dtype):
         spec = q.get(mod, {"bits": q.get("bits", 4), "group_size": q.get("group_size", 64)})
         u = mlx_unpack(raw.pop(k), spec["bits"])
         raw[k] = mlx_dequant(u, raw.pop(f"{mod}.scales"), raw.pop(f"{mod}.biases"), spec["group_size"]).to(dtype)
+    ids = raw.pop("lm_head_ids", None)
+    if ids is not None:  # output-trimmed LM head: back to full size, the dropped rows zero (see mask_head)
+        ids = ids.to(torch.long)
+        W = raw["lm_head.weight"]
+        full = torch.zeros(cfg["vocab_size"], W.shape[1], dtype=W.dtype)
+        full[ids] = W
+        raw["lm_head.weight"] = full
+        out["lm_head_ids"] = ids
     for k, v in raw.items():
         m = re.match(r"model\.layers\.(\d+)\.mlp\.(experts_hot|experts)\.(gate_proj|up_proj|down_proj)\.weight$", k)
         if not m:
@@ -116,6 +124,22 @@ def _mlx_state(path: Path, dtype):
         for j in range(v.shape[0]):
             out[f"model.layers.{layer}.mlp.experts.{base + j}.{name}.weight"] = v[j].to(dtype)
     return out
+
+
+HEAD_FILL = -30.0   # logit of a token an output-trimmed LM head cannot write (finite, so KL stays finite)
+
+
+def mask_head(model, ids) -> None:
+    """Output-only vocab trim on a full-size PyTorch LM head: tokens outside ids get HEAD_FILL."""
+    import torch
+    V = model.lm_head.out_features
+    keep = torch.zeros(V, dtype=torch.bool)
+    keep[torch.as_tensor(ids, dtype=torch.long)] = True
+    drop = ~keep
+
+    def hook(mod, args, out):
+        return out.masked_fill(drop.to(out.device), HEAD_FILL)
+    model.lm_head.register_forward_hook(hook)
 
 
 def load(path: Path, device: str):
@@ -134,7 +158,7 @@ def load(path: Path, device: str):
     dtype = torch.bfloat16 if device == "cuda" else torch.float32
     cfg = AutoConfig.from_pretrained(path)
     for c in (cfg, getattr(cfg, "text_config", None)):
-        for a in ("quantization_config", "quantization", "model_file", "expert_tiers"):
+        for a in ("quantization_config", "quantization", "model_file", "expert_tiers", "head_vocab"):
             if c is not None and hasattr(c, a):
                 delattr(c, a)
     try:
@@ -144,13 +168,17 @@ def load(path: Path, device: str):
     with no_init_weights(), torch.device(device):
         model = AutoModelForCausalLM.from_config(cfg, dtype=dtype)
     missing = {n for n, _ in model.named_parameters()}
+    head_ids = None
     for part in ([_mlx_state(path, dtype)] if method == "mlx" else _unpacked_state(path, dtype)):
+        head_ids = part.pop("lm_head_ids", head_ids)
         model.load_state_dict(part, strict=False, assign=False)
         missing -= set(part)
     if missing - {"lm_head.weight"}:
         raise RuntimeError(f"{len(missing)} weights missing from {path}, e.g. {sorted(missing)[:3]}")
     if "lm_head.weight" in missing:
         model.tie_weights()
+    if head_ids is not None:
+        mask_head(model, head_ids)
     return model.eval(), tok
 
 

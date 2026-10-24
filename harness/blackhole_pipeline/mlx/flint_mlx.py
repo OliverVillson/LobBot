@@ -13,6 +13,9 @@ renormalised over the chosen experts, ungated shared expert, dense `mlp_only_lay
 REAQ tiers: a MoE layer listed in `expert_tiers` ({layer: n_hot}) keeps its experts permuted so
 the n_hot most salient (by REAP score) come first, in their own stacked tensors (`experts_hot`,
 quantized with more bits) and the rest in `experts`; the router rows are permuted to match.
+
+Output-only vocab trim: with `head_vocab` = K the LM head has K rows for the token ids in
+`lm_head_ids`; logits of every other token are -inf (the model still reads all tokens).
 """
 
 from dataclasses import dataclass, field
@@ -51,6 +54,7 @@ class ModelArgs(BaseModelArgs):
     mlp_only_layers: list = field(default_factory=list)
     tie_word_embeddings: bool = False
     expert_tiers: Optional[dict] = None   # {str(layer): n_hot}
+    head_vocab: int = 0                   # output-only vocab trim: LM head rows (0 = vocab_size)
 
     def __post_init__(self):
         if self.layer_types is None:
@@ -174,11 +178,20 @@ class Model(nn.Module):
         self.model_type = args.model_type
         self.model = FlintModel(args)
         if not args.tie_word_embeddings:
-            self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+            self.lm_head = nn.Linear(args.hidden_size, args.head_vocab or args.vocab_size, bias=False)
+        if args.head_vocab:
+            self.lm_head_ids = mx.zeros((args.head_vocab,), dtype=mx.int32)
 
     def __call__(self, inputs, cache=None, input_embeddings=None):
         h = self.model(inputs, cache, input_embeddings)
-        return self.model.embed_tokens.as_linear(h) if self.args.tie_word_embeddings else self.lm_head(h)
+        if self.args.tie_word_embeddings:
+            return self.model.embed_tokens.as_linear(h)
+        logits = self.lm_head(h)
+        if not self.args.head_vocab:
+            return logits
+        full = mx.full((*logits.shape[:-1], self.args.vocab_size), -mx.inf, dtype=logits.dtype)
+        idx = mx.broadcast_to(self.lm_head_ids.astype(mx.int32), logits.shape)
+        return mx.put_along_axis(full, idx, logits, axis=-1)
 
     @property
     def layers(self):

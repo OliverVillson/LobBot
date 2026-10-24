@@ -4,9 +4,13 @@ Routed experts get GPTQ at `mlx_bits` (group `mlx_group`), sequential over chunk
 like the gptq stage; with mlx_hot > 0 the most salient share of each layer's experts (REAP
 score, Oliver's REAQ idea as bit widths) gets `mlx_hot_bits` and is stored as its own stacked
 tensors. GPTQ's symmetric codes map exactly onto MLX's affine format, so the Mac runs the
-weights GPTQ chose. Attention, shared experts and dense MLPs get round-to-nearest at
-`mlx_attn_bits`, the embedding at `mlx_embed_bits` and the LM head at `mlx_head_bits`; routers
-and norms stay bf16. The quantized model is compared with the teacher (KL / top-1) and written
+weights GPTQ chose. Attention, shared experts and dense MLPs get GPTQ too (`mlx_attn_gptq`; else
+round-to-nearest) at `mlx_attn_bits` (q/o projections at `mlx_qo_bits` when set), the LM head at
+`mlx_head_bits`, the embedding round-to-nearest at `mlx_embed_bits`; routers and norms stay bf16.
+Output-only vocab trim (`mlx_head_vocab` = K > 0): the LM head keeps only K rows, the tokens the
+teacher actually writes (its distillation answers and calibration answers first, then the lowest
+ids, the tokenizer's most common merges); the model still reads every token, and the rest get
+-inf logits. Fewer head rows are both a smaller file and less memory read per generated token. The quantized model is compared with the teacher (KL / top-1) and written
 with flint_mlx.py, so `mlx_lm.server --model DIR --trust-remote-code` serves it.
 Writes work/mlx.json and out/<name>-MLX-<size>/.
 """
@@ -28,6 +32,66 @@ def gptq_fmt(bits: int, group: int) -> str:
     return f"int{bits}_g{group}"
 
 
+def linear_hessians(model, names: list[str], batches) -> dict:
+    """GPTQ Hessians (sum of x x^T over real tokens) of the inputs of the named Linear layers.
+    Layers that share an input (q/k/v, gate/up) share one matrix."""
+    import torch
+    mods = dict(model.named_modules())
+    share = {}
+    for n in names:
+        head, _, leaf = n.rpartition(".")
+        src = f"{head}.q_proj" if leaf in ("k_proj", "v_proj") else f"{head}.gate_proj" if leaf == "up_proj" else n
+        share[n] = src if src in mods else n
+    Hs, state, hooks = {}, {"mask": None}, []
+    for src in set(share.values()):
+        def hook(mod, args, src=src):
+            x = args[0].reshape(-1, args[0].shape[-1])
+            m = state["mask"]
+            if m is not None and m.numel() == x.shape[0]:
+                x = x[m.to(x.device)]
+            x = x.float()
+            if src in Hs:
+                Hs[src].addmm_(x.T, x)
+            else:
+                Hs[src] = x.T @ x
+        hooks.append(mods[src].register_forward_pre_hook(hook))
+    try:
+        with torch.no_grad():
+            for ids, mask in batches:
+                state["mask"] = mask.reshape(-1).bool()
+                model(input_ids=ids, attention_mask=mask, use_cache=False)
+    finally:
+        for h in hooks:
+            h.remove()
+    return {n: Hs[share[n]] for n in names if share[n] in Hs}
+
+
+def head_vocab(rj, tok, vocab: int, k: int) -> list[int]:
+    """The k token ids the LM head keeps: special tokens, then the tokens of the teacher's own
+    answers (distillation data, calibration answers) by frequency, then the lowest ids."""
+    from collections import Counter
+
+    from reaper_pipeline.stages._common import read_jsonl
+    keep = {i for i in getattr(tok, "all_special_ids", []) if i is not None and i < vocab}
+    keep |= {int(i) for i in getattr(tok, "added_tokens_decoder", {}) if int(i) < vocab}
+    cnt = Counter()
+    for r in read_jsonl(rj.path("work", "heal_data.jsonl")):
+        cnt.update(r["ids"][r["start"]:])
+    for r in read_jsonl(rj.path("data", "calib.jsonl")):
+        if r.get("answer"):
+            cnt.update(tok(r["answer"], add_special_tokens=False)["input_ids"])
+    for i, _ in cnt.most_common():
+        if len(keep) >= k:
+            break
+        if i < vocab:
+            keep.add(i)
+    i = 0
+    while len(keep) < k and i < vocab:
+        keep.add(i)
+        i += 1
+    return sorted(keep)[:k] if len(keep) > k else sorted(keep)
+
+
 def run(bh, rj) -> None:
     import torch
     from gptq import GRID, gptq_batched
@@ -36,6 +100,7 @@ def run(bh, rj) -> None:
     from safetensors.torch import save_file
 
     from blackhole_pipeline.pack import int_codes_bits, mlx_bpw, mlx_dequant, mlx_from_symmetric, mlx_pack, mlx_rtn
+    from blackhole_pipeline.serve import mask_head
 
     p = bh.params
     bits, group, hot_bits, hot_share = p["mlx_bits"], p["mlx_group"], p["mlx_hot_bits"], p["mlx_hot"]
@@ -106,21 +171,58 @@ def run(bh, rj) -> None:
         del hs
         free()
 
-    emit(STAGE, pct=73, msg="attention, shared experts, embeddings")
     expert_mods = {n for per in m.names.values() for e in per for n in e.values()}
+    lin = [n for n, mod in m.model.named_modules() if isinstance(mod, torch.nn.Linear) and n not in expert_mods]
+    head_ids = None
+    if p["mlx_head_vocab"] and "lm_head" in lin and p["mlx_head_vocab"] < m.model.lm_head.out_features:
+        from reaper_pipeline.load import load_tokenizer
+        head_ids = head_vocab(rj, load_tokenizer(src, rj.config.trust_remote_code), m.model.lm_head.out_features,
+                              p["mlx_head_vocab"])
+        head_ids += [0] * (-len(head_ids) % 32)   # MLX quantized matmuls like a multiple of 32 rows
+    Hs = {}
+    if p["mlx_attn_gptq"]:
+        emit(STAGE, pct=73, msg="Hessians for attention, shared experts and the LM head")
+        Hs = linear_hessians(m.model, lin, m.batches)
+    emit(STAGE, pct=75, msg="attention, shared experts, LM head, embedding")
     with torch.no_grad():
-        for name, mod in m.model.named_modules():
-            if name in expert_mods:
-                continue
-            if isinstance(mod, torch.nn.Embedding):
-                nb = p["mlx_embed_bits"]
-            elif isinstance(mod, torch.nn.Linear):
-                nb = p["mlx_head_bits"] if name == "lm_head" else p["mlx_attn_bits"]
+        for name in lin:
+            mod = m.model.get_submodule(name)
+            leaf = name.rpartition(".")[2]
+            if name == "lm_head":
+                nb = p["mlx_head_bits"]
+            elif leaf in ("q_proj", "o_proj") and p["mlx_qo_bits"]:
+                nb = p["mlx_qo_bits"]
             else:
-                continue
-            u, s, b = mlx_rtn(mod.weight, nb, group, dtype)
-            mod.weight.copy_(mlx_dequant(u, s, b, group).to(mod.weight.dtype))
-            put_q(name, u, s, b, nb, "rest")
+                nb = p["mlx_attn_bits"]
+            W = mod.weight.float()
+            if name == "lm_head" and head_ids is not None:
+                W = W[torch.tensor(head_ids, device=W.device)]
+            if name in Hs:
+                GRID.setdefault(gptq_fmt(nb, group), (nb, group))
+                H = Hs.pop(name).to(W.device)
+                Q, S = gptq_batched(W[None], H[None], gptq_fmt(nb, group), return_scales=True)
+                u, s_, b = mlx_from_symmetric(int_codes_bits(Q, S, group, nb), S, nb, dtype)
+                u, s_, b = u[0], s_[0], b[0]
+                del Q, S, H
+            else:
+                u, s_, b = mlx_rtn(W, nb, group, dtype)
+            deq = mlx_dequant(u, s_, b, group).to(mod.weight.dtype)
+            if name == "lm_head" and head_ids is not None:
+                full = torch.zeros_like(mod.weight)
+                full[torch.tensor(head_ids, device=full.device)] = deq
+                mod.weight.copy_(full)
+            else:
+                mod.weight.copy_(deq)
+            put_q(name, u, s_, b, nb, "rest")
+        del Hs
+        for name, mod in m.model.named_modules():
+            if isinstance(mod, torch.nn.Embedding):
+                u, s_, b = mlx_rtn(mod.weight, p["mlx_embed_bits"], group, dtype)
+                mod.weight.copy_(mlx_dequant(u, s_, b, group).to(mod.weight.dtype))
+                put_q(name, u, s_, b, p["mlx_embed_bits"], "rest")
+        if head_ids is not None:
+            out["lm_head_ids"] = torch.tensor(head_ids, dtype=torch.int32)
+            mask_head(m.model, head_ids)
         for name, prm in m.model.named_parameters():  # routers (done above), norms, sinks: unquantized
             mod_name = name.rsplit(".", 1)[0]
             if name in out or mod_name in quant or mod_name in expert_mods:
@@ -167,6 +269,8 @@ def run(bh, rj) -> None:
         shutil.copy2(f, tmp / f.name)
     shutil.copy2(MODEL_FILE, tmp / MODEL_FILE.name)
     cfg.pop("quantization_config", None)
+    if head_ids is not None:
+        cfg["head_vocab"] = len(head_ids)
     cfg.update({"model_file": MODEL_FILE.name, "expert_tiers": tiers,
                 "quantization": {"group_size": group, "bits": bits, **quant}})
     (tmp / "config.json").write_text(json.dumps(cfg, indent=2) + "\n")
@@ -179,7 +283,9 @@ def run(bh, rj) -> None:
                                                                if hot_share else "") + f" g{group}",
            "bpw": round(avg + 32 / group, 3), "expert_params": expert_params,
            "expert_gb": round(gib(nbytes["experts"]), 2), "size_gb": round(gib(total), 2), "out": str(dst),
-           "healed": src != rj.out_dir}
+           "healed": src != rj.out_dir, "attn": ("GPTQ" if p["mlx_attn_gptq"] else "RTN") +
+           f" {p['mlx_attn_bits']}-bit" + (f", q/o {p['mlx_qo_bits']}-bit" if p["mlx_qo_bits"] else ""),
+           "head_vocab": len(head_ids) if head_ids is not None else None}
     if r:
         res.update(top1=round(r["top1_agreement"], 4), kl=round(r["kl"], 4), ppl_teacher=round(r["ppl_teacher"], 3),
                    ppl_student=round(r["ppl_pruned"], 3))

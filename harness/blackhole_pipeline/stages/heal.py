@@ -12,10 +12,10 @@
    model is written to <pruned>-healed only if that beats the start (the quant stages then use it).
 Writes work/heal.json and work/heal_data.jsonl.
 
-Stage qheal is the same distillation after the mlx stage, around the quantized model: routed
-experts, embedding and LM head are the MLX folder's own (dequantized, frozen); attention, shared
-experts and dense MLPs train in bf16 behind a straight-through round-to-nearest at the MLX bit
-width (so the student is exactly the MLX model and the gains survive re-quantization); routers,
+Stage qheal is the same distillation after the mlx stage, around the quantized model: the
+student is loaded as exactly the MLX folder (dequantized); routed experts, embedding and LM head
+stay frozen; attention, shared experts and dense MLPs train behind a straight-through rounding
+on the folder's own grid (fixed scales and biases), so the gains survive re-quantization; routers,
 norms and sinks train as they are. So the heal repairs the 3-bit error as well as the pruning.
 If it beats the start it writes <mlx folder>-healed and points work/mlx.json at it (the bench
 then measures it). Writes work/qheal.json.
@@ -41,67 +41,91 @@ def trainable(name: str) -> bool:
     return True
 
 
-class FakeQuant:
-    """Parametrization: the weight as MLX round-to-nearest stores it, gradient straight through."""
+def grid_codes(w, scales, biases, bits: int, group: int):
+    """Codes of w [out, in] on a fixed MLX affine grid (scales / biases [out, in / group])."""
+    import torch
+    x = w.float().reshape(*w.shape[:-1], -1, group)
+    u = ((x - biases.float()[..., None]) / scales.float()[..., None]).round().clamp(0, 2 ** bits - 1)
+    return u.reshape(w.shape).to(torch.int64)
 
-    def __new__(cls, bits: int, group: int):
+
+class FakeQuant:
+    """Parametrization: the weight rounded on the MLX folder's own grid (its scales and biases
+    stay fixed), gradient straight through, so training starts as exactly the stored model and
+    its result re-quantizes to the codes it trained with."""
+
+    def __new__(cls, scales, biases, bits: int, group: int):
         import torch
 
-        from blackhole_pipeline.pack import mlx_dequant, mlx_rtn
+        from blackhole_pipeline.pack import mlx_dequant
 
         class _FQ(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer("scales", scales)
+                self.register_buffer("biases", biases)
+
             def forward(self, w):
                 with torch.no_grad():
-                    u, s, b = mlx_rtn(w, bits, group, torch.bfloat16)  # the mlx stage's scale dtype
-                    q = mlx_dequant(u, s, b, group).to(w.dtype)
+                    q = mlx_dequant(grid_codes(w, self.scales, self.biases, bits, group), self.scales, self.biases,
+                                    group).to(w.dtype)
                 return w + (q - w).detach()
         return _FQ()
 
 
 def quantize_like(student, mlx_dir: Path) -> dict:
-    """Makes the bf16 student the MLX model: frozen tensors (routed experts, routers in the MLX
-    expert order, embedding, LM head) from the MLX folder, fake-quant on the other quantized
-    Linear layers. Returns {module name: {"bits", "group_size"}} of the fake-quantized ones."""
+    """Makes the student exactly the MLX model: every tensor from the MLX folder (dequantized);
+    the routed experts, embedding and LM head stay as they are, and the other quantized Linear
+    layers get a fixed-grid fake quant. Returns {module name: {"bits", "group_size"}} of those."""
     import torch
+    from safetensors import safe_open
     from torch.nn.utils import parametrize
 
-    from blackhole_pipeline.serve import _mlx_state
+    from blackhole_pipeline.serve import _mlx_state, mask_head
     cfg = json.loads((mlx_dir / "config.json").read_text())
     q = cfg.get("quantization") or {}
     dtype = next(student.parameters()).dtype
     st = _mlx_state(mlx_dir, dtype)
-    keep = {k: v for k, v in st.items()
-            if ".experts." in k or k.endswith("mlp.gate.weight") or "embed_tokens" in k or k.startswith("lm_head")}
-    student.load_state_dict(keep, strict=False)
+    head_ids = st.pop("lm_head_ids", None)
     names = {n for n, _ in student.named_parameters()}
-    lost = [k for k in keep if k not in names]
+    lost = [k for k in st if k not in names]
     if lost:
         raise RuntimeError(f"MLX tensors with no place in the model: {lost[:4]}")
+    student.load_state_dict(st, strict=False)
+    if head_ids is not None:
+        mask_head(student, head_ids)
+    where = json.loads((mlx_dir / "model.safetensors.index.json").read_text())["weight_map"]
+    dev = next(student.parameters()).device
     fq = {}
     for name, mod in student.named_modules():
-        if (isinstance(mod, torch.nn.Linear) and name in q and isinstance(q[name], dict) and ".experts." not in name
+        if (isinstance(mod, torch.nn.Linear) and isinstance(q.get(name), dict) and ".experts." not in name
                 and name != "lm_head"):
             spec = {"bits": q[name]["bits"], "group_size": q[name]["group_size"]}
-            parametrize.register_parametrization(mod, "weight", FakeQuant(spec["bits"], spec["group_size"]))
+            with safe_open(str(mlx_dir / where[f"{name}.scales"]), "pt") as f:
+                sc = f.get_tensor(f"{name}.scales").to(dev)
+            with safe_open(str(mlx_dir / where[f"{name}.biases"]), "pt") as f:
+                bi = f.get_tensor(f"{name}.biases").to(dev)
+            parametrize.register_parametrization(mod, "weight", FakeQuant(sc, bi, spec["bits"], spec["group_size"]))
             fq[name] = spec
     return fq
 
 
 def write_mlx(student, fq: dict, src: Path, dst: Path) -> None:
-    """A copy of the MLX folder src with the student's trained tensors: fake-quantized layers
-    re-quantized (same codes the student ran with), routers / norms / sinks as they are."""
+    """A copy of the MLX folder src with the student's trained tensors: fake-quantized layers as
+    their codes on the folder's own grid, routers / norms / sinks as they are."""
     import torch
     from safetensors.torch import load_file, save_file
     from torch.nn.utils import parametrize
 
-    from blackhole_pipeline.pack import mlx_pack, mlx_rtn
+    from blackhole_pipeline.pack import mlx_pack
     new = {}
     for name, spec in fq.items():
         mod = student.get_submodule(name)
+        fqm = mod.parametrizations.weight[0]
+        sc, bi = fqm.scales, fqm.biases
         parametrize.remove_parametrizations(mod, "weight", leave_parametrized=False)
-        u, s, b = mlx_rtn(mod.weight.detach(), spec["bits"], spec["group_size"], torch.bfloat16)
-        new.update({f"{name}.weight": mlx_pack(u, spec["bits"]).cpu(), f"{name}.scales": s.contiguous().cpu(),
-                    f"{name}.biases": b.contiguous().cpu()})
+        u = grid_codes(mod.weight.detach(), sc, bi, spec["bits"], spec["group_size"])
+        new[f"{name}.weight"] = mlx_pack(u, spec["bits"]).cpu()
     for n, prm in student.named_parameters():
         if ".experts." in n or "embed_tokens" in n or n.startswith("lm_head") or n.rsplit(".", 1)[0] in fq:
             continue

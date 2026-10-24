@@ -280,7 +280,7 @@ def test_mac_schema_heal_and_mlx_on_a_tiny_flint(tmp_path):
     (job / "config.json").write_text(json.dumps({
         "model": str(model), "schema": sc.id, "target": "mac", "purpose": "",
         "steps": [s.__dict__ for s in sc.steps], "quant": sc.quant, "calib_samples": 8, **small,
-        "mlx_group": 32, "mlx_hot": 0.5, "heal_prompts": 6, "heal_max_tokens": 10, "heal_accum": 2,
+        "mlx_group": 32, "mlx_hot": 0.5, "mlx_qo_bits": 3, "mlx_head_vocab": 190, "heal_prompts": 6, "heal_max_tokens": 10, "heal_accum": 2,
         "heal_lr": 1e-3, "heal_expert_rank": 2, "bench_file": str(probs), "bench_max_tokens": 16}))
     p = subprocess.run([sys.executable, "-m", "blackhole_pipeline", "--job", str(job)], env=env, cwd=tmp_path,
                        capture_output=True, text=True, timeout=900)
@@ -338,6 +338,8 @@ def test_mac_schema_heal_and_mlx_on_a_tiny_flint(tmp_path):
     hot = next(k for k in q if k.endswith("experts_hot.gate_proj"))
     assert q[hot]["bits"] == 4 and q[hot.replace("experts_hot", "experts")]["bits"] == 3
     assert q["lm_head"]["bits"] == 6 and q["model.embed_tokens"]["bits"] == 4
+    assert cfg["head_vocab"] == 192                       # 190 rounded up to a multiple of 32
+    assert q["model.layers.0.self_attn.q_proj"]["bits"] == 3 and q["model.layers.0.self_attn.k_proj"]["bits"] == 4
     assert rec["results"]["mlx"]["kl"] >= 0 and "mlx" in rec["results"]["bench"]
     assert "mlx_lm.server" in (job / "RESULTS.md").read_text()
 
@@ -355,7 +357,9 @@ def test_mac_schema_heal_and_mlx_on_a_tiny_flint(tmp_path):
     mm, _ = load_model(xdir, trust_remote_code=True)
     mm.set_dtype(mx.float32)  # bf16 activations would hide a real mismatch on a tiny random model
     got = np.array(mm(mx.array(ids.numpy()))[0].astype(mx.float32))
-    assert np.abs(got - ref).max() < 1e-3 * np.abs(ref).max() + 1e-4
+    live = np.isfinite(got)                                # output-trimmed head: dropped tokens are -inf
+    assert np.array_equal(live, ref > serve.HEAD_FILL) and live[0].sum() <= 192
+    assert np.abs(got[live] - ref[live]).max() < 1e-3 * np.abs(ref[live]).max() + 1e-4
     assert np.array_equal(got.argmax(-1), ref.argmax(-1))
 
 

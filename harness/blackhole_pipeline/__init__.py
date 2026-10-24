@@ -72,7 +72,10 @@ DEFAULTS = {
     "mlx_group": 64,
     "mlx_hot": 0.0,          # share of each layer's experts (by REAP score) on mlx_hot_bits
     "mlx_hot_bits": 4,
-    "mlx_attn_bits": 4,      # attention, shared experts, dense MLPs (round-to-nearest)
+    "mlx_attn_bits": 4,      # attention, shared experts, dense MLPs
+    "mlx_attn_gptq": 1,      # GPTQ (1) or round-to-nearest (0) for those and the LM head
+    "mlx_qo_bits": 0,        # q/o projections (the big attention matrices); 0 = mlx_attn_bits
+    "mlx_head_vocab": 0,     # output-only vocab trim: LM head rows kept (0 = all)
     "mlx_embed_bits": 4,
     "mlx_head_bits": 6,
     "bench": "lcb-v6",       # LiveCodeBench release (problems new in it) for original vs int4; "none" skips
