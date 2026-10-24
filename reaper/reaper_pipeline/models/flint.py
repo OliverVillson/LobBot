@@ -132,10 +132,21 @@ class FlintSparseMoeBlock(nn.Module):
         shape = x.shape
         h = x.reshape(-1, shape[-1])
         _, w, ids = self.gate(h)
+        # group the (token, slot) pairs by expert with one sort and one host sync per layer
+        # (a torch.where per expert syncs 256 times per layer, which dominates decoding)
+        k = ids.shape[1]
+        flat = ids.reshape(-1)
+        order = torch.argsort(flat, stable=True)
+        tok = order // k
+        counts = torch.bincount(flat, minlength=len(self.experts)).tolist()
+        hs, ws = h[tok], w.reshape(-1)[order]
         out = torch.zeros(h.shape, dtype=torch.float32, device=h.device)
-        for j in torch.unique(ids).tolist():
-            tok, slot = torch.where(ids == j)
-            out.index_add_(0, tok, (self.experts[j](h[tok]) * w[tok, slot, None]).float())
+        start = 0
+        for j, c in enumerate(counts):
+            if c:
+                sl = slice(start, start + c)
+                out.index_add_(0, tok[sl], (self.experts[j](hs[sl]) * ws[sl, None]).float())
+                start += c
         return (out.to(x.dtype) + self.shared_expert(h)).reshape(shape)
 
 
@@ -320,10 +331,10 @@ class FlintForCausalLM(FlintPreTrainedModel, GenerationMixin):
 
     @torch.no_grad()
     def fast_generate(self, input_ids, attention_mask=None, max_new_tokens: int = 256, temperature: float = 0.0,
-                      top_p: float = 1.0, eos_token_id=None, generator=None):
+                      top_p: float = 1.0, eos_token_id=None, generator=None, on_step=None):
         """Batched sampling with a KV cache (generate() recomputes the whole sequence every step).
         input_ids [B, T] left-padded. Returns new tokens [B, n]; a row is padded with its first
-        eos token after it finishes."""
+        eos token after it finishes. on_step(step, still_writing) is called after every token."""
         m = self.model
         B = input_ids.shape[0]
         dev = m.embed_tokens.weight.device
@@ -348,6 +359,8 @@ class FlintForCausalLM(FlintPreTrainedModel, GenerationMixin):
             out.append(nxt)
             if len(eos):
                 done |= torch.isin(nxt, eos)
+            if on_step is not None and step % 16 == 15:
+                on_step(step + 1, int((~done).sum()))
             if bool(done.all()) or step == max_new_tokens - 1:
                 break
             last = last + 1

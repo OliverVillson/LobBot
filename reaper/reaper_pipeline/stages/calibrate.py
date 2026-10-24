@@ -13,7 +13,7 @@ from reaper_pipeline import calib
 from reaper_pipeline.events import emit, log
 from reaper_pipeline.job import Job
 from reaper_pipeline.stages._common import profile, stage_main, write_jsonl
-from reaper_pipeline.teacher import make_teacher, pick_backend
+from reaper_pipeline.teacher import HfTeacher, make_teacher, pick_backend
 
 STAGE = "calibrate"
 CHUNK = 64  # HF generate batch; vLLM gets far bigger submissions, see answer_chunk()
@@ -56,8 +56,14 @@ def run(job: Job) -> None:
         chunk = answer_chunk(prof, backend, len(rows))
         for i in range(0, len(rows), chunk):
             part = rows[i:i + chunk]
-            answers = teacher.chat([[{"role": "user", "content": r["prompt"]}] for r in part],
-                                   cfg.answer_max_tokens, 0.6)
+            msgs = [[{"role": "user", "content": r["prompt"]}] for r in part]
+            if isinstance(teacher, HfTeacher):
+                def prog(got, of, note, i=i):
+                    emit(STAGE, pct=40 + 58 * (i + got * len(part) / of) / len(rows),
+                         msg=f"teacher answering {i + 1}–{i + len(part)} of {len(rows)}: {note}")
+                answers = teacher.chat(msgs, cfg.answer_max_tokens, 0.6, on_progress=prog)
+            else:
+                answers = teacher.chat(msgs, cfg.answer_max_tokens, 0.6)
             for r, a in zip(part, answers):
                 r["answer"] = a
             done = min(i + chunk, len(rows))

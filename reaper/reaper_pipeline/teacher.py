@@ -70,7 +70,8 @@ class HfTeacher:
             return self.tok.apply_chat_template(conv, tokenize=False, add_generation_prompt=True)
         return "\n\n".join(m["content"] for m in conv) + "\n\n"
 
-    def chat(self, convs: list[list[dict]], max_tokens: int, temperature: float = 0.7) -> list[str]:
+    def chat(self, convs: list[list[dict]], max_tokens: int, temperature: float = 0.7, on_progress=None) -> list[str]:
+        """on_progress(answered, total, note) while a batch is still generating (cached generation only)."""
         import torch
 
         from reaper_pipeline.load import input_device
@@ -80,8 +81,12 @@ class HfTeacher:
             enc = self.tok(texts, return_tensors="pt", padding=True, add_special_tokens=False).to(input_device(self.model))
             with torch.no_grad():
                 if self.fast:
+                    def step(t, active, i=i, nb=len(texts)):
+                        if on_progress:
+                            on_progress(i + (nb - active) * 0.5 + nb * 0.5 * t / max_tokens, len(convs),
+                                        f"token {t}/{max_tokens}, {active}/{nb} still writing")
                     new = self.model.fast_generate(enc["input_ids"], enc["attention_mask"], max_tokens, temperature,
-                                                   0.95, self.eos)
+                                                   0.95, self.eos, on_step=step)
                     rows = []
                     for r in new.tolist():
                         cut = next((i for i, t in enumerate(r) if t in self.eos), len(r))
