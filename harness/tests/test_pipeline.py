@@ -149,3 +149,48 @@ def test_full_run_on_a_tiny_flint(tmp_path, donor):
     assert rec["results"]["reaq_codebook"]["bpw"] == pytest.approx(3.75)
     assert rec["results"]["gptq_int4"]["bpw"] == pytest.approx(4.125)
     assert (job / "out" / gdir.name).is_symlink() and (job / "RESULTS.md").exists()
+    if donor == "scores":
+        check_serve(gdir, qdir)
+
+
+def check_serve(gdir: Path, qdir: Path):
+    """blackhole-serve loads the int4 and codebook folders (unpacked to bf16 = the measured weights)
+    and answers OpenAI chat requests, streamed and not."""
+    import threading
+    import urllib.request
+    from http.server import ThreadingHTTPServer
+
+    from blackhole_pipeline import serve
+    qm, _ = serve.load(qdir, "cpu")
+    assert hasattr(qm, "fast_generate")
+    model, tok = serve.load(gdir, "cpu")
+    engine = serve.Engine(model, tok, "tiny")
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), serve.make_handler(engine))
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{srv.server_address[1]}/v1"
+
+    def post(body):
+        r = urllib.request.Request(url + "/chat/completions", json.dumps(body).encode(),
+                                   {"Content-Type": "application/json"})
+        return urllib.request.urlopen(r, timeout=120).read().decode()
+
+    assert json.loads(urllib.request.urlopen(url + "/models").read())["data"][0]["id"] == "tiny"
+    msgs = [{"role": "user", "content": [{"type": "text", "text": "fix this bug"}]}]
+    r = json.loads(post({"model": "tiny", "messages": msgs, "max_tokens": 8, "temperature": 0}))
+    assert r["choices"][0]["message"]["role"] == "assistant" and r["usage"]["completion_tokens"] <= 8
+    lines = [l for l in post({"model": "tiny", "messages": msgs, "max_tokens": 8, "stream": True}).splitlines()
+             if l.startswith("data: ")]
+    assert lines[-1] == "data: [DONE]" and json.loads(lines[-2][6:])["choices"][0]["finish_reason"]
+    srv.shutdown()
+
+
+def test_parse_reply_tool_calls_and_reasoning():
+    from blackhole_pipeline.serve import parse_reply, to_template_messages
+    c, r, calls = parse_reply('<think>look first</think>Sure.<tool_call>{"name": "read", "arguments": {"path": "a.py"}}'
+                              '</tool_call>')
+    assert (c, r) == ("Sure.", "look first") and calls[0]["function"]["name"] == "read"
+    assert json.loads(calls[0]["function"]["arguments"]) == {"path": "a.py"}
+    assert parse_reply("plain answer") == ("plain answer", "", [])
+    m = to_template_messages([{"role": "assistant", "content": None, "tool_calls": [
+        {"id": "x", "type": "function", "function": {"name": "read", "arguments": '{"path": "a"}'}}]}])
+    assert m[0]["content"] == "" and m[0]["tool_calls"][0]["function"]["arguments"] == {"path": "a"}

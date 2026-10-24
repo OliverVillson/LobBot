@@ -11,6 +11,7 @@ dependencies = ["textual>=1.0"]
 [project.scripts]
 blackhole = "blackhole_tui.app:main"
 blackhole-pipeline = "blackhole_pipeline.__main__:main"
+blackhole-serve = "blackhole_pipeline.serve:main"
 
 [tool.setuptools.packages.find]
 include = ["blackhole_tui*", "blackhole_pipeline*"]

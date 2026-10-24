@@ -331,10 +331,11 @@ class FlintForCausalLM(FlintPreTrainedModel, GenerationMixin):
 
     @torch.no_grad()
     def fast_generate(self, input_ids, attention_mask=None, max_new_tokens: int = 256, temperature: float = 0.0,
-                      top_p: float = 1.0, eos_token_id=None, generator=None, on_step=None):
+                      top_p: float = 1.0, eos_token_id=None, generator=None, on_step=None, on_token=None):
         """Batched sampling with a KV cache (generate() recomputes the whole sequence every step).
         input_ids [B, T] left-padded. Returns new tokens [B, n]; a row is padded with its first
-        eos token after it finishes. on_step(step, still_writing) is called after every token."""
+        eos token after it finishes. on_step(step, still_writing) is called every 16 tokens and
+        on_token(tokens [B]) after every token; on_token returning True stops generation."""
         m = self.model
         B = input_ids.shape[0]
         dev = m.embed_tokens.weight.device
@@ -359,6 +360,8 @@ class FlintForCausalLM(FlintPreTrainedModel, GenerationMixin):
             out.append(nxt)
             if len(eos):
                 done |= torch.isin(nxt, eos)
+            if on_token is not None and on_token(nxt):
+                break
             if on_step is not None and step % 16 == 15:
                 on_step(step + 1, int((~done).sum()))
             if bool(done.all()) or step == max_new_tokens - 1:
