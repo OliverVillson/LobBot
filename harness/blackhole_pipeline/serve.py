@@ -102,7 +102,7 @@ def load(path: Path, device: str):
     except ImportError:  # transformers 4.x
         from transformers.modeling_utils import no_init_weights
     with no_init_weights(), torch.device(device):
-        model = AutoModelForCausalLM.from_config(cfg, torch_dtype=dtype)
+        model = AutoModelForCausalLM.from_config(cfg, dtype=dtype)
     missing = {n for n, _ in model.named_parameters()}
     for part in _unpacked_state(path, dtype):
         model.load_state_dict(part, strict=False, assign=False)
