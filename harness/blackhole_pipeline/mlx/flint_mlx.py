@@ -124,6 +124,8 @@ HEX_SKIP = 0xFFFFFFFF   # expert id of a (token, slot) another tier serves: outp
 _HEX_KERNELS = {}
 
 _HEX_SOURCE = """
+    // one simdgroup per (output row, token-slot); lanes walk 8-weight chunks so neighbouring
+    // lanes read neighbouring index words and inputs
     uint lane = thread_position_in_threadgroup.x;
     uint row = threadgroup_position_in_grid.x;
     uint r = thread_position_in_grid.y;
@@ -137,30 +139,32 @@ _HEX_SOURCE = """
     const uint mask = (1u << BITS) - 1u;
     float es = expert_scale[e];
     ulong base = ((ulong)e * OUT + row) * nblk;
+    const device float* lv = levels + (ulong)e * (1u << BITS);
+    const device T* xrow = x + (ulong)xr * IN;
     float acc = 0.0f;
-    for (uint b = lane; b < nblk; b += 32) {
-        uint8_t c = block_scale[base + b];
-        uint ex = (c >> 3) & 15u;
-        uint mt = c & 7u;
+    for (uint u = lane; u < nblk * 4; u += 32) {
+        uint b = u >> 2;
+        uint c = u & 3u;
+        uint8_t code = block_scale[base + b];
+        uint ex = (code >> 3) & 15u;
+        uint mt = code & 7u;
         float s = ex == 0 ? (float(mt) / 8.0f) * 0.015625f : (1.0f + float(mt) / 8.0f) * exp2(float(ex) - 7.0f);
-        s = ((c & 128u) ? -s : s) * es;
+        s = (code & 128u) ? -s : s;
         const device uint32_t* w = idx + (base + b) * BITS;
-        uint words[BITS];
-        for (uint q = 0; q < BITS; q++) words[q] = w[q];
-        const device float* lv = levels + (ulong)e * (1u << BITS);
-        const device T* xv = x + (ulong)xr * IN + b * 32;
+        uint off = c * 8u * BITS;
+        uint wi = off >> 5;
+        uint sh = off & 31u;
+        ulong bitsv = (ulong)w[wi];
+        if (wi + 1 < BITS) bitsv |= ((ulong)w[wi + 1]) << 32;
+        bitsv >>= sh;
+        const device T* xv = xrow + b * 32 + c * 8;
         float part = 0.0f;
-        for (uint j = 0; j < 32; j++) {
-            uint off = j * BITS;
-            uint wi = off >> 5;
-            uint sh = off & 31u;
-            uint v = words[wi] >> sh;
-            if (sh + BITS > 32u) v |= words[wi + 1] << (32u - sh);
-            part += lv[v & mask] * float(xv[j]);
+        for (uint j = 0; j < 8; j++) {
+            part += lv[(uint)(bitsv >> (j * BITS)) & mask] * float(xv[j]);
         }
         acc += part * s;
     }
-    acc = simd_sum(acc);
+    acc = simd_sum(acc) * es;
     if (lane == 0) y[(ulong)r * OUT + row] = static_cast<T>(acc);
 """
 
@@ -168,7 +172,7 @@ _HEX_SOURCE = """
 def _hex_kernel():
     if "k" not in _HEX_KERNELS:
         _HEX_KERNELS["k"] = mx.fast.metal_kernel(
-            name="blackhole_hex_gather_matvec",
+            name="blackhole_hex_gather_matvec_v2",
             input_names=["x", "idx", "block_scale", "expert_scale", "levels", "experts"],
             output_names=["y"], source=_HEX_SOURCE)
     return _HEX_KERNELS["k"]

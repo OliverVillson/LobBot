@@ -24,13 +24,14 @@ def random_hex(E, out, inp, bits):
     return idx, codes, es, levels
 
 
-def bench(fn, n=200):
-    for _ in range(10):
-        mx.eval(fn())
+def bench(fn, n=20, chain=48):
+    """Microseconds per call, `chain` calls per evaluation (as in decoding: one per layer)."""
+    for _ in range(3):
+        mx.eval([fn() for _ in range(chain)])
     t = time.perf_counter()
     for _ in range(n):
-        mx.eval(fn())
-    return (time.perf_counter() - t) / n * 1e6
+        mx.eval([fn() for _ in range(chain)])
+    return (time.perf_counter() - t) / (n * chain) * 1e6
 
 
 def main():
