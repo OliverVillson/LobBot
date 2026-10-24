@@ -228,8 +228,10 @@ def generate(model, tok, probs: list[dict], max_tokens: int, batch: int, stage: 
     sampled = gc is not None and getattr(gc, "do_sample", False)
     temp = float(gc.temperature) if sampled and gc.temperature else 0.6
     top_p = float(gc.top_p) if sampled and gc.top_p else 0.95
+    # the model's own top_k if its generation_config sets one (not transformers' default 50), else 20
+    top_k = int((gc.to_diff_dict() if gc is not None else {}).get("top_k") or 20)
     batch = fit_batch(model, batch, max(len(t) for t in texts) // 3 + max_tokens)
-    print(f"bench: sampling at temperature {temp}, top_p {top_p}, {batch} answers at a time, "
+    print(f"bench: sampling at temperature {temp}, top_p {top_p}, top_k {top_k}, {batch} answers at a time, "
           f"up to {max_tokens} tokens each", flush=True)
     out = [""] * len(texts)
     t0, ntok, finished = time.time(), 0, 0
@@ -266,7 +268,7 @@ def generate(model, tok, probs: list[dict], max_tokens: int, batch: int, stage: 
                     last[0] = time.time()
                     emit(stage, pct[0] + (pct[1] - pct[0]) * finished / len(texts),
                          f"{finished}/{len(texts)} solutions written, {active} writing now, step {t}")
-            model.generate_many(enc, max_tokens, temp, top_p, eos, slots=batch, on_step=step, on_done=done)
+            model.generate_many(enc, max_tokens, temp, top_p, eos, slots=batch, on_step=step, on_done=done, top_k=top_k)
         else:
             tok.padding_side = "left"
             dev = model.get_input_embeddings().weight.device
@@ -274,7 +276,7 @@ def generate(model, tok, probs: list[dict], max_tokens: int, batch: int, stage: 
                 idx = list(range(b0, min(b0 + batch, len(texts))))
                 e = tok([texts[i] for i in idx], return_tensors="pt", padding=True, add_special_tokens=False)
                 g = model.generate(**e.to(dev), max_new_tokens=max_tokens, do_sample=True, temperature=temp,
-                                   top_p=top_p, pad_token_id=tok.pad_token_id)
+                                   top_p=top_p, top_k=top_k, pad_token_id=tok.pad_token_id)
                 for i, r in zip(idx, g[:, e["input_ids"].shape[1]:].tolist()):
                     out[i] = answer(r)
                     ntok += next((k for k, t in enumerate(r) if t in eos), len(r))

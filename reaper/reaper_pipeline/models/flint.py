@@ -450,7 +450,7 @@ class FlintForCausalLM(FlintPreTrainedModel, GenerationMixin):
     @torch.no_grad()
     def generate_many(self, prompts: list[list[int]], max_new_tokens: int = 256, temperature: float = 0.0,
                       top_p: float = 1.0, eos_token_id=None, generator=None, slots: int | None = None,
-                      on_step=None, on_token=None, on_done=None) -> list[list[int]]:
+                      on_step=None, on_token=None, on_done=None, top_k: int = 0) -> list[list[int]]:
         """Continuous batching: `slots` sequences decode together and a finished slot takes the next
         prompt at once (a batch never waits for its longest answer). Returns each prompt's new
         tokens, ending with its eos token if it produced one. on_step(tokens so far, still writing);
@@ -600,7 +600,7 @@ class FlintForCausalLM(FlintPreTrainedModel, GenerationMixin):
                 prefill([s_ for s_ in range(S) if owner[s_] < 0])
                 if all(o < 0 for o in owner):
                     break
-            nxt = _sample(logits, temperature, top_p, generator)
+            nxt = _sample(logits, temperature, top_p, generator, top_k)
             out_buf[st["ar"], n_gen.clamp(max=out_buf.shape[1] - 1)] = nxt
             n_gen.add_((~done).long())
             if len(eos):
@@ -619,9 +619,12 @@ class FlintForCausalLM(FlintPreTrainedModel, GenerationMixin):
         return [r if r is not None else [] for r in results]
 
 
-def _sample(logits, temperature: float, top_p: float, generator=None):
+def _sample(logits, temperature: float, top_p: float, generator=None, top_k: int = 0):
     if temperature <= 0:
         return logits.argmax(-1)
+    if top_k and top_k < logits.shape[-1]:
+        kth = logits.topk(top_k, -1).values[:, -1:]
+        logits = logits.masked_fill(logits < kth, float("-inf"))
     probs = torch.softmax(logits / temperature, -1)
     if top_p < 1.0:
         sp, si = probs.sort(-1, descending=True)
