@@ -65,6 +65,25 @@ def _pow2_tp(need_gb: float, gpus: int, per_gpu_gb: float) -> int | None:
     return None
 
 
+def _runs_on(sm: str, arches: list[str]) -> bool:
+    """Whether torch's kernel list covers GPU `sm` (e.g. sm_103): a cubin for the same major
+    version and an equal or lower minor runs on it (B300's sm_103 runs sm_100 kernels), and PTX
+    (compute_XY) of an equal or lower version JIT-compiles for it."""
+    def num(a: str) -> int:
+        d = "".join(c for c in a.split("_", 1)[-1] if c.isdigit())
+        return int(d) if d else -1
+    want = num(sm)
+    for a in arches:
+        n = num(a)
+        if a.startswith("sm_") and n // 10 == want // 10 and n <= want and not a.endswith("a"):
+            return True
+        if a.startswith("sm_") and n == want:
+            return True
+        if a.startswith("compute_") and 0 <= n <= want:
+            return True
+    return False
+
+
 def _software(hw: Hardware, p: Plan) -> None:
     """The CUDA stack has to know the GPU. Blackwell needs CUDA 12.8 builds everywhere."""
     if hw.blackwell:
@@ -74,7 +93,7 @@ def _software(hw: Hardware, p: Plan) -> None:
             p.fail(f"driver {hw.driver} supports CUDA {hw.cuda}; {hw.gpus[0].family} needs a driver "
                    "with CUDA 12.8+ (R570 or newer)")
         if hw.torch:
-            native = {sm, sm.replace("sm_", "compute_")} & set(hw.torch_arches)
+            native = _runs_on(sm, hw.torch_arches)
             if _ver(hw.torch) < (2, 7) or (hw.torch_cuda and _ver(hw.torch_cuda) < (12, 8)) \
                     or (hw.torch_arches and not native):
                 p.fail(f"torch {hw.torch} (CUDA {hw.torch_cuda or '?'}) has no {sm} kernels: "
