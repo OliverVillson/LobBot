@@ -57,7 +57,8 @@ DEFAULTS = {
     "heal_max_tokens": 1536,
     "heal_epochs": 1.0,
     "heal_accum": 8,         # sequences per optimizer step
-    "heal_lr": 1e-5,
+    "heal_lr": 3e-6,         # 1e-5 overfit Flint's attention (held-out KL 0.31 -> 0.40)
+    "heal_eval_every": 8,    # optimizer steps between held-out checks (early stopping, best point kept)
     "heal_minutes": 45,      # wall-clock cap on training (0 = none)
     "mlx_bits": 3,           # MLX export: routed experts (GPTQ)
     "mlx_group": 64,

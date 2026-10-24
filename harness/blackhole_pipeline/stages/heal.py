@@ -7,8 +7,9 @@
    q/k norms, sinks, routers, shared experts, dense MLPs and norms (fp32 master copies, AdamW,
    cosine). Frozen: the routed experts (the quant stages GPTQ them afterwards) and the
    embedding / LM head. Decoder layers are checkpointed.
-3. KL / top-1 on the held-out teacher answers before and after; the healed model is written to
-   <pruned>-healed only if KL went down (the quant stages then start from it).
+3. KL / top-1 on the held-out teacher answers every `heal_eval_every` steps; training stops when
+   it has not improved for three checks and the weights go back to the best point. The healed
+   model is written to <pruned>-healed only if that beats the start (the quant stages then use it).
 Writes work/heal.json and work/heal_data.jsonl.
 """
 
@@ -122,6 +123,8 @@ def run(bh, rj) -> None:
     student.train()
     emit(STAGE, pct=36, msg=f"distilling: {n_train / 1e9:.2f}B trainable, {len(rows)} sequences, {steps} steps")
     t0, step, seen, loss_avg = time.time(), 0, 0, None
+    best = {"kl": before.get("kl", float("inf")), "step": 0, "state": None, "r": None}
+    history = []
     k = 0
     stopped = False
     while step < steps and not stopped:
@@ -172,20 +175,39 @@ def run(bh, rj) -> None:
             emit(STAGE, pct=36 + 50 * step / steps,
                  msg=f"step {step}/{steps} · KL {loss_avg:.4f} · {seen} seqs · {el / 60:.0f} min"
                      + ("" if ok else " · skipped a non-finite step"))
+            if refs and (step % p["heal_eval_every"] == 0 or step >= steps):
+                student.eval()
+                r_ = compare(student, refs)
+                student.train()
+                history.append({"step": step, "kl": round(r_["kl"], 4), "top1": round(r_["top1_agreement"], 4)})
+                if r_["kl"] < best["kl"]:
+                    best.update(kl=r_["kl"], step=step, r=r_,
+                                state=[q.detach().to("cpu", copy=True) for _, q in params])
+                emit(STAGE, pct=36 + 50 * step / steps,
+                     msg=f"step {step}: held-out KL {r_['kl']:.3f} (start {before['kl']:.3f}, best {best['kl']:.3f}"
+                         f" at step {best['step']})")
+                if step - best["step"] >= 3 * p["heal_eval_every"]:  # no better point for a while
+                    stopped = True
+                    break
             if step >= steps:
                 break
             if limit and el > limit:
                 stopped = True
                 break
+    if best.get("state") is not None:  # back to the best point seen on the held-out answers
+        with torch.no_grad():
+            for (_, q), saved in zip(params, best["state"]):
+                q.copy_(saved.to(q.device))
+    elif refs:  # never better than the start: the unhealed weights stand (nothing is written)
+        best["r"] = None
     del opt, master
     for _, q in params:
         q.requires_grad_(False)
     student.eval()
     del teacher
     free()
-    after = compare(student, refs, lambda i, n: emit(STAGE, pct=87 + 5 * i / n, msg=f"KL after {i}/{n}")) \
-        if refs else {}
-    better = not refs or after["kl"] < before["kl"]
+    after = (best["r"] or before) if refs else {}
+    better = not refs or best["r"] is not None
     dst = bh.healed_dir(rj)
     shutil.rmtree(dst, ignore_errors=True)
     if better:
@@ -199,6 +221,7 @@ def run(bh, rj) -> None:
            "kl_before": round(before.get("kl", float("nan")), 4), "kl_after": round(after.get("kl", float("nan")), 4),
            "top1_before": round(before.get("top1_agreement", float("nan")), 4),
            "top1_after": round(after.get("top1_agreement", float("nan")), 4), "kept": better,
+           "best_step": best["step"], "history": history,
            "total_minutes": round((time.time() - t_start) / 60, 1)}
     rj.write("work/heal.json", res)
     rj.mark_done(STAGE, res)
