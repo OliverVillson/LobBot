@@ -122,8 +122,8 @@ SCHEMAS = [
             Step("gptq", "GPTQ int4 g128 on the routed experts (shipped)", {"gptq_calib": 64}),
             Step("reaq", "REAQ codebooks 16/8-level by REAP rank (lab, measured)", {"reaq_top": 0.5, "reaq_block": 32})),
            quant="int4", tags=("lab", "experimental", "moe"),
-           stage_list=("detect", "plan", "weights", "calibrate", "score", "prune", "eval", "gptq", "reaq", "quant",
-                       "package")),
+           stage_list=("detect", "plan", "weights", "calibrate", "score", "prune", "eval", "gptq", "reaq", "bench",
+                       "quant", "package")),
     Schema("reap-classic", "REAP classic", "blackhole", "REAPer's pipeline: prune experts by router-weighted "
            "activation on purpose-built calibration data, then store experts in fp8.",
            (Step("reap", "drop 50% of routed experts per layer", {"prune": 0.5}),), quant="fp8",

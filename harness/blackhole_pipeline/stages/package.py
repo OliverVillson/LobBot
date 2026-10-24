@@ -39,6 +39,11 @@ def run(bh, rj) -> None:
              row(f"REAP {p['prune']:.0%}, bf16", base),
              row("REAP + GPTQ int4 (shipped)", g),
              row("REAP + REAQ codebooks (lab)", q)]
+    b = rj.read("work/bench.json") or {}
+    if b.get("original") is not None:
+        table += ["", f"**{b['bench']}** ({b['problems']} problems, pass@1, one sample at temperature 0.2): "
+                      f"original {b['original']:.1%} → int4 {b['int4']:.1%}"
+                      + (f" ({b['retained']:.0%} retained)." if b.get("retained") else ".")]
     ppl_t = ev.get("ppl_teacher")
     card = [
         f"# {bh.gptq_dir(rj).name}", "",
@@ -64,7 +69,8 @@ def run(bh, rj) -> None:
     final = gd if gd.exists() else rj.final_dir
     receipt = {"schema": bh.config.get("schema"), "model_in": bh.config["model"], "model": str(final),
                "finished": time.strftime("%Y-%m-%d %H:%M:%S"), "params": p,
-               "size_gb": g.get("size_gb"), "results": {"reap_bf16": base, "gptq_int4": g, "reaq_codebook": q},
+               "size_gb": g.get("size_gb"), "results": {"reap_bf16": base, "gptq_int4": g, "reaq_codebook": q,
+                           "bench": {k: v for k, v in b.items() if k != "runs"}},
                "artifacts": [str(d) for d in links], "gates_passed": True}
     bh.write("receipt.json", receipt)
     (bh.root / "RESULTS.md").write_text("\n".join(card))

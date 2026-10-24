@@ -11,6 +11,7 @@ calibrate → REAP → eval, plus two stages of our own on the pruned model:
          rest on 8 (block 32, fp8 block scales). No kernel serves this yet, so it is a
          measured stage: KL / top-1 / size against int4, and the packed indices, tables
          and scales are saved for a future kernel.
+  bench  LiveCodeBench pass@1 of the original and the int4 model (one sample, 4k tokens)
 
 Events are REAPer's JSON lines; stage names are STAGES.
 """
@@ -20,7 +21,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-STAGES = ["detect", "plan", "weights", "calibrate", "score", "prune", "eval", "gptq", "reaq", "quant", "package"]
+STAGES = ["detect", "plan", "weights", "calibrate", "score", "prune", "eval", "gptq", "reaq", "bench", "quant", "package"]
 
 # (process, stages it reports, who runs it): REAPer processes are reaper_pipeline.stages.<name>,
 # ours blackhole_pipeline.stages.<name>. Each process frees the GPU when it exits.
@@ -33,6 +34,7 @@ PROCESSES = [
     ("eval", ["eval"], "reaper"),
     ("gptq", ["gptq"], "bh"),
     ("reaq", ["reaq"], "bh"),
+    ("bench", ["bench"], "bh"),
     ("quant", ["quant"], "reaper"),
     ("package", ["package"], "bh"),
 ]
@@ -44,6 +46,10 @@ DEFAULTS = {
     "layer_chunk": 12,       # MoE layers per sequential GPTQ chunk
     "reaq_top": 0.5,         # share of each layer's experts (by REAP score) on 16-level tables
     "reaq_block": 32,
+    "bench": "lcb-v6",       # LiveCodeBench release (problems new in it) for original vs int4; "none" skips
+    "bench_limit": 0,        # 0 = every problem of the release
+    "bench_max_tokens": 4096,
+    "bench_file": "",        # a local jsonl in LiveCodeBench's format instead of the download
 }
 
 

@@ -523,6 +523,10 @@ class BlackHole(App):
                 d = (q["kl"] / g["kl"] - 1) if g["kl"] else 0.0
                 pipe.append(f"  ·  REAQ codebook (lab): kl {q['kl']:.3f} · {q.get('expert_gb', 0):.1f} GB · "
                             f"{d:+.0%} kl", style=f"bold {EMBER}")
+        b = s.stages.get("bench") or {}
+        if b.get("status") == "done" and "lcb_int4" in b:
+            pipe.append(f"\n  LiveCodeBench pass@1: original {b['lcb_original']:.1%} → int4 {b['lcb_int4']:.1%}"
+                        f" ({b.get('problems', '?')} problems)", style=f"bold {FLARE}")
         if s.result:
             pipe.append(f"\n◉ {s.result}", style=f"bold {PHOTON}")
         self.query_one("#pipeline", Static).update(pipe)

@@ -89,12 +89,17 @@ def test_full_run_on_a_tiny_flint(tmp_path, donor):
         (old / ".done" / "score").unlink()
         (old / "work" / "teacher_ref.pt").unlink()
 
+    probs = tmp_path / "lcb.jsonl"
+    probs.write_text("".join(json.dumps(r) + "\n" for r in LCB_ROWS))
+    small_bench = {"bench_file": str(probs), "bench_max_tokens": 16}
+
     sc = find_schema("reaq-codebook")
     job = tmp_path / "bh" / "flint-tiny-reaq"
     job.mkdir(parents=True)
     (job / "config.json").write_text(json.dumps({
         "model": str(model), "schema": sc.id, "target": "rtx4090", "purpose": "",
-        "steps": [s.__dict__ for s in sc.steps], "quant": sc.quant, "calib_samples": 8, **small}))
+        "steps": [s.__dict__ for s in sc.steps], "quant": sc.quant, "calib_samples": 8, **small,
+        **small_bench}))
     p = subprocess.run([sys.executable, "-m", "blackhole_pipeline", "--job", str(job)], env=env, cwd=tmp_path,
                        capture_output=True, text=True, timeout=900)
     events = [e for e in map(parse_event, p.stdout.splitlines()) if e]
@@ -108,7 +113,7 @@ def test_full_run_on_a_tiny_flint(tmp_path, donor):
     else:
         assert by["score"][-1]["status"] == "done"
         assert "calibration usable, REAP scores not" in p.stdout
-    for s in ("detect", "plan", "prune", "eval", "gptq", "reaq", "quant", "package"):
+    for s in ("detect", "plan", "prune", "eval", "gptq", "reaq", "bench", "quant", "package"):
         assert by[s][-1]["status"] == "done", (s, by[s][-1])
     ev = by["eval"][-1]
     assert {"top1", "kl", "ppl_teacher", "ppl_student"} <= set(ev)
@@ -149,6 +154,7 @@ def test_full_run_on_a_tiny_flint(tmp_path, donor):
     assert rec["results"]["reaq_codebook"]["bpw"] == pytest.approx(3.75)
     assert rec["results"]["gptq_int4"]["bpw"] == pytest.approx(4.125)
     assert (job / "out" / gdir.name).is_symlink() and (job / "RESULTS.md").exists()
+    assert rec["results"]["bench"]["problems"] == 2 and "LiveCodeBench" in (job / "RESULTS.md").read_text()
     if donor == "scores":
         check_serve(gdir, qdir)
 
@@ -182,6 +188,43 @@ def check_serve(gdir: Path, qdir: Path):
              if l.startswith("data: ")]
     assert lines[-1] == "data: [DONE]" and json.loads(lines[-2][6:])["choices"][0]["finish_reason"]
     srv.shutdown()
+
+
+def _private(tests):
+    import base64
+    import pickle
+    import zlib
+    return base64.b64encode(zlib.compress(pickle.dumps(json.dumps(tests)))).decode()
+
+
+LCB_ROWS = [
+    {"question_title": "Sum", "question_content": "Read two integers and print their sum.", "platform": "atcoder",
+     "question_id": "abc1", "contest_date": "2025-02-01", "starter_code": "", "difficulty": "easy",
+     "public_test_cases": json.dumps([{"input": "1 2\n", "output": "3\n", "testtype": "stdin"}]),
+     "private_test_cases": _private([{"input": "5 7\n", "output": "12\n", "testtype": "stdin"}]), "metadata": "{}"},
+    {"question_title": "Twice", "question_content": "Return twice the list.", "platform": "leetcode",
+     "question_id": "lc1", "contest_date": "2025-03-01", "difficulty": "medium",
+     "starter_code": "class Solution:\n    def twice(self, nums: List[int], k: int) -> List[int]:\n        ",
+     "public_test_cases": json.dumps([{"input": "[1, 2]\n2", "output": "[2, 4]", "testtype": "functional"}]),
+     "private_test_cases": _private([{"input": "[3]\n2", "output": "[6]", "testtype": "functional"}]),
+     "metadata": json.dumps({"func_name": "twice"})},
+]
+
+
+def test_lcb_problems_and_runner(tmp_path):
+    from blackhole_pipeline import bench
+    f = tmp_path / "p.jsonl"
+    f.write_text("".join(json.dumps(r) + "\n" for r in LCB_ROWS))
+    a, b = bench.load_problems(file=str(f))
+    assert len(a["tests"]) == 2 and b["func"] == "twice" and "starter code" in bench.prompt(b)[1]["content"]
+    good_a = "```python\na, b = map(int, input().split())\nprint(a + b)\n```"
+    good_b = "<think>hm</think>```python\nclass Solution:\n    def twice(self, nums, k):\n        return [x * k for x in nums]\n```"
+    assert bench.run_problem(a, bench.extract_code(good_a))["passed"]
+    assert bench.run_problem(b, bench.extract_code(good_b))["passed"]
+    bad = bench.run_problem(a, "print(3)")
+    assert not bad["passed"] and "test 2" in bad["why"]
+    assert not bench.run_problem(a, "while True: pass")["passed"]
+    assert not bench.run_problem(a, "")["passed"]
 
 
 def test_parse_reply_tool_calls_and_reasoning():
