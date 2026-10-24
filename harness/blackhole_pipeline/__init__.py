@@ -79,6 +79,7 @@ DEFAULTS = {
     "mlx_group": 64,
     "mlx_hot": 0.0,          # share of each layer's experts (by REAP score) on mlx_hot_bits
     "mlx_hot_bits": 4,
+    "mlx_hex": 0,            # 1: routed experts as HEX per-expert level tables (2**bits levels, block 32, fp8 scales)
     "mlx_attn_bits": 4,      # attention, shared experts, dense MLPs
     "mlx_attn_gptq": 1,      # GPTQ (1) or round-to-nearest (0) for those and the LM head
     "mlx_qo_bits": 0,        # q/o projections (the big attention matrices); 0 = mlx_attn_bits

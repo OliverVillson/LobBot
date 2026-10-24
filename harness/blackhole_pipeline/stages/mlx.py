@@ -25,6 +25,7 @@ from pathlib import Path
 from blackhole_pipeline.common import Pruned, emit, gib, stage_main
 
 STAGE = "mlx"
+HEX_BLOCK = 32
 MODEL_FILE = Path(__file__).resolve().parents[1] / "mlx" / "flint_mlx.py"
 
 
@@ -101,6 +102,10 @@ def run(bh, rj) -> None:
 
     from blackhole_pipeline.pack import int_codes_bits, mlx_bpw, mlx_dequant, mlx_from_symmetric, mlx_pack, mlx_rtn
     from blackhole_pipeline.serve import mask_head
+    from gptq import gptq_table
+    from headers import header_parts
+
+    from blackhole_pipeline.pack import block_codes, codebook_dequant, expert_scale, pack_nibbles, table_indices
 
     p = bh.params
     bits, group, hot_bits, hot_share = p["mlx_bits"], p["mlx_group"], p["mlx_hot_bits"], p["mlx_hot"]
@@ -120,6 +125,7 @@ def run(bh, rj) -> None:
     out: dict[str, torch.Tensor] = {}
     quant: dict[str, dict] = {}
     tiers: dict[str, int] = {}
+    hexcfg: dict[str, dict] = {}
     nbytes = {"experts": 0, "rest": 0}
 
     def put_q(path: str, u, s, b, nb: int, kind: str) -> None:
@@ -150,12 +156,40 @@ def run(bh, rj) -> None:
                 if not js:
                     continue
                 gu, dn = m.stacked(blk.layer, js, Hin.device)
+                I = gu.shape[1] // 2
+                if p["mlx_hex"]:  # HEX: per-expert learned level tables, GPTQ rounding to them
+                    hexcfg.setdefault(str(blk.layer), {})[name] = nb
+                    jj = torch.tensor(js, device=Hin.device)
+                    back = {}
+                    for mat, W, Hm in (("gate_up", gu, Hin), ("down", dn, Hdn)):
+                        Hj = Hm[jj]
+                        S, Lv = header_parts(W, "expert", 2 ** nb, HEX_BLOCK, Hj.diagonal(dim1=-2, dim2=-1), False)
+                        Q = gptq_table(W, Hj, S, Lv)
+                        es = expert_scale(W)
+                        idx = table_indices(Q, S, Lv)
+                        codes = block_codes(S, es, HEX_BLOCK)
+                        back[mat] = codebook_dequant(pack_nibbles(idx), W.shape[-1], codes, es, Lv, HEX_BLOCK)
+                        n_, o_, i_ = idx.shape
+                        words = mlx_pack(idx.long().reshape(n_, o_, i_ // HEX_BLOCK, HEX_BLOCK), nb)
+                        words = words.reshape(n_, o_, -1)
+                        parts = {"idx": words, "block_scale": codes.view(torch.uint8), "expert_scale": es.float(),
+                                 "levels": Lv.float()}
+                        rows = {"gate_proj": slice(0, I), "up_proj": slice(I, 2 * I)} if mat == "gate_up" \
+                            else {"down_proj": slice(None)}
+                        for proj, sl in rows.items():
+                            for k_, t in parts.items():
+                                t = t[:, sl] if t.dim() == 3 else t
+                                out[f"{prefix}.{name}.{proj}.{k_}"] = t.cpu().clone().contiguous()
+                                nbytes["experts"] += t.numel() * t.element_size()
+                        del S, Q, idx, codes, words
+                    m.put(blk.layer, js, back["gate_up"], back["down"])
+                    del gu, dn, back
+                    continue
                 qg, sg = gptq_batched(gu, Hin[js], gptq_fmt(nb, group), return_scales=True)
                 qd, sd = gptq_batched(dn, Hdn[js], gptq_fmt(nb, group), return_scales=True)
                 ug, sgm, bgm = mlx_from_symmetric(int_codes_bits(qg, sg, group, nb), sg, nb, dtype)
                 ud, sdm, bdm = mlx_from_symmetric(int_codes_bits(qd, sd, group, nb), sd, nb, dtype)
                 m.put(blk.layer, js, mlx_dequant(ug, sgm, bgm, group), mlx_dequant(ud, sdm, bdm, group))
-                I = gu.shape[1] // 2
                 put_q(f"{prefix}.{name}.gate_proj", ug[:, :I], sgm[:, :I], bgm[:, :I], nb, "experts")
                 put_q(f"{prefix}.{name}.up_proj", ug[:, I:], sgm[:, I:], bgm[:, I:], nb, "experts")
                 put_q(f"{prefix}.{name}.down_proj", ud, sdm, bdm, nb, "experts")
@@ -268,9 +302,13 @@ def run(bh, rj) -> None:
             continue
         shutil.copy2(f, tmp / f.name)
     shutil.copy2(MODEL_FILE, tmp / MODEL_FILE.name)
+    if hexcfg:
+        shutil.copy2(MODEL_FILE.with_name("hex_check.py"), tmp / "hex_check.py")
     cfg.pop("quantization_config", None)
     if head_ids is not None:
         cfg["head_vocab"] = len(head_ids)
+    if hexcfg:
+        cfg["hex"] = hexcfg
     cfg.update({"model_file": MODEL_FILE.name, "expert_tiers": tiers,
                 "quantization": {"group_size": group, "bits": bits, **quant}})
     (tmp / "config.json").write_text(json.dumps(cfg, indent=2) + "\n")
@@ -279,9 +317,15 @@ def run(bh, rj) -> None:
     bh.link(dst)
 
     avg = (bits * (1 - hot_share) + hot_bits * hot_share)
-    res = {"format": f"MLX affine, experts GPTQ {bits}-bit" + (f" (top {hot_share:.0%} by REAP {hot_bits}-bit)"
-                                                               if hot_share else "") + f" g{group}",
-           "bpw": round(avg + 32 / group, 3), "expert_params": expert_params,
+    if p["mlx_hex"]:
+        fmt = (f"MLX, HEX experts: {2 ** bits}-level per-expert tables" +
+               (f", top {hot_share:.0%} by REAP {2 ** hot_bits}-level" if hot_share else "") + f", block {HEX_BLOCK}")
+        bpw_ = avg + 8 / HEX_BLOCK
+    else:
+        fmt = (f"MLX affine, experts GPTQ {bits}-bit" + (f" (top {hot_share:.0%} by REAP {hot_bits}-bit)"
+                                                         if hot_share else "") + f" g{group}")
+        bpw_ = avg + 32 / group
+    res = {"format": fmt, "bpw": round(bpw_, 3), "expert_params": expert_params,
            "expert_gb": round(gib(nbytes["experts"]), 2), "size_gb": round(gib(total), 2), "out": str(dst),
            "healed": src != rj.out_dir, "attn": ("GPTQ" if p["mlx_attn_gptq"] else "RTN") +
            f" {p['mlx_attn_bits']}-bit" + (f", q/o {p['mlx_qo_bits']}-bit" if p["mlx_qo_bits"] else ""),

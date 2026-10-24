@@ -14,6 +14,18 @@ REAQ tiers: a MoE layer listed in `expert_tiers` ({layer: n_hot}) keeps its expe
 the n_hot most salient (by REAP score) come first, in their own stacked tensors (`experts_hot`,
 quantized with more bits) and the rest in `experts`; the router rows are permuted to match.
 
+HEX experts (Header-Encoded eXperts, BlackHole-Harness): a MoE layer listed in `hex` stores its
+routed experts as per-expert learned level tables instead of evenly spaced levels. Per tier
+("experts" / "experts_hot") and projection, stacked over the tier's experts:
+  idx           uint32 [n, out, in / 32 * bits]   level indices, `bits` per weight, a little-endian
+                                                  bit stream per block of 32 inputs (bits words)
+  block_scale   uint8  [n, out, in / 32]          fp8 e4m3 scale per block of 32 inputs
+  expert_scale  float32 [n]                       one scale per expert matrix
+  levels        float32 [n, 2**bits]              the expert's own level table (its header)
+weight[e, o, i] = levels[e, idx] * fp8(block_scale[e, o, i // 32]) * expert_scale[e]
+On Apple GPUs a Metal kernel reads the tables directly (one simdgroup per output row); elsewhere a
+reference path dequantizes the chosen experts.
+
 Output-only vocab trim: with `head_vocab` = K the LM head has K rows for the token ids in
 `lm_head_ids`; logits of every other token are -inf (the model still reads all tokens).
 """
@@ -55,6 +67,7 @@ class ModelArgs(BaseModelArgs):
     tie_word_embeddings: bool = False
     expert_tiers: Optional[dict] = None   # {str(layer): n_hot}
     head_vocab: int = 0                   # output-only vocab trim: LM head rows (0 = vocab_size)
+    hex: Optional[dict] = None            # {str(layer): {"experts": bits, "experts_hot": bits}}
 
     def __post_init__(self):
         if self.layer_types is None:
@@ -62,6 +75,7 @@ class ModelArgs(BaseModelArgs):
         if self.rope_parameters and "rope_theta" in self.rope_parameters:
             self.rope_theta = float(self.rope_parameters["rope_theta"])
         self.expert_tiers = {int(k): int(v) for k, v in (self.expert_tiers or {}).items()}
+        self.hex = {int(k): dict(v) for k, v in (self.hex or {}).items()}
 
 
 class Attention(nn.Module):
@@ -105,15 +119,146 @@ class MLP(nn.Module):
         return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
+HEX_BLOCK = 32
+HEX_SKIP = 0xFFFFFFFF   # expert id of a (token, slot) another tier serves: output 0, no weights read
+_HEX_KERNELS = {}
+
+_HEX_SOURCE = """
+    uint lane = thread_position_in_threadgroup.x;
+    uint row = threadgroup_position_in_grid.x;
+    uint r = thread_position_in_grid.y;
+    uint e = experts[r];
+    if (e == 0xFFFFFFFFu) {            // this (token, slot) belongs to the other tier
+        if (lane == 0) y[(ulong)r * OUT + row] = static_cast<T>(0.0f);
+        return;
+    }
+    uint xr = r / XDIV;
+    const uint nblk = IN / 32;
+    const uint mask = (1u << BITS) - 1u;
+    float es = expert_scale[e];
+    ulong base = ((ulong)e * OUT + row) * nblk;
+    float acc = 0.0f;
+    for (uint b = lane; b < nblk; b += 32) {
+        uint8_t c = block_scale[base + b];
+        uint ex = (c >> 3) & 15u;
+        uint mt = c & 7u;
+        float s = ex == 0 ? (float(mt) / 8.0f) * 0.015625f : (1.0f + float(mt) / 8.0f) * exp2(float(ex) - 7.0f);
+        s = ((c & 128u) ? -s : s) * es;
+        const device uint32_t* w = idx + (base + b) * BITS;
+        uint words[BITS];
+        for (uint q = 0; q < BITS; q++) words[q] = w[q];
+        const device float* lv = levels + (ulong)e * (1u << BITS);
+        const device T* xv = x + (ulong)xr * IN + b * 32;
+        float part = 0.0f;
+        for (uint j = 0; j < 32; j++) {
+            uint off = j * BITS;
+            uint wi = off >> 5;
+            uint sh = off & 31u;
+            uint v = words[wi] >> sh;
+            if (sh + BITS > 32u) v |= words[wi + 1] << (32u - sh);
+            part += lv[v & mask] * float(xv[j]);
+        }
+        acc += part * s;
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) y[(ulong)r * OUT + row] = static_cast<T>(acc);
+"""
+
+
+def _hex_kernel():
+    if "k" not in _HEX_KERNELS:
+        _HEX_KERNELS["k"] = mx.fast.metal_kernel(
+            name="blackhole_hex_gather_matvec",
+            input_names=["x", "idx", "block_scale", "expert_scale", "levels", "experts"],
+            output_names=["y"], source=_HEX_SOURCE)
+    return _HEX_KERNELS["k"]
+
+
+def hex_dequant(idx, block_scale, expert_scale, levels, bits: int):
+    """Reference: weights [..., out, in] (float32) from HEX parts with matching leading dims."""
+    *lead, out, nw = idx.shape
+    nblk = nw // bits
+    w = idx.reshape(*lead, out, nblk, bits).astype(mx.uint32)
+    vals = []
+    for j in range(HEX_BLOCK):
+        off = j * bits
+        wi, sh = off // 32, off % 32
+        v = mx.right_shift(w[..., wi], sh)
+        if sh + bits > 32:
+            v = mx.bitwise_or(v, mx.left_shift(w[..., wi + 1], 32 - sh))
+        vals.append(mx.bitwise_and(v, (1 << bits) - 1))
+    u = mx.stack(vals, -1).reshape(*lead, out, nblk * HEX_BLOCK).astype(mx.int32)   # [..., out, in]
+    L = levels.shape[-1]
+    flat_lv = levels.reshape(-1, L)
+    rows = mx.arange(flat_lv.shape[0]).reshape(*lead, 1, 1) * L if lead else mx.array(0)
+    v = mx.take(flat_lv.reshape(-1), (u + rows).reshape(-1)).reshape(u.shape)
+    c = block_scale.astype(mx.uint32)
+    ex = mx.bitwise_and(mx.right_shift(c, 3), 15).astype(mx.float32)
+    mt = mx.bitwise_and(c, 7).astype(mx.float32)
+    s = mx.where(ex == 0, mt / 8.0 * 0.015625, (1.0 + mt / 8.0) * mx.power(2.0, ex - 7.0))
+    s = mx.where(mx.bitwise_and(c, 128) > 0, -s, s) * expert_scale.reshape(*lead, 1, 1)
+    return v * mx.repeat(s, HEX_BLOCK, axis=-1)
+
+
+class HexSwitchLinear(nn.Module):
+    """Stacked experts in HEX format: y = x @ W[expert].T for each (token, slot)."""
+
+    def __init__(self, in_dims: int, out_dims: int, num_experts: int, bits: int):
+        super().__init__()
+        self.bits, self.in_dims, self.out_dims = bits, in_dims, out_dims
+        nblk = in_dims // HEX_BLOCK
+        self.idx = mx.zeros((num_experts, out_dims, nblk * bits), dtype=mx.uint32)
+        self.block_scale = mx.zeros((num_experts, out_dims, nblk), dtype=mx.uint8)
+        self.expert_scale = mx.ones((num_experts,), dtype=mx.float32)
+        self.levels = mx.zeros((num_experts, 2 ** bits), dtype=mx.float32)
+
+    def __call__(self, x, experts, shared_x: bool):
+        """x [R or N, in] (shared_x: one row per token for all its k slots), experts [N*k] -> [N*k, out]."""
+        R = experts.shape[0]
+        xdiv = R // x.shape[0]
+        if mx.metal.is_available() and mx.default_device() == mx.gpu:
+            return _hex_kernel()(
+                inputs=[x, self.idx, self.block_scale, self.expert_scale, self.levels, experts.astype(mx.uint32)],
+                template=[("T", x.dtype), ("BITS", self.bits), ("IN", self.in_dims), ("OUT", self.out_dims),
+                          ("XDIV", xdiv)],
+                grid=(32 * self.out_dims, R, 1), threadgroup=(32, 1, 1),
+                output_shapes=[(R, self.out_dims)], output_dtypes=[x.dtype])[0]
+        live = experts != HEX_SKIP
+        e = mx.where(live, experts, 0)
+        W = hex_dequant(self.idx[e], self.block_scale[e], self.expert_scale[e], self.levels[e], self.bits)
+        xr = mx.repeat(x, xdiv, axis=0) if xdiv > 1 else x
+        y = (W @ xr[..., None].astype(mx.float32))[..., 0]
+        return mx.where(live[:, None], y, 0.0).astype(x.dtype)
+
+
+class HexSwitchGLU(nn.Module):
+    def __init__(self, hidden: int, inter: int, num_experts: int, bits: int):
+        super().__init__()
+        self.gate_proj = HexSwitchLinear(hidden, inter, num_experts, bits)
+        self.up_proj = HexSwitchLinear(hidden, inter, num_experts, bits)
+        self.down_proj = HexSwitchLinear(inter, hidden, num_experts, bits)
+
+    def __call__(self, x, indices):
+        """x [..., H], indices [..., k] -> [..., k, H] (like SwitchGLU)."""
+        shp, k = x.shape, indices.shape[-1]
+        xf = x.reshape(-1, shp[-1])
+        ids = indices.reshape(-1).astype(mx.uint32)   # HEX_SKIP marks slots another tier serves
+        a = nn.silu(self.gate_proj(xf, ids, True)) * self.up_proj(xf, ids, True)      # [N*k, I]
+        y = self.down_proj(a, ids, False)                                              # [N*k, H]
+        return y.reshape(*shp[:-1], k, shp[-1])
+
+
 class MoE(nn.Module):
-    def __init__(self, args: ModelArgs, n_hot: int = 0):
+    def __init__(self, args: ModelArgs, n_hot: int = 0, hex_bits: Optional[dict] = None):
         super().__init__()
         H, I, E = args.hidden_size, args.moe_intermediate_size, args.num_experts
         self.k, self.norm, self.n_hot = args.num_experts_per_tok, args.norm_topk_prob, n_hot
         self.gate = nn.Linear(H, E, bias=False)
-        self.experts = SwitchGLU(H, I, E - n_hot)
+        hb = hex_bits or {}
+        self.experts = HexSwitchGLU(H, I, E - n_hot, hb["experts"]) if "experts" in hb else SwitchGLU(H, I, E - n_hot)
         if n_hot:
-            self.experts_hot = SwitchGLU(H, I, n_hot)
+            self.experts_hot = (HexSwitchGLU(H, I, n_hot, hb["experts_hot"]) if "experts_hot" in hb
+                                else SwitchGLU(H, I, n_hot))
         self.shared_expert = MLP(H, args.shared_expert_intermediate_size)
 
     def __call__(self, x):
@@ -123,7 +268,13 @@ class MoE(nn.Module):
         if self.norm:
             w = w / (w.sum(-1, keepdims=True) + 1e-20)
         w = w.astype(x.dtype)
-        if self.n_hot:
+        if self.n_hot and isinstance(self.experts, HexSwitchGLU) and isinstance(self.experts_hot, HexSwitchGLU):
+            hot = ids < self.n_hot   # each (token, slot) is computed by its own tier only
+            skip = mx.array(HEX_SKIP, dtype=mx.uint32)
+            u = ids.astype(mx.uint32)
+            y = (self.experts_hot(x, mx.where(hot, u, skip))
+                 + self.experts(x, mx.where(hot, skip, u - self.n_hot)))
+        elif self.n_hot:
             hot = ids < self.n_hot
             y = mx.where(hot[..., None], self.experts_hot(x, mx.where(hot, ids, 0)),
                          self.experts(x, mx.where(hot, 0, ids - self.n_hot)))
@@ -137,7 +288,7 @@ class DecoderLayer(nn.Module):
         super().__init__()
         self.self_attn = Attention(args, layer)
         self.mlp = (MLP(args.hidden_size, args.intermediate_size) if layer in args.mlp_only_layers
-                    else MoE(args, args.expert_tiers.get(layer, 0)))
+                    else MoE(args, args.expert_tiers.get(layer, 0), args.hex.get(layer)))
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 

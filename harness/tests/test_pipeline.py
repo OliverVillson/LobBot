@@ -259,7 +259,8 @@ def test_parse_reply_tool_calls_and_reasoning():
     assert m[0]["content"] == "" and m[0]["tool_calls"][0]["function"]["arguments"] == {"path": "a"}
 
 
-def test_mac_schema_heal_and_mlx_on_a_tiny_flint(tmp_path):
+@pytest.mark.parametrize("hex_", [0, 1])
+def test_mac_schema_heal_and_mlx_on_a_tiny_flint(tmp_path, hex_):
     """mac-16gb: REAP 50% on code, distillation heal, MLX export (GPTQ experts with a REAQ hot tier),
     bench of the MLX model; the MLX folder loads in blackhole-serve (dequantized) and, when mlx is
     installed, in mlx-lm with the same logits."""
@@ -280,7 +281,7 @@ def test_mac_schema_heal_and_mlx_on_a_tiny_flint(tmp_path):
     (job / "config.json").write_text(json.dumps({
         "model": str(model), "schema": sc.id, "target": "mac", "purpose": "",
         "steps": [s.__dict__ for s in sc.steps], "quant": sc.quant, "calib_samples": 8, **small,
-        "mlx_group": 32, "mlx_hot": 0.5, "mlx_qo_bits": 3, "mlx_head_vocab": 190, "heal_prompts": 6, "heal_max_tokens": 10, "heal_accum": 2,
+        "mlx_group": 32, "mlx_hot": 0.5, "mlx_qo_bits": 3, "mlx_head_vocab": 190, "mlx_hex": hex_, "heal_prompts": 6, "heal_max_tokens": 10, "heal_accum": 2,
         "heal_lr": 1e-3, "heal_expert_rank": 2, "heal_layer_weight": 1.0, "heal_router_weight": 1.0, "heal_opd_rounds": 1, "heal_opd_prompts": 3, "bench_file": str(probs), "bench_max_tokens": 16}))
     p = subprocess.run([sys.executable, "-m", "blackhole_pipeline", "--job", str(job)], env=env, cwd=tmp_path,
                        capture_output=True, text=True, timeout=900)
@@ -337,8 +338,12 @@ def test_mac_schema_heal_and_mlx_on_a_tiny_flint(tmp_path):
     assert cfg["model_file"] == "flint_mlx.py" and cfg["num_experts"] == 4
     assert all(v == 2 for v in cfg["expert_tiers"].values())  # half of the 4 kept experts on the hot tier
     q = cfg["quantization"]
-    hot = next(k for k in q if k.endswith("experts_hot.gate_proj"))
-    assert q[hot]["bits"] == 4 and q[hot.replace("experts_hot", "experts")]["bits"] == 3
+    if hex_:   # HEX: per-expert tables, 16 levels on the hot tier, 8 on the rest; not in MLX's quant map
+        assert cfg["hex"] and all(v == {"experts_hot": 4, "experts": 3} for v in cfg["hex"].values())
+        assert not any(".experts" in k for k in q)
+    else:
+        hot = next(k for k in q if k.endswith("experts_hot.gate_proj"))
+        assert q[hot]["bits"] == 4 and q[hot.replace("experts_hot", "experts")]["bits"] == 3
     assert q["lm_head"]["bits"] == 6 and q["model.embed_tokens"]["bits"] == 4
     assert cfg["head_vocab"] == 192                       # 190 rounded up to a multiple of 32
     assert q["model.layers.0.self_attn.q_proj"]["bits"] == 3 and q["model.layers.0.self_attn.k_proj"]["bits"] == 4

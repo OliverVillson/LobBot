@@ -97,6 +97,17 @@ def _mlx_state(path: Path, dtype):
     for f in sorted(path.glob("model*.safetensors")):
         raw.update(load_file(str(f)))
     out = {}
+    for k in [k for k in raw if k.endswith(".levels")]:  # HEX experts: per-expert level tables
+        mod = k[:-len(".levels")]
+        lv = raw.pop(k).float()
+        bits = int(lv.shape[-1]).bit_length() - 1
+        words = raw.pop(f"{mod}.idx")
+        n, o, nw = words.shape
+        u = mlx_unpack(words.reshape(n, o, nw // bits, bits), bits).reshape(n, o, -1)
+        vals = torch.gather(lv, 1, u.reshape(n, -1)).view(u.shape)
+        sc = raw.pop(f"{mod}.block_scale").view(torch.float8_e4m3fn).float()
+        es = raw.pop(f"{mod}.expert_scale").float()
+        raw[f"{mod}.weight"] = (vals * sc.repeat_interleave(32, -1) * es[:, None, None]).to(dtype)
     for k in list(raw):
         if not k.endswith(".weight") or k not in raw:
             continue
