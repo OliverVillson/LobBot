@@ -289,9 +289,41 @@ def test_mac_schema_heal_and_mlx_on_a_tiny_flint(tmp_path):
     by = {}
     for e in events:
         by.setdefault(e["stage"], []).append(e)
-    for s in ("prune", "eval", "heal", "mlx", "bench", "package"):
+    for s in ("prune", "eval", "heal", "mlx", "qheal", "bench", "package"):
         assert by[s][-1]["status"] == "done", (s, by[s][-1])
+    qh = json.loads((job / "reaper" / "work" / "qheal.json").read_text())
+    mj = json.loads((job / "reaper" / "work" / "mlx.json").read_text())
+    assert qh["steps"] >= 1
+    start = mj.get("unhealed_kl", mj["kl"])
+    assert abs(qh["kl_before"] - start) <= 1e-3 + 1e-2 * start, (qh["kl_before"], start)  # qheal starts AS the MLX model
+    if qh["kept"]:
+        assert mj["out"].endswith("-healed") and Path(mj["out"], "config.json").exists() and mj["kl"] < start
     assert "gptq" not in by and "reaq" not in by and "quant" not in by  # not in this schema
+
+    # qheal's writer: the pruned model made into the MLX model, changed, written back as an MLX
+    # folder that loads with the same logits
+    from blackhole_pipeline import serve
+    from blackhole_pipeline.stages.heal import quantize_like, write_mlx
+    mdir = Path(mj.get("unhealed_out", mj["out"]))
+    st, _ = serve.load(mdir.parent / mdir.name.split("-MLX-")[0], "cpu")
+    fq = quantize_like(st, mdir)
+    assert any("self_attn.q_proj" in n for n in fq) and not any(".experts." in n for n in fq)
+    ids = torch.randint(5, 300, (1, 12))
+    with torch.no_grad():
+        same = st(input_ids=ids).logits[0]
+        ref_mlx, _ = serve.load(mdir, "cpu")
+        assert torch.allclose(same, ref_mlx(input_ids=ids).logits[0], atol=1e-2)   # it IS the MLX model
+        g = torch.Generator().manual_seed(3)
+        for n, prm in st.named_parameters():
+            if "parametrizations" in n or n.endswith("mlp.gate.weight") or "layernorm" in n:
+                prm.add_(0.05 * prm.abs().mean() * torch.randn(prm.shape, generator=g))
+        want = st(input_ids=ids).logits[0]
+    assert (want - same).abs().max() > 1e-2
+    write_mlx(st, fq, mdir, tmp_path / "healed-MLX")
+    got_m, _ = serve.load(tmp_path / "healed-MLX", "cpu")
+    with torch.no_grad():
+        got = got_m(input_ids=ids).logits[0]
+    assert torch.allclose(got, want, atol=2e-2 * want.abs().max()), (got - want).abs().max()
     rcfg = json.loads((job / "reaper" / "config.json").read_text())
     assert rcfg["calib"] == "code" and rcfg["prune"] == 0.5
     heal = json.loads((job / "reaper" / "work" / "heal.json").read_text())

@@ -132,9 +132,10 @@ SCHEMAS = [
            (Step("reap", "drop 50% of routed experts, calibrated on code", {"prune": 0.5, "calib": "code"}),
             Step("heal", "distil from the unpruned teacher on 1k coding prompts", {"heal_prompts": 1024}),
             Step("mlx", "MLX: GPTQ 3-bit experts, REAQ 4-bit hot tier, 4-bit attention",
-                 {"mlx_bits": 3, "mlx_group": 64, "mlx_hot": 0.125, "mlx_hot_bits": 4, "bench_models": "original,mlx"})),
+                 {"mlx_bits": 3, "mlx_group": 64, "mlx_hot": 0.125, "mlx_hot_bits": 4, "bench_models": "original,mlx"}),
+            Step("qheal", "distil again around the 3-bit model so the heal repairs the quantization too", {})),
            quant="mlx-3bit", tags=("mac", "code", "moe", "lab"),
-           stage_list=("detect", "plan", "weights", "calibrate", "score", "prune", "eval", "heal", "mlx", "bench",
+           stage_list=("detect", "plan", "weights", "calibrate", "score", "prune", "eval", "heal", "mlx", "qheal", "bench",
                        "package")),
     Schema("mac-16gb-375", "Mac 16 GB coder, lighter prune", "blackhole", "Like Mac 16 GB coder but REAP drops "
            "37.5% of routed experts and the MLX groups are 128 wide (~11 GB): better quality, needs the Mac's GPU "
@@ -142,9 +143,10 @@ SCHEMAS = [
            (Step("reap", "drop 37.5% of routed experts, calibrated on code", {"prune": 0.375, "calib": "code"}),
             Step("heal", "distil from the unpruned teacher on 1k coding prompts", {"heal_prompts": 1024}),
             Step("mlx", "MLX: GPTQ 3-bit g128 experts, 4-bit attention",
-                 {"mlx_bits": 3, "mlx_group": 128, "mlx_hot": 0.0, "bench_models": "original,mlx"})),
+                 {"mlx_bits": 3, "mlx_group": 128, "mlx_hot": 0.0, "bench_models": "original,mlx"}),
+            Step("qheal", "distil again around the 3-bit model so the heal repairs the quantization too", {})),
            quant="mlx-3bit", tags=("mac", "code", "moe", "lab"),
-           stage_list=("detect", "plan", "weights", "calibrate", "score", "prune", "eval", "heal", "mlx", "bench",
+           stage_list=("detect", "plan", "weights", "calibrate", "score", "prune", "eval", "heal", "mlx", "qheal", "bench",
                        "package")),
     Schema("reap-classic", "REAP classic", "blackhole", "REAPer's pipeline: prune experts by router-weighted "
            "activation on purpose-built calibration data, then store experts in fp8.",

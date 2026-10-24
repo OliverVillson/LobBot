@@ -36,7 +36,8 @@ def run(bh, rj) -> None:
             slug = "".join(c if c.isalnum() or c in "-." else "-" for c in str(bh.config["model"]))[-80:]
             out = home() / "bench" / f"{slug}-{p['bench']}-{p['bench_max_tokens']}-{p['bench_limit']}"
         old = json.loads((out / "summary.json").read_text()) if (out / "summary.json").exists() else {}
-        if old.get("max_tokens") != p["bench_max_tokens"]:  # missing, or run with another token limit
+        if old.get("max_tokens") != p["bench_max_tokens"] or (label != "original" and old.get("model") != str(path)):
+            # missing, run with another token limit, or the model folder changed (qheal)
             if not (path / "config.json").exists():
                 raise RuntimeError(f"no model to bench in {path}")
             cmd = [sys.executable, "-u", "-m", "blackhole_pipeline.bench", "--model", str(path), "--out", str(out),

@@ -14,6 +14,8 @@ calibrate → REAP → eval, plus two stages of our own on the pruned model:
   heal   distillation of the pruned model from the teacher on fresh calibration prompts
   mlx    an MLX folder for Apple silicon: GPTQ 3-bit experts (optionally a REAQ 4-bit hot tier),
          4-bit attention and embeddings, flint_mlx.py for mlx-lm
+  qheal  the heal again around the quantized MLX model (frozen 3-bit experts, fake-quant attention),
+         so it repairs the quantization error too; the bench then measures the healed folder
   bench  LiveCodeBench pass@1 and tok/s of the original and the REAQ model (bench_models) (one sample, up to 32k tokens)
 
 Events are REAPer's JSON lines; stage names are STAGES. A schema's stage_list (blackhole_tui.catalog)
@@ -25,7 +27,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-STAGES = ["detect", "plan", "weights", "calibrate", "score", "prune", "eval", "heal", "gptq", "reaq", "mlx", "bench",
+STAGES = ["detect", "plan", "weights", "calibrate", "score", "prune", "eval", "heal", "gptq", "reaq", "mlx", "qheal", "bench",
           "quant", "package"]
 
 # (process, stages it reports, who runs it): REAPer processes are reaper_pipeline.stages.<name>,
@@ -41,6 +43,7 @@ PROCESSES = [
     ("gptq", ["gptq"], "bh"),
     ("reaq", ["reaq"], "bh"),
     ("mlx", ["mlx"], "bh"),
+    ("qheal", ["qheal"], "bh"),
     ("bench", ["bench"], "bh"),
     ("quant", ["quant"], "reaper"),
     ("package", ["package"], "bh"),

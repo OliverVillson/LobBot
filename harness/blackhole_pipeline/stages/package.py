@@ -34,6 +34,7 @@ def run(bh, rj) -> None:
     reap = rj.read("work/reap.json") or {}
     h = rj.read("work/heal.json") or {}
     x = rj.read("work/mlx.json") or {}
+    qh = rj.read("work/qheal.json") or {}
     base = {"top1": ev.get("top1_agreement"), "kl": ev.get("kl"), "ppl_student": ev.get("ppl_pruned"),
             "size_gb": reap.get("bytes_after", 0) / 1024 ** 3 if reap.get("bytes_after") else None}
     base = {k: v for k, v in base.items() if v is not None}
@@ -44,7 +45,10 @@ def run(bh, rj) -> None:
                if h.get("kept") else []),
              *([row("REAP + GPTQ int4 (shipped)", g)] if g else []),
              *([row("REAP + REAQ codebooks (lab)", q)] if q else []),
-             *([row(f"MLX for Apple silicon ({x.get('format', '')})", x)] if x else [])]
+             *([row(f"MLX for Apple silicon ({x.get('format', '')})",
+                    {**x, "kl": x.get("unhealed_kl", x.get("kl")), "top1": x.get("unhealed_top1", x.get("top1"))})]
+               if x else []),
+             *([row("+ heal around the quantized MLX model", x)] if x.get("healed_after_quant") else [])]
     b = rj.read("work/bench.json") or {}
     if b.get("runs"):
         names = {"original": "original", "int4": "GPTQ int4", "reaq": "REAQ codebooks", "mlx": "MLX (Mac)"}
@@ -70,6 +74,9 @@ def run(bh, rj) -> None:
     if x:
         steps.append(f"MLX for Apple silicon: {x.get('format')}; attention / shared experts {p['mlx_attn_bits']}-bit, "
                      f"embedding {p['mlx_embed_bits']}-bit, LM head {p['mlx_head_bits']}-bit; routers and norms bf16")
+    if x.get("healed_after_quant"):
+        steps.append(f"heal again around the quantized MLX model ({qh.get('steps')} steps; experts frozen at 3-bit, "
+                     "attention trained through its rounding)")
     card = [f"# {final.name}", "",
             f"{bh.config['model']} compressed by BlackHole-Harness (schema `{bh.config.get('schema')}`):", "",
             *[f"- {t}" for t in steps], "",
@@ -91,7 +98,7 @@ def run(bh, rj) -> None:
     size = x.get("size_gb") if x else g.get("size_gb")
     receipt = {"schema": bh.config.get("schema"), "model_in": bh.config["model"], "model": str(final),
                "finished": time.strftime("%Y-%m-%d %H:%M:%S"), "params": p, "size_gb": size,
-               "results": {"reap_bf16": base, "heal": h, "gptq_int4": g, "reaq_codebook": q, "mlx": x,
+               "results": {"reap_bf16": base, "heal": h, "gptq_int4": g, "reaq_codebook": q, "mlx": x, "qheal": qh,
                            "bench": {k: v for k, v in b.items() if k != "runs"}},
                "artifacts": [str(d) for d in links], "gates_passed": True}
     bh.write("receipt.json", receipt)

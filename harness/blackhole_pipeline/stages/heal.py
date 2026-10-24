@@ -11,14 +11,24 @@
    it has not improved for three checks and the weights go back to the best point. The healed
    model is written to <pruned>-healed only if that beats the start (the quant stages then use it).
 Writes work/heal.json and work/heal_data.jsonl.
+
+Stage qheal is the same distillation after the mlx stage, around the quantized model: routed
+experts, embedding and LM head are the MLX folder's own (dequantized, frozen); attention, shared
+experts and dense MLPs train in bf16 behind a straight-through round-to-nearest at the MLX bit
+width (so the student is exactly the MLX model and the gains survive re-quantization); routers,
+norms and sinks train as they are. So the heal repairs the 3-bit error as well as the pruning.
+If it beats the start it writes <mlx folder>-healed and points work/mlx.json at it (the bench
+then measures it). Writes work/qheal.json.
 """
 
 from __future__ import annotations
 
+import json
 import math
 import random
 import shutil
 import time
+from pathlib import Path
 
 from blackhole_pipeline.common import emit, stage_main
 
@@ -31,7 +41,87 @@ def trainable(name: str) -> bool:
     return True
 
 
-def run(bh, rj) -> None:
+class FakeQuant:
+    """Parametrization: the weight as MLX round-to-nearest stores it, gradient straight through."""
+
+    def __new__(cls, bits: int, group: int):
+        import torch
+
+        from blackhole_pipeline.pack import mlx_dequant, mlx_rtn
+
+        class _FQ(torch.nn.Module):
+            def forward(self, w):
+                with torch.no_grad():
+                    u, s, b = mlx_rtn(w, bits, group, torch.bfloat16)  # the mlx stage's scale dtype
+                    q = mlx_dequant(u, s, b, group).to(w.dtype)
+                return w + (q - w).detach()
+        return _FQ()
+
+
+def quantize_like(student, mlx_dir: Path) -> dict:
+    """Makes the bf16 student the MLX model: frozen tensors (routed experts, routers in the MLX
+    expert order, embedding, LM head) from the MLX folder, fake-quant on the other quantized
+    Linear layers. Returns {module name: {"bits", "group_size"}} of the fake-quantized ones."""
+    import torch
+    from torch.nn.utils import parametrize
+
+    from blackhole_pipeline.serve import _mlx_state
+    cfg = json.loads((mlx_dir / "config.json").read_text())
+    q = cfg.get("quantization") or {}
+    dtype = next(student.parameters()).dtype
+    st = _mlx_state(mlx_dir, dtype)
+    keep = {k: v for k, v in st.items()
+            if ".experts." in k or k.endswith("mlp.gate.weight") or "embed_tokens" in k or k.startswith("lm_head")}
+    student.load_state_dict(keep, strict=False)
+    names = {n for n, _ in student.named_parameters()}
+    lost = [k for k in keep if k not in names]
+    if lost:
+        raise RuntimeError(f"MLX tensors with no place in the model: {lost[:4]}")
+    fq = {}
+    for name, mod in student.named_modules():
+        if (isinstance(mod, torch.nn.Linear) and name in q and isinstance(q[name], dict) and ".experts." not in name
+                and name != "lm_head"):
+            spec = {"bits": q[name]["bits"], "group_size": q[name]["group_size"]}
+            parametrize.register_parametrization(mod, "weight", FakeQuant(spec["bits"], spec["group_size"]))
+            fq[name] = spec
+    return fq
+
+
+def write_mlx(student, fq: dict, src: Path, dst: Path) -> None:
+    """A copy of the MLX folder src with the student's trained tensors: fake-quantized layers
+    re-quantized (same codes the student ran with), routers / norms / sinks as they are."""
+    import torch
+    from safetensors.torch import load_file, save_file
+    from torch.nn.utils import parametrize
+
+    from blackhole_pipeline.pack import mlx_pack, mlx_rtn
+    new = {}
+    for name, spec in fq.items():
+        mod = student.get_submodule(name)
+        parametrize.remove_parametrizations(mod, "weight", leave_parametrized=False)
+        u, s, b = mlx_rtn(mod.weight.detach(), spec["bits"], spec["group_size"], torch.bfloat16)
+        new.update({f"{name}.weight": mlx_pack(u, spec["bits"]).cpu(), f"{name}.scales": s.contiguous().cpu(),
+                    f"{name}.biases": b.contiguous().cpu()})
+    for n, prm in student.named_parameters():
+        if ".experts." in n or "embed_tokens" in n or n.startswith("lm_head") or n.rsplit(".", 1)[0] in fq:
+            continue
+        new[n] = prm.detach().to(torch.float32 if n.endswith("softmax_offset") else prm.dtype).cpu().contiguous()
+    tmp = dst.with_name(dst.name + ".tmp")
+    shutil.rmtree(tmp, ignore_errors=True)
+    shutil.copytree(src, tmp)
+    where = json.loads((tmp / "model.safetensors.index.json").read_text())["weight_map"]
+    extra = [k for k in new if k not in where]
+    if extra:
+        raise RuntimeError(f"trained tensors the MLX folder does not have: {extra[:4]}")
+    for f in sorted(set(where[k] for k in new)):
+        t = load_file(str(tmp / f))
+        t.update({k: v.to(t[k].dtype) if v.is_floating_point() else v for k, v in new.items() if where[k] == f})
+        save_file(t, str(tmp / f), metadata={"format": "mlx"})
+    shutil.rmtree(dst, ignore_errors=True)
+    tmp.rename(dst)
+
+
+def run(bh, rj, quantized: bool = False) -> None:
     import torch
     import torch.nn.functional as F
     from reaper_pipeline.calib import load_prompts
@@ -40,12 +130,13 @@ def run(bh, rj) -> None:
     from reaper_pipeline.stages.eval import compare
 
     p = bh.params
+    stage = "qheal" if quantized else STAGE
     t_start = time.time()
     tok = load_tokenizer(rj.model_dir, rj.config.trust_remote_code)
     prof = profile(rj)
     data_path = rj.path("work", "heal_data.jsonl")
     rows = read_jsonl(data_path)
-    emit(STAGE, pct=1, msg="loading the teacher")
+    emit(stage, pct=1, msg="loading the teacher")
     teacher = load_model(rj.model_dir, prof, rj.config.trust_remote_code).eval()
     for q in teacher.parameters():
         q.requires_grad_(False)
@@ -53,7 +144,7 @@ def run(bh, rj) -> None:
     if len(rows) < p["heal_prompts"]:
         calib = rj.config.calib or "mix"
         prompts, note = load_prompts(calib, p["heal_prompts"], seed=1234)
-        emit(STAGE, pct=3, msg=f"teacher answers for {len(prompts)} {note}")
+        emit(stage, pct=3, msg=f"teacher answers for {len(prompts)} {note}")
         enc = [encode(tok, q, None, rj.config.max_seq)[0] for q in prompts]
         ge = teacher.generation_config.eos_token_id
         eos = sorted({t for t in [tok.eos_token_id, *(ge if isinstance(ge, list) else [ge])] if t is not None})
@@ -64,7 +155,7 @@ def run(bh, rj) -> None:
             answers[i] = r
             done[0] += 1
             if done[0] % 16 == 0:
-                emit(STAGE, pct=3 + 27 * done[0] / len(enc), msg=f"teacher answered {done[0]}/{len(enc)}")
+                emit(stage, pct=3 + 27 * done[0] / len(enc), msg=f"teacher answered {done[0]}/{len(enc)}")
         if hasattr(teacher, "generate_many"):
             teacher.generate_many(enc, p["heal_max_tokens"], 0.7, 0.95, eos, slots=min(len(enc), 128), on_done=on_done)
         else:  # any other model: plain HF generate, 16 prompts at a time
@@ -83,12 +174,23 @@ def run(bh, rj) -> None:
         write_jsonl(data_path, rows)
     free()
 
-    emit(STAGE, pct=31, msg=f"loading the student {rj.out_dir.name}")
-    student = load_model(rj.out_dir, prof, rj.config.trust_remote_code)
+    fq, mlx_info = {}, {}
+    if quantized:
+        mlx_info = rj.read("work/mlx.json") or {}
+        mlx_dir = Path(mlx_info.get("unhealed_out") or mlx_info.get("out", ""))
+        if not (mlx_dir / "config.json").exists():
+            raise RuntimeError("no MLX model to heal: run the mlx stage first")
+        src = bh.healed_dir(rj) if bh.healed_dir(rj).exists() else rj.out_dir
+        emit(stage, pct=31, msg=f"loading {src.name} as {mlx_dir.name}")
+        student = load_model(src, prof, rj.config.trust_remote_code)
+        fq = quantize_like(student, mlx_dir)
+    else:
+        emit(stage, pct=31, msg=f"loading the student {rj.out_dir.name}")
+        student = load_model(rj.out_dir, prof, rj.config.trust_remote_code)
     refs_path = rj.path("work", "teacher_ref.pt")
     refs = torch.load(refs_path, weights_only=False) if refs_path.exists() else []
     student.eval()
-    before = compare(student, refs, lambda i, n: emit(STAGE, pct=31 + 4 * i / n, msg=f"KL before {i}/{n}")) \
+    before = compare(student, refs, lambda i, n: emit(stage, pct=31 + 4 * i / n, msg=f"KL before {i}/{n}")) \
         if refs else {}
 
     params = [(n, q) for n, q in student.named_parameters() if trainable(n)]
@@ -121,7 +223,7 @@ def run(bh, rj) -> None:
         if hasattr(mdl, "stack_experts"):
             mdl.stack_experts()
     student.train()
-    emit(STAGE, pct=36, msg=f"distilling: {n_train / 1e9:.2f}B trainable, {len(rows)} sequences, {steps} steps")
+    emit(stage, pct=36, msg=f"distilling: {n_train / 1e9:.2f}B trainable, {len(rows)} sequences, {steps} steps")
     t0, step, seen, loss_avg = time.time(), 0, 0, None
     best = {"kl": before.get("kl", float("inf")), "step": 0, "state": None, "r": None}
     history = []
@@ -172,7 +274,7 @@ def run(bh, rj) -> None:
                 q.grad = None
             step += 1
             el = time.time() - t0
-            emit(STAGE, pct=36 + 50 * step / steps,
+            emit(stage, pct=36 + 50 * step / steps,
                  msg=f"step {step}/{steps} · KL {loss_avg:.4f} · {seen} seqs · {el / 60:.0f} min"
                      + ("" if ok else " · skipped a non-finite step"))
             if refs and (step % p["heal_eval_every"] == 0 or step >= steps):
@@ -183,7 +285,7 @@ def run(bh, rj) -> None:
                 if r_["kl"] < best["kl"]:
                     best.update(kl=r_["kl"], step=step, r=r_,
                                 state=[q.detach().to("cpu", copy=True) for _, q in params])
-                emit(STAGE, pct=36 + 50 * step / steps,
+                emit(stage, pct=36 + 50 * step / steps,
                      msg=f"step {step}: held-out KL {r_['kl']:.3f} (start {before['kl']:.3f}, best {best['kl']:.3f}"
                          f" at step {best['step']})")
                 if step - best["step"] >= 3 * p["heal_eval_every"]:  # no better point for a while
@@ -208,27 +310,48 @@ def run(bh, rj) -> None:
     free()
     after = (best["r"] or before) if refs else {}
     better = not refs or best["r"] is not None
-    dst = bh.healed_dir(rj)
-    shutil.rmtree(dst, ignore_errors=True)
-    if better:
-        emit(STAGE, pct=93, msg=f"writing {dst.name}")
-        student.save_pretrained(dst, safe_serialization=True)
-        tok.save_pretrained(dst)
-        for f in rj.out_dir.iterdir():
-            if f.suffix in (".py", ".jinja") or f.name == "generation_config.json":
-                shutil.copy2(f, dst / f.name)
+    if quantized:
+        dst = mlx_dir.with_name(mlx_dir.name + "-healed")
+        shutil.rmtree(dst, ignore_errors=True)
+        if better:
+            emit(stage, pct=93, msg=f"writing {dst.name}")
+            write_mlx(student, fq, mlx_dir, dst)
+            bh.link(dst)
+            info = {**mlx_info, "unhealed_out": str(mlx_dir), "out": str(dst), "healed_after_quant": True,
+                    "unhealed_kl": mlx_info.get("unhealed_kl", mlx_info.get("kl")),
+                    "unhealed_top1": mlx_info.get("unhealed_top1", mlx_info.get("top1"))}
+            if refs:
+                info.update(kl=round(after["kl"], 4), top1=round(after["top1_agreement"], 4))
+            rj.write("work/mlx.json", info)
+        elif mlx_info.get("unhealed_out"):  # an earlier qheal's folder is gone: the unhealed one stands
+            rj.write("work/mlx.json", {**mlx_info, "out": mlx_info["unhealed_out"], "healed_after_quant": False,
+                                       "kl": mlx_info.get("unhealed_kl"), "top1": mlx_info.get("unhealed_top1")})
+    else:
+        dst = bh.healed_dir(rj)
+        shutil.rmtree(dst, ignore_errors=True)
+        if better:
+            emit(stage, pct=93, msg=f"writing {dst.name}")
+            student.save_pretrained(dst, safe_serialization=True)
+            tok.save_pretrained(dst)
+            for f in rj.out_dir.iterdir():
+                if f.suffix in (".py", ".jinja") or f.name == "generation_config.json":
+                    shutil.copy2(f, dst / f.name)
     res = {"trainable_params": n_train, "sequences": len(rows), "steps": step, "minutes": round((time.time() - t0) / 60, 1),
            "kl_before": round(before.get("kl", float("nan")), 4), "kl_after": round(after.get("kl", float("nan")), 4),
            "top1_before": round(before.get("top1_agreement", float("nan")), 4),
            "top1_after": round(after.get("top1_agreement", float("nan")), 4), "kept": better,
            "best_step": best["step"], "history": history,
            "total_minutes": round((time.time() - t_start) / 60, 1)}
-    rj.write("work/heal.json", res)
-    rj.mark_done(STAGE, res)
+    rj.write(f"work/{stage}.json", res)
+    rj.mark_done(stage, res)
     msg = (f"KL {res['kl_before']:.3f} → {res['kl_after']:.3f}, top-1 {res['top1_before']:.0%} → {res['top1_after']:.0%}"
            if refs else f"{step} steps")
-    emit(STAGE, "done", 100, msg + ("" if better else " · no gain, kept the unhealed model"),
+    emit(stage, "done", 100, msg + ("" if better else " · no gain, kept the unhealed model"),
          kl=res["kl_after"], top1=res["top1_after"])
+
+
+def run_quantized(bh, rj) -> None:
+    run(bh, rj, quantized=True)
 
 
 if __name__ == "__main__":
