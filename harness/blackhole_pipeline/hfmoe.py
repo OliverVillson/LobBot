@@ -125,13 +125,27 @@ def vllm_generate(model_dir: Path, prompts: list[list[int]], max_tokens: int, te
     py = vllm_python()
     env = {**os.environ, "PATH": str(Path(py).parent) + os.pathsep + os.environ.get("PATH", "")}   # ninja for JIT
     p = subprocess.Popen([py, "-u", str(script), str(work / "job.json")], env=env, stdout=subprocess.PIPE,
-                         stderr=subprocess.STDOUT, text=True, bufsize=1, errors="replace")
+                         stderr=subprocess.STDOUT, text=True, bufsize=1, errors="replace", start_new_session=True)
+    # a stop (SIGTERM / Ctrl-C) takes vLLM and its engine processes down too, not just this process
+    import signal
+    import threading
+    main = threading.current_thread() is threading.main_thread()
+    old = signal.signal(signal.SIGTERM, lambda *_: sys.exit(143)) if main else None
     tail = []
-    for line in p.stdout:
-        tail = (tail + [line.rstrip()])[-40:]
-        if on_line:
-            on_line(line.rstrip())
-    if p.wait() != 0:
+    try:
+        for line in p.stdout:
+            tail = (tail + [line.rstrip()])[-40:]
+            if on_line:
+                on_line(line.rstrip())
+        rc = p.wait()
+    finally:
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        if main:
+            signal.signal(signal.SIGTERM, old)
+    if rc != 0:
         raise RuntimeError("vLLM generation failed:\n" + "\n".join(tail))
     ans = [[] for _ in prompts]
     for line in (work / "out.jsonl").read_text().splitlines():
