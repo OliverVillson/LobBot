@@ -277,6 +277,10 @@ def main(argv: list[str] | None = None) -> int:
     if venv.exists() and not os.environ.get("BLACKHOLE_NO_VLLM"):
         os.environ.setdefault("REAPER_VLLM_PY", str(venv))
         os.environ.setdefault("BLACKHOLE_VLLM_PY", str(venv))
+    for k in ("REAPER_VLLM_PY", "BLACKHOLE_VLLM_PY"):   # vLLM's JIT builds call tools in its venv (ninja)
+        b = str(Path(os.environ[k]).parent) if os.environ.get(k) else None
+        if b and b not in os.environ.get("PATH", "").split(os.pathsep):
+            os.environ["PATH"] = b + os.pathsep + os.environ.get("PATH", "")
     bh = BHJob(a.job)
     (bh.root / "pid").write_text(str(os.getpid()))
     signal.signal(signal.SIGTERM, _stop)

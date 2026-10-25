@@ -37,10 +37,11 @@ round(torch.cuda.mem_get_info()[1] / 2**30), 'GB')"
 # vLLM in its own venv (its own torch): the pipeline uses it for the teacher's answers, the
 # student's on-policy answers and LiveCodeBench on models it supports (Qwen3.5 / 3.6; not Flint)
 if [ ! -x ~/vllm-venv/bin/python ] || ! ~/vllm-venv/bin/python -c "import vllm" 2>/dev/null; then
-  python3 -m venv ~/vllm-venv && ~/vllm-venv/bin/pip install -q -U pip && ~/vllm-venv/bin/pip install -q vllm && \
+  python3 -m venv ~/vllm-venv && ~/vllm-venv/bin/pip install -q -U pip && ~/vllm-venv/bin/pip install -q vllm ninja && \
   ~/vllm-venv/bin/pip install -q -e "$HOME/LobBot/reaper[pipeline]" || \
   echo "vLLM install failed: the pipeline falls back to (much slower) transformers generation"
 fi
+~/vllm-venv/bin/pip install -q ninja 2>/dev/null || true   # vLLM's JIT kernel builds need it on PATH
 ~/vllm-venv/bin/python -c "import vllm; from vllm import ModelRegistry as R; print('vllm', vllm.__version__, \
 '· Qwen3.5/3.6 MoE', 'yes' if 'Qwen3_5MoeForConditionalGeneration' in R.get_supported_archs() else 'NO')" 2>/dev/null || true
 echo "ready: source ~/bh-venv/bin/activate"

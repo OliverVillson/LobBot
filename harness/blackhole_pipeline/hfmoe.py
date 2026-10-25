@@ -122,7 +122,9 @@ def vllm_generate(model_dir: Path, prompts: list[list[int]], max_tokens: int, te
            "max_model_len": max(map(len, prompts)) + max_tokens + 8, "out": str(work / "out.jsonl")}
     (work / "job.json").write_text(json.dumps(job))
     script = Path(__file__).with_name("vllm_gen.py")
-    p = subprocess.Popen([vllm_python(), "-u", str(script), str(work / "job.json")], stdout=subprocess.PIPE,
+    py = vllm_python()
+    env = {**os.environ, "PATH": str(Path(py).parent) + os.pathsep + os.environ.get("PATH", "")}   # ninja for JIT
+    p = subprocess.Popen([py, "-u", str(script), str(work / "job.json")], env=env, stdout=subprocess.PIPE,
                          stderr=subprocess.STDOUT, text=True, bufsize=1, errors="replace")
     tail = []
     for line in p.stdout:
