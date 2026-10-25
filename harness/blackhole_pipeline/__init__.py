@@ -16,7 +16,7 @@ calibrate → REAP → eval, plus two stages of our own on the pruned model:
          4-bit attention and embeddings, flint_mlx.py for mlx-lm
   qheal  the heal again around the quantized MLX model (frozen 3-bit experts, fake-quant attention),
          so it repairs the quantization error too; the bench then measures the healed folder
-  bench  LiveCodeBench pass@1 and tok/s of the original and the REAQ model (bench_models) (one sample, up to 32k tokens)
+  bench  LiveCodeBench pass@1 and tok/s of the original and the REAQ model (bench_models) (one sample, up to 64k tokens)
 
 Events are REAPer's JSON lines; stage names are STAGES. A schema's stage_list (blackhole_tui.catalog)
 picks which of them a job runs.
@@ -89,7 +89,7 @@ DEFAULTS = {
     "bench": "lcb-v6",       # LiveCodeBench release (problems new in it) for original vs int4; "none" skips
     "bench_models": "original,reaq",  # any of original, int4, reaq, mlx
     "bench_limit": 0,        # 0 = every problem of the release
-    "bench_max_tokens": 32768,  # reasoning models think for tens of thousands of tokens; 4k cut most off
+    "bench_max_tokens": 65536,  # reasoning models think for tens of thousands of tokens (Qwen3.6: 32k cut 38% off)
     "bench_file": "",        # a local jsonl in LiveCodeBench's format instead of the download
 }
 

@@ -23,6 +23,7 @@ import resource
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 import zlib
 from concurrent.futures import ThreadPoolExecutor
@@ -103,7 +104,7 @@ def prompt(p: dict) -> list[dict]:
 def extract_code(reply: str) -> str:
     reply = re.sub(r"<think>.*?</think>", "", reply, flags=re.S)
     blocks = CODE_RE.findall(reply)
-    return blocks[-1] if blocks else ""
+    return textwrap.dedent(blocks[-1]) if blocks else ""   # a block inside a markdown list is indented
 
 
 # --------------------------------------------------------------------------- tests
