@@ -45,8 +45,16 @@ def shortest_passing(problems: list[dict], samples: int, generate, check, on_pro
     problem, its shortest passing answer) and statistics."""
     jobs = [(p, s) for p in problems for s in range(samples)]
     outs = generate(jobs)
+    done = [0]
+
+    def one(a):
+        r = check(a[0][0], a[1][2]) if a[1][2] else False   # unfinished answers are empty: nothing to run
+        done[0] += 1
+        if on_progress and done[0] % 64 == 0:
+            on_progress(done[0], len(jobs))
+        return r
     with ThreadPoolExecutor(max(1, (os.cpu_count() or 4) - 1)) as ex:
-        ok = list(ex.map(lambda a: check(a[0][0], a[1][2]), zip(jobs, outs)))
+        ok = list(ex.map(one, zip(jobs, outs)))
     best: dict[int, tuple] = {}
     lens_all, lens_pass = [], []
     for (p, _), (pids, aids, _), passed in zip(jobs, outs, ok):

@@ -289,7 +289,8 @@ def run(bh, rj, quantized: bool = False) -> None:
                         ans[i] = ans[i][:budget] + force + list(m)
                 return [(e, a, tok.decode(a, skip_special_tokens=True) if finished(a) else "") for e, a in zip(enc, ans)]
             rows, trace_stats = traces.shortest_passing(
-                probs, samples, gen, lambda pr, text: run_problem(pr, extract_code(text))["passed"])
+                probs, samples, gen, lambda pr, text: run_problem(pr, extract_code(text))["passed"],
+                lambda i, n: emit(stage, pct=25 + 5 * i / n, msg=f"testing the teacher's answers {i}/{n} (CPU)"))
             rj.write("work/heal_traces.json", trace_stats)
             emit(stage, pct=30, msg=f"teacher solved {trace_stats['solved']}/{len(probs)} problems; kept answers are "
                                     f"{trace_stats['shorter_than_passing']:.0%} shorter than its average passing one")
