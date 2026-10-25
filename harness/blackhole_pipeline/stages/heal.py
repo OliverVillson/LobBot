@@ -209,7 +209,8 @@ def run(bh, rj, quantized: bool = False) -> None:
         gc = None
     data_path = rj.path("work", "heal_data.jsonl")
     calib = p["heal_calib"] or rj.config.calib or "mix"
-    meta = {"calib": calib, "max_tokens": p["heal_max_tokens"], "samples": p["heal_samples"]}
+    meta = {"calib": calib, "max_tokens": p["heal_max_tokens"], "samples": p["heal_samples"], "finished": 1,
+            "think_budget": p["heal_think_budget"]}
     rows = read_jsonl(data_path) if (rj.read("work/heal_data_meta.json") or meta) == meta else []
     ge = getattr(gc, "eos_token_id", None)
     eos = sorted({t for t in [tok.eos_token_id, *(ge if isinstance(ge, list) else [ge])] if t is not None})
@@ -224,7 +225,8 @@ def run(bh, rj, quantized: bool = False) -> None:
             loaded["t"] = t
         return loaded["t"]
 
-    def teacher_answers(enc, temperature, top_p, top_k, what):
+    def teacher_answers(enc, temperature, top_p, top_k, what, max_tokens=None):
+        max_tokens = max_tokens or p["heal_max_tokens"]
         done = [0]
         answers = [None] * len(enc)
 
@@ -238,16 +240,14 @@ def run(bh, rj, quantized: bool = False) -> None:
                 if line.startswith("vllm_gen: done"):
                     a, b = line.split()[-1].split("/")
                     emit(stage, pct=3 + 27 * int(a) / int(b), msg=f"teacher {what} {a}/{b} (vLLM)")
-            return hfmoe.vllm_generate(rj.model_dir, enc, p["heal_max_tokens"], temperature, top_p, top_k, eos,
-                                       on_line=on_line)
+            return hfmoe.vllm_generate(rj.model_dir, enc, max_tokens, temperature, top_p, top_k, eos, on_line=on_line)
         teacher = load_teacher()
         if hasattr(teacher, "generate_many"):
             from blackhole_pipeline.bench import fit_batch
-            slots = fit_batch(teacher, min(len(enc), 256), max(map(len, enc)) + p["heal_max_tokens"])
-            teacher.generate_many(enc, p["heal_max_tokens"], temperature, top_p, eos, slots=slots, on_done=on_done,
-                                  top_k=top_k)
+            slots = fit_batch(teacher, min(len(enc), 256), max(map(len, enc)) + max_tokens)
+            teacher.generate_many(enc, max_tokens, temperature, top_p, eos, slots=slots, on_done=on_done, top_k=top_k)
         else:  # any other model without vLLM: plain HF generate, 16 prompts at a time
-            hfmoe.hf_answers(teacher, tok, enc, p["heal_max_tokens"], temperature, top_p, top_k, eos, on_done)
+            hfmoe.hf_answers(teacher, tok, enc, max_tokens, temperature, top_p, top_k, eos, on_done)
         return [a or [] for a in answers]
 
     samples = p["heal_samples"]
@@ -264,12 +264,30 @@ def run(bh, rj, quantized: bool = False) -> None:
             top_p = (gc.top_p or 0.95) if sampled else 0.95
             top_k = int((gc.to_diff_dict() if gc is not None else {}).get("top_k") or 20)
 
+            end = tok.get_vocab().get("</think>")
+            budget = p["heal_think_budget"]
+
+            def finished(a):   # an answer cut off by the token cap is never a training example
+                return bool(a) and a[-1] in eos and (end is None or end in a)
+
             def gen(jobs):
                 texts = [tok.apply_chat_template(prompt(pr), tokenize=False, add_generation_prompt=True) for pr, _ in jobs]
                 enc = [tok(t, add_special_tokens=False)["input_ids"][:rj.config.max_seq] for t in texts]
-                emit(stage, pct=3, msg=f"teacher solving {len(probs)} problems × {samples}")
-                ans = teacher_answers(enc, temp, top_p, top_k, "answers")
-                return [(e, a, tok.decode(a, skip_special_tokens=True)) for e, a in zip(enc, ans)]
+                emit(stage, pct=3, msg=f"teacher solving {len(probs)} problems × {samples}"
+                                       + (f", thinking budget {budget}" if budget else ""))
+                ans = teacher_answers(enc, temp, top_p, top_k, "answers", budget or None)
+                if budget and end is not None:
+                    # budget forcing: thinking still open at the budget is cut there and the teacher
+                    # is told to answer now; the forced answer is verified like any other
+                    from blackhole_pipeline.bench import ANSWER_TOKENS, FORCE_ANSWER
+                    force = tok(FORCE_ANSWER, add_special_tokens=False)["input_ids"]
+                    cut = [i for i, a in enumerate(ans) if end not in a and not (a and a[-1] in eos)]
+                    emit(stage, pct=20, msg=f"{len(cut)} answers still thinking at {budget} tokens: told to answer now")
+                    more = teacher_answers([enc[i] + ans[i][:budget] + force for i in cut], temp, top_p, top_k,
+                                           "forced answers", ANSWER_TOKENS) if cut else []
+                    for i, m in zip(cut, more):
+                        ans[i] = ans[i][:budget] + force + list(m)
+                return [(e, a, tok.decode(a, skip_special_tokens=True) if finished(a) else "") for e, a in zip(enc, ans)]
             rows, trace_stats = traces.shortest_passing(
                 probs, samples, gen, lambda pr, text: run_problem(pr, extract_code(text))["passed"])
             rj.write("work/heal_traces.json", trace_stats)

@@ -13,6 +13,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from blackhole_pipeline.bench import model_stamp
 from blackhole_pipeline.common import emit, stage_main
 
 STAGE = "bench"
@@ -36,7 +37,7 @@ def run(bh, rj) -> None:
             slug = "".join(c if c.isalnum() or c in "-." else "-" for c in str(bh.config["model"]))[-80:]
             out = home() / "bench" / f"{slug}-{p['bench']}-{p['bench_max_tokens']}-{p['bench_limit']}"
         old = json.loads((out / "summary.json").read_text()) if (out / "summary.json").exists() else {}
-        if old.get("max_tokens") != p["bench_max_tokens"] or (p["bench_budgets"] and "budgets" not in old) or (label != "original" and old.get("model") != str(path)):
+        if old.get("max_tokens") != p["bench_max_tokens"] or (p["bench_budgets"] and "budgets" not in old) or (label != "original" and (old.get("model") != str(path) or old.get("model_stamp") != model_stamp(path))):
             # missing, run with another token limit, or the model folder changed (qheal)
             if not (path / "config.json").exists():
                 raise RuntimeError(f"no model to bench in {path}")

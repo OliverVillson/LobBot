@@ -198,15 +198,16 @@ SCHEMAS = [
     Schema("qwen-mac-qhex-short", "REAP/Q-HEX Mac coder, short thinking (Qwen3.6)", "blackhole", "qwen-mac-qhex "
            "trained to think SHORTER: the compressed Qwen3.6 thought for a median 25k tokens on LiveCodeBench and 35% "
            "of its answers never finished within 64k (looping), while a 32k thinking budget lost nothing. The teacher "
-           "solves 1024 code_contests problems 4x with a 12k-token cap, so only answers that finish within 12k can be "
-           "kept and the shortest passing one is; two on-policy rounds with 12k-token student rollouts teach it to "
+           "solves 1024 code_contests problems 4x; thinking still open at 8k tokens is cut and the teacher is told to "
+           "answer now (budget forcing), only answers that finished and pass their tests count, and the shortest is kept; two on-policy rounds with 12k-token student rollouts teach it to "
            "climb out of its own loops (the teacher grades every token); training runs through without early "
            "stopping on the held-out KL (which cannot see answer length) and the bench judges the result. Same MLX "
            "export (HEX experts, REAQ tiers, full output vocab) and quantized heal.",
            (Step("reap", "drop 31.25% of routed experts, calibrated on code", {"prune": 0.3125, "calib": "code"}),
-            Step("heal", "short verified traces (12k cap, shortest of 4), on-policy rounds against looping",
+            Step("heal", "budget-forced verified traces (thinking cut at 8k, then answer; shortest finished pass of 4), "
+                 "on-policy rounds against looping",
                  {"heal_calib": "contest", "heal_samples": 4, "heal_prompts": 1024, "heal_max_tokens": 12288,
-                  "heal_seq": 14336, "heal_epochs": 2.0, "heal_select": "last", "heal_expert_rank": 16,
+                  "heal_think_budget": 8192, "heal_seq": 14336, "heal_epochs": 2.0, "heal_select": "last", "heal_expert_rank": 16,
                   "heal_layer_weight": 1.0, "heal_router_weight": 0.5, "heal_minutes": 90, "heal_opd_rounds": 2,
                   "heal_opd_prompts": 384, "heal_opd_minutes": 60}),
             Step("mlx", "MLX: HEX experts, REAQ tiers (top 10% 16-level, rest 8-level), GPTQ attention q/o 3-bit, "

@@ -375,6 +375,11 @@ def generate_vllm(model_dir: Path, cfg: dict, probs: list[dict], max_tokens: int
     return replies, temp, sum(len(r) for r in ans), len(enc), by_budget, think
 
 
+def model_stamp(model_dir: Path) -> float:
+    """When the model's weights last changed: a rebuilt folder of the same name is benched again."""
+    return max((f.stat().st_mtime for f in Path(model_dir).glob("*.safetensors")), default=0.0)
+
+
 def run(model_dir: Path, out: Path, release: str, file: str | None, limit: int, max_tokens: int, batch: int,
         stage: str | None = None, pct: tuple = (0, 100), label: str = "", budgets: tuple = ()) -> dict:
     from blackhole_pipeline import serve
@@ -420,7 +425,7 @@ def run(model_dir: Path, out: Path, release: str, file: str | None, limit: int, 
                "by_difficulty": {k: {"passed": a, "total": n, "pass@1": round(a / n, 4)} for k, (a, n) in by.items()},
                "no_code": sum(1 for c in codes if not c.strip()), "max_tokens": max_tokens, "temperature": temp,
                "gen_s": round(gen_s, 1), "tokens": ntok, "tok_s": round(ntok / gen_s, 1),
-               "batch": batch, "dates": [rows[0]["date"], rows[-1]["date"]]}
+               "batch": batch, "dates": [rows[0]["date"], rows[-1]["date"]], "model_stamp": model_stamp(model_dir)}
     if think:
         done = sorted(n for n in think if n is not None)
         summary["thinking"] = {"median": done[len(done) // 2] if done else None, "mean": round(sum(done) / len(done))
