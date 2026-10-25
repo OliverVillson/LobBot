@@ -425,7 +425,7 @@ def test_qwen_mac_schema_on_a_tiny_qwen3_6(tmp_path):
         "answer_max_tokens": 12, "writer_max_tokens": 24, "teacher_backend": "hf", "mlx_group": 32, "mlx_hot": 0.5,
         "mlx_head_vocab": 190, "heal_calib": "code", "heal_samples": 1, "heal_prompts": 6, "heal_max_tokens": 10,
         "heal_seq": 0, "heal_accum": 2, "heal_lr": 1e-3, "heal_expert_rank": 2, "heal_opd_rounds": 1,
-        "heal_opd_prompts": 3, "bench_file": str(probs), "bench_max_tokens": 16}))
+        "heal_opd_prompts": 3, "heal_select": "last", "bench_file": str(probs), "bench_max_tokens": 16}))
     p = subprocess.run([sys.executable, "-m", "blackhole_pipeline", "--job", str(job)], env=env, cwd=tmp_path,
                        capture_output=True, text=True, timeout=1500)
     events = [e for e in map(parse_event, p.stdout.splitlines()) if e]

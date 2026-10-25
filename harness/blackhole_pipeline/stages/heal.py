@@ -485,7 +485,7 @@ def run(bh, rj, quantized: bool = False) -> None:
                     emit(stage, pct=pct0 + span * step / steps,
                          msg=f"{label} step {step}: held-out KL {r_['kl']:.3f} (start {before['kl']:.3f}, "
                              f"best {best['kl']:.3f} at step {best['step']})")
-                    if run_["step"] - max(best["step"], phase_start[0]) >= 3 * p["heal_eval_every"]:
+                    if not keep_last and run_["step"] - max(best["step"], phase_start[0]) >= 3 * p["heal_eval_every"]:
                         stopped = True
                         break
                 if step >= steps:
@@ -501,6 +501,10 @@ def run(bh, rj, quantized: bool = False) -> None:
                     q.copy_(saved.to(q.device))
                     mq.copy_(q.float())
 
+    # heal_select "last": train through and keep the final weights. The held-out KL scores generic
+    # answers, so it cannot see what short-thinking training is for (shorter, finishing answers);
+    # early stopping on it would throw that away. The bench judges the result instead.
+    keep_last = p["heal_select"] == "last" and not quantized
     opt = make_opt()
     emit(stage, pct=36, msg=f"distilling: {n_train / 1e9:.2f}B trainable, {len(rows)} sequences")
     phase_start = [0]
@@ -511,7 +515,8 @@ def run(bh, rj, quantized: bool = False) -> None:
     if opd_rounds:
         # on-policy distillation: the student writes the answers, the teacher grades every token
         # (reverse KL), so it learns to recover from its own mistakes instead of only copying
-        restore_best()
+        if not keep_last:
+            restore_best()
         if any(".lora_" in n for n, _ in params):
             merge_lora()     # the student's fast decoder (or vLLM) runs merged weights
             params = [(n, q) for n, q in params if ".lora_" not in n]
@@ -548,7 +553,13 @@ def run(bh, rj, quantized: bool = False) -> None:
     for h in hooks:
         h.remove()
     step = run_["step"]
-    if best.get("state") is not None:  # back to the best point seen on the held-out answers
+    if keep_last:
+        best["state"] = None
+        if refs:
+            student.eval()
+            emit(stage, pct=90, msg="held-out KL of the final weights")
+            best["r"] = compare(student, refs)
+    elif best.get("state") is not None:  # back to the best point seen on the held-out answers
         restore_best()
     elif refs:  # never better than the start: the unhealed weights stand (nothing is written)
         best["r"] = None
@@ -560,7 +571,7 @@ def run(bh, rj, quantized: bool = False) -> None:
     loaded.clear()
     free()
     after = (best["r"] or before) if refs else {}
-    better = not refs or best["r"] is not None
+    better = keep_last or not refs or best["r"] is not None
     if quantized:
         dst = mlx_dir.with_name(mlx_dir.name + "-healed")
         shutil.rmtree(dst, ignore_errors=True)

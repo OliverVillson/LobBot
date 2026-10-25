@@ -73,6 +73,7 @@ DEFAULTS = {
     "heal_opd_rounds": 0,    # on-policy distillation rounds after the first pass (student writes, teacher grades)
     "heal_opd_prompts": 256, # student answers per round
     "heal_opd_minutes": 60,
+    "heal_select": "kl",     # kl: early stopping, best held-out KL kept; last: train through, keep the final weights
     "qheal_minutes": 45,     # training cap of the heal around the quantized model
     "heal_samples": 0,       # > 1 (with heal_calib contest): answers per problem; train on the shortest that passes its tests
     "mlx_bits": 3,           # MLX export: routed experts (GPTQ)

@@ -195,6 +195,29 @@ SCHEMAS = [
            quant="mlx-3bit", tags=("mac", "code", "moe", "lab", "reaq", "distill", "qwen"),
            stage_list=("detect", "plan", "weights", "calibrate", "score", "prune", "eval", "heal", "mlx", "qheal", "bench",
                        "package")),
+    Schema("qwen-mac-qhex-short", "REAP/Q-HEX Mac coder, short thinking (Qwen3.6)", "blackhole", "qwen-mac-qhex "
+           "trained to think SHORTER: the compressed Qwen3.6 thought for a median 25k tokens on LiveCodeBench and 35% "
+           "of its answers never finished within 64k (looping), while a 32k thinking budget lost nothing. The teacher "
+           "solves 1024 code_contests problems 4x with a 12k-token cap, so only answers that finish within 12k can be "
+           "kept and the shortest passing one is; two on-policy rounds with 12k-token student rollouts teach it to "
+           "climb out of its own loops (the teacher grades every token); training runs through without early "
+           "stopping on the held-out KL (which cannot see answer length) and the bench judges the result. Same MLX "
+           "export (HEX experts, REAQ tiers, full output vocab) and quantized heal.",
+           (Step("reap", "drop 31.25% of routed experts, calibrated on code", {"prune": 0.3125, "calib": "code"}),
+            Step("heal", "short verified traces (12k cap, shortest of 4), on-policy rounds against looping",
+                 {"heal_calib": "contest", "heal_samples": 4, "heal_prompts": 1024, "heal_max_tokens": 12288,
+                  "heal_seq": 14336, "heal_epochs": 2.0, "heal_select": "last", "heal_expert_rank": 16,
+                  "heal_layer_weight": 1.0, "heal_router_weight": 0.5, "heal_minutes": 90, "heal_opd_rounds": 2,
+                  "heal_opd_prompts": 384, "heal_opd_minutes": 60}),
+            Step("mlx", "MLX: HEX experts, REAQ tiers (top 10% 16-level, rest 8-level), GPTQ attention q/o 3-bit, "
+                 "full output vocab",
+                 {"mlx_hex": 1, "mlx_bits": 3, "mlx_group": 128, "mlx_hot": 0.10, "mlx_hot_bits": 4, "mlx_attn_gptq": 1,
+                  "mlx_qo_bits": 3, "mlx_head_bits": 4, "mlx_embed_bits": 3, "mlx_head_vocab": 0,
+                  "bench_models": "mlx"}),
+            Step("qheal", "distil again around the quantized model", {"qheal_minutes": 30})),
+           quant="mlx-3bit", tags=("mac", "code", "moe", "lab", "reaq", "distill", "qwen"),
+           stage_list=("detect", "plan", "weights", "calibrate", "score", "prune", "eval", "heal", "mlx", "qheal", "bench",
+                       "package")),
     Schema("reap-classic", "REAP classic", "blackhole", "REAPer's pipeline: prune experts by router-weighted "
            "activation on purpose-built calibration data, then store experts in fp8.",
            (Step("reap", "drop 50% of routed experts per layer", {"prune": 0.5}),), quant="fp8",
