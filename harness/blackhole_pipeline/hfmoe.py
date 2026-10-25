@@ -143,28 +143,47 @@ def vllm_generate(model_dir: Path, prompts: list[list[int]], max_tokens: int, te
     return ans
 
 
+def _src_names(k: str, t, src_keys) -> list:
+    """(name, tensor) pairs of the model tensor k in checkpoint layout src_keys: the same name or
+    the image-text model's (model.language_model.*), fused experts split into one module per expert
+    when the checkpoint stores them that way ([E, 2I, H] gate_up_proj = gate rows, then up rows)."""
+    import re
+    alts = [k] + (["model.language_model." + k[len("model."):]] if k.startswith("model.") else [])
+    for a in alts:
+        if a in src_keys:
+            return [(a, t)]
+    m = re.match(r"(.*\.experts)\.(gate_up_proj|down_proj)$", k)
+    if m and t.dim() == 3:
+        for a in alts:
+            pre = a[:-len(m.group(2)) - 1]
+            if f"{pre}.0.down_proj.weight" not in src_keys:
+                continue
+            if m.group(2) == "down_proj":
+                return [(f"{pre}.{e}.down_proj.weight", t[e]) for e in range(t.shape[0])]
+            half = t.shape[1] // 2
+            return [p for e in range(t.shape[0]) for p in ((f"{pre}.{e}.gate_proj.weight", t[e, :half]),
+                                                          (f"{pre}.{e}.up_proj.weight", t[e, half:]))]
+    if k == "lm_head.weight":   # tied to the embedding in this checkpoint
+        return []
+    raise RuntimeError(f"{k} has no place in this checkpoint's layout")
+
+
 def save_like(model, tok, src: Path, dst: Path) -> None:
-    """Save the model in the layout of checkpoint src (its config.json, tensor names and any tensors
-    the model does not hold, e.g. the vision tower of an image-text checkpoint whose text model was
-    trained alone), so engines that load src (vLLM) load dst the same way."""
+    """Save the model in the layout of checkpoint src (its config.json, tensor names, expert
+    layout and any tensors the model does not hold, e.g. the vision tower of an image-text
+    checkpoint whose text model was trained alone), so engines that load src (vLLM) load dst the
+    same way. Written from the model's own tensors, not save_pretrained, whose names depend on how
+    the model was built."""
     import shutil
 
     from safetensors import safe_open
-    from safetensors.torch import load_file, save_file
+    from safetensors.torch import save_file
     tmp = dst.with_name(dst.name + ".tmp")
     shutil.rmtree(tmp, ignore_errors=True)
-    model.save_pretrained(tmp / "raw", safe_serialization=True)
+    tmp.mkdir(parents=True)
     idx = src / "model.safetensors.index.json"
     src_keys = json.loads(idx.read_text())["weight_map"] if idx.exists() else \
         {k: "model.safetensors" for k in safe_open(str(src / "model.safetensors"), "pt").keys()}
-
-    def name(k: str) -> str:
-        if k in src_keys:
-            return k
-        alt = "model.language_model." + k[len("model."):] if k.startswith("model.") else None
-        if alt in src_keys:
-            return alt
-        raise RuntimeError(f"{k} has no place in {src.name}'s layout")
     n, size, shard, wmap = 0, 0, {}, {}
 
     def flush():
@@ -175,19 +194,22 @@ def save_like(model, tok, src: Path, dst: Path) -> None:
             save_file(shard, str(tmp / f), metadata={"format": "pt"})
             wmap.update({k: f for k in shard})
         shard, size = {}, 0
-    for f in sorted((tmp / "raw").glob("*.safetensors")):
-        for k, t in load_file(str(f)).items():
-            shard[name(k)] = t
-            size += t.numel() * t.element_size()
+    for k, t in model.state_dict().items():
+        for name, v in _src_names(k, t.detach(), src_keys):
+            shard[name] = v.to("cpu").contiguous()
+            size += v.numel() * v.element_size()
             if size > 4 * 2 ** 30:
                 flush()
+    flush()
     for f in sorted(set(src_keys.values())):   # what the text model does not hold: vision tower, MTP head
         with safe_open(str(src / f), "pt") as h:
             for k in h.keys():
                 if k not in wmap and k not in shard and not k.startswith(("model.language_model.", "lm_head")):
                     shard[k] = h.get_tensor(k)
+                    size += shard[k].numel() * shard[k].element_size()
+                    if size > 4 * 2 ** 30:
+                        flush()
     flush()
-    shutil.rmtree(tmp / "raw")
     (tmp / "model.safetensors.index.json").write_text(json.dumps({"metadata": {}, "weight_map": wmap}, indent=2))
     for f in src.iterdir():
         if f.is_file() and not f.name.endswith(".safetensors") and f.name != "model.safetensors.index.json":
