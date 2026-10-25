@@ -208,7 +208,7 @@ def run(bh, rj) -> None:
     expert_mods = {n for per in m.names.values() for e in per for n in e.values()}
     # small gates (Qwen's shared-expert gate, linear attention's a / b projections) stay bf16
     lin = [n for n, mod in m.model.named_modules() if isinstance(mod, torch.nn.Linear) and n not in expert_mods
-           and mod.out_features >= 64]
+           and not n.endswith(("shared_expert_gate", "linear_attn.in_proj_a", "linear_attn.in_proj_b"))]
     head_ids = None
     if p["mlx_head_vocab"] and "lm_head" in lin and p["mlx_head_vocab"] < m.model.lm_head.out_features:
         from reaper_pipeline.load import load_tokenizer

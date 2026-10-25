@@ -41,6 +41,7 @@ def test_routing_and_expert_outputs_rebuild_the_moe_output(models, arch):
     model = load(models[arch])
     blocks = moe.find_blocks(model)
     cfg = json.loads((models[arch] / "config.json").read_text())
+    cfg = cfg.get("text_config") or cfg   # image-text checkpoints (Qwen3.5 / 3.6)
     dense_first = cfg.get("first_k_dense_replace", 0) + len(cfg.get("mlp_only_layers") or [])
     assert len(blocks) == cfg["num_hidden_layers"] - dense_first
     assert all(b.num_experts == 8 for b in blocks)
@@ -149,6 +150,7 @@ def test_pruned_checkpoint_is_exact_where_routing_is_unchanged(models, arch, tmp
         got = pruned(input_ids=one, use_cache=False).logits
     torch.testing.assert_close(got, ref, rtol=1e-4, atol=1e-4)
     cfg = json.loads((tmp_path / "pruned" / "config.json").read_text())
+    cfg = cfg.get("text_config") or cfg
     assert 4 in [cfg.get(k) for k in moe.EXPERT_COUNT_KEYS]
 
 
