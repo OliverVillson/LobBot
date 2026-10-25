@@ -399,3 +399,87 @@ def test_shortest_passing_keeps_the_shortest_correct_answer():
     assert st["solved"] == 1 and st["passed"] == 2 and st["answers"] == 6
     assert len(rows) == 1 and rows[0]["start"] == 3
     assert st["tokens_mean_kept"] < st["tokens_mean_passing"] and st["shorter_than_passing"] > 0
+
+
+def test_qwen_mac_schema_on_a_tiny_qwen3_6(tmp_path):
+    """qwen-mac-qhex on a tiny Qwen3.5/3.6-shaped image-text MoE (Gated DeltaNet layers, fused
+    experts, gated shared expert): REAP, distillation with expert low-rank updates and on-policy
+    rounds (transformers generate here, vLLM on a GPU), MLX export with HEX tiers and a trimmed head,
+    qheal, bench. The MLX folder gives mlx-lm the same logits as the PyTorch model it came from,
+    and dequantizes back into a checkpoint in the original layout (what vLLM benches)."""
+    pytest.importorskip("transformers")
+    sys.path.insert(0, str(REAPER / "tests"))
+    from tiny_moe import build
+    model = build("qwen3_5_moe", tmp_path / "qwen-tiny")
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(REAPER), str(HARNESS)]), "REAPER_HW": "builtin",
+           "HF_HUB_OFFLINE": "1", "HF_DATASETS_OFFLINE": "1", "REAPER_HOME": str(tmp_path / "home"),
+           "BLACKHOLE_HOME": str(tmp_path / "bhhome"), "BLACKHOLE_NO_VLLM": "1"}
+    probs = tmp_path / "lcb.jsonl"
+    probs.write_text("".join(json.dumps(r) + "\n" for r in LCB_ROWS))
+    sc = find_schema("qwen-mac-qhex")
+    job = tmp_path / "bh" / "qwen-tiny-mac"
+    job.mkdir(parents=True)
+    (job / "config.json").write_text(json.dumps({
+        "model": str(model), "schema": sc.id, "target": "mac", "purpose": "",
+        "steps": [s.__dict__ for s in sc.steps], "quant": sc.quant, "calib_samples": 8, "heldout": 4, "max_seq": 96,
+        "answer_max_tokens": 12, "writer_max_tokens": 24, "teacher_backend": "hf", "mlx_group": 32, "mlx_hot": 0.5,
+        "mlx_head_vocab": 190, "heal_calib": "code", "heal_samples": 1, "heal_prompts": 6, "heal_max_tokens": 10,
+        "heal_seq": 0, "heal_accum": 2, "heal_lr": 1e-3, "heal_expert_rank": 2, "heal_opd_rounds": 1,
+        "heal_opd_prompts": 3, "bench_file": str(probs), "bench_max_tokens": 16}))
+    p = subprocess.run([sys.executable, "-m", "blackhole_pipeline", "--job", str(job)], env=env, cwd=tmp_path,
+                       capture_output=True, text=True, timeout=1500)
+    events = [e for e in map(parse_event, p.stdout.splitlines()) if e]
+    assert p.returncode == 0, p.stdout[-4000:] + p.stderr[-3000:]
+    by = {}
+    for e in events:
+        by.setdefault(e["stage"], []).append(e)
+    for s in ("prune", "eval", "heal", "mlx", "qheal", "bench", "package"):
+        assert by[s][-1]["status"] == "done", (s, by[s][-1])
+    work = job / "reaper" / "work"
+    heal = json.loads((work / "heal.json").read_text())
+    assert heal["steps"] >= 1 and heal["on_policy"] and heal["on_policy"][0]["rollouts"] >= 1
+    assert heal["trainable_params"] > 4 * (6 * 2 * 64 + 6 * 64 * 2)       # attention etc. + expert low-rank updates
+    mj = json.loads((work / "mlx.json").read_text())
+    qh = json.loads((work / "qheal.json").read_text())
+    start = mj.get("unhealed_kl", mj["kl"])
+    assert abs(qh["kl_before"] - start) <= 1e-3 + 1e-2 * start
+    xdir = Path(mj.get("unhealed_out", mj["out"]))
+    cfg = json.loads((xdir / "config.json").read_text())
+    assert cfg["model_file"] == "qwen_mlx.py" and (xdir / "flint_mlx.py").exists()
+    assert cfg["text_config"]["num_experts"] == 6 and cfg["text_config"]["full_attention_interval"] == 4
+    assert all(v == {"experts_hot": 4, "experts": 3} for v in cfg["hex"].values()) and cfg["head_vocab"] == 192
+    q = cfg["quantization"]
+    assert q["language_model.model.layers.3.self_attn.q_proj"]["bits"] == 3
+    assert "language_model.model.layers.0.mlp.shared_expert_gate" not in q   # small gates stay bf16
+
+    from blackhole_pipeline import hfmoe, serve
+    tm, tok = serve.load(xdir, "cpu")
+    ids = torch.randint(5, 300, (1, 12))
+    with torch.no_grad():
+        ref = tm(input_ids=ids).logits[0].float()
+    # the MLX weights, dequantized into the original image-text layout (vision tower kept), load the same
+    from transformers import AutoModelForImageTextToText
+    hfmoe.save_like(tm, tok, Path(cfg["blackhole_source"]), tmp_path / "as-hf")
+    back = AutoModelForImageTextToText.from_pretrained(tmp_path / "as-hf", dtype=torch.float32)
+    with torch.no_grad():
+        got = back(input_ids=ids).logits[0].float()
+    live = ref > serve.HEAD_FILL
+    assert torch.allclose(got[live], ref[live], atol=1e-5)
+    try:
+        import mlx.core as mx
+        from mlx_lm.utils import load_model
+    except ImportError:
+        return
+    import numpy as np
+    mm, _ = load_model(xdir, trust_remote_code=True)
+    mm.set_dtype(mx.float32)
+    out = np.array(mm(mx.array(ids.numpy()))[0].astype(mx.float32))
+    fin = np.isfinite(out)
+    r = ref.numpy()
+    assert np.array_equal(fin, r > serve.HEAD_FILL) and fin[0].sum() <= 192
+    assert np.abs(out[fin] - r[fin]).max() < 1e-3 * np.abs(r[fin]).max() + 1e-4
+    for layer in mm.model.layers:
+        if hasattr(layer.mlp, "split_min"):
+            layer.mlp.split_min = 1
+    split = np.array(mm(mx.array(ids.numpy()))[0].astype(mx.float32))
+    assert np.abs(split[fin] - out[fin]).max() < 1e-4 * np.abs(out[fin]).max()

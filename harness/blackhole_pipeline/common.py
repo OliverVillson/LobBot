@@ -52,13 +52,16 @@ class Pruned:
         if not self.blocks:
             raise RuntimeError("no MoE blocks in the pruned model")
         self.H = moe.text_config(self.model.config).hidden_size
-        if self.blocks[0].fused:
-            raise RuntimeError("fused expert tensors are not supported by the GPTQ export yet")
+        self.fused = self.blocks[0].fused   # [E, ...] expert tensors (transformers 5 Qwen3.5 / 3.6, ...)
         names = {id(p): n for n, p in self.model.named_parameters()}
+        mods = {id(m): n for n, m in self.model.named_modules()}
         self.views, self.names = {}, {}
         for b in self.blocks:
             self.views[b.layer] = [expert_views(b, j, self.H) for j in range(b.num_experts)]
             ex = b.experts
+            if self.fused:   # one module holds every expert: its name stands for all of them
+                self.names[b.layer] = [{k: mods[id(ex)] for k in ("gate", "up", "down")}] * b.num_experts
+                continue
             self.names[b.layer] = [{k: names[id(getattr(ex[j], f"{k}_proj").weight)][:-len(".weight")]
                                     for k in ("gate", "up", "down")} for j in range(b.num_experts)]
         tok = load_tokenizer(self.src, rj.config.trust_remote_code)

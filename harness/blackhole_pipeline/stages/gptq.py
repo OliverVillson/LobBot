@@ -41,6 +41,8 @@ def run(bh, rj) -> None:
     p = bh.params
     emit(STAGE, pct=1, msg=f"loading {rj.out_dir.name}")
     m = Pruned(rj, p["gptq_calib"])
+    if m.fused:
+        raise RuntimeError("fused expert tensors (e.g. Qwen3.5 / 3.6) are not supported by this export yet; use the mlx stage")
     layers_dir = rj.path("work", "gptq")
     shutil.rmtree(layers_dir, ignore_errors=True)
     layers_dir.mkdir(parents=True)

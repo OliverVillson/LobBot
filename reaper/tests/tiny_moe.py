@@ -28,6 +28,14 @@ ARCHS = {
                      n_group=1, topk_group=1, first_k_dense_replace=1, norm_topk_prob=True,
                      routed_scaling_factor=2.5, num_hidden_layers=3),
     "minimax_m2": dict(num_local_experts=8, num_experts_per_tok=2, use_routing_bias=True),
+    # Qwen3.5 / 3.6 MoE (Qwen3.6-35B-A3B): a vision-language checkpoint whose text model has Gated
+    # DeltaNet linear-attention layers, a full-attention layer every 4th, fused routed experts and
+    # a gated shared expert; built as the full image-text model like the real one
+    "qwen3_5_moe": dict(num_experts=8, num_experts_per_tok=2, moe_intermediate_size=32,
+                        shared_expert_intermediate_size=32, num_hidden_layers=4,
+                        layer_types=["linear_attention", "linear_attention", "linear_attention", "full_attention"],
+                        linear_num_value_heads=4, linear_num_key_heads=2, linear_key_head_dim=16,
+                        linear_value_head_dim=16, linear_conv_kernel_dim=4),
     # REAPer's own PyTorch Flint (reaper_pipeline.models.flint): a dense first layer, sliding
     # layers with RoPE, a full layer without, attention sinks, sigmoid routing, shared expert
     "flint": dict(num_experts=8, num_experts_per_tok=2, moe_intermediate_size=32, shared_expert_intermediate_size=32,
@@ -63,8 +71,16 @@ def build(arch: str, path: Path, seed: int = 0, **over) -> Path:
     register_all()
     torch.manual_seed(seed)
     kw = {**COMMON, **ARCHS[arch], **over}
-    cfg = CONFIG_MAPPING[arch](**kw)
-    model = AutoModelForCausalLM.from_config(cfg).eval()
+    if arch == "qwen3_5_moe":
+        from transformers import AutoModelForImageTextToText
+        kw.pop("intermediate_size")
+        vision = dict(depth=1, hidden_size=32, intermediate_size=32, num_heads=2, out_hidden_size=kw["hidden_size"],
+                      patch_size=4, num_position_embeddings=16)
+        cfg = CONFIG_MAPPING[arch](text_config=kw, vision_config=vision, tie_word_embeddings=False)
+        model = AutoModelForImageTextToText.from_config(cfg).eval()
+    else:
+        cfg = CONFIG_MAPPING[arch](**kw)
+        model = AutoModelForCausalLM.from_config(cfg).eval()
     with torch.no_grad():  # random routers and biases so routing is not degenerate
         for n, p in model.named_parameters():
             if "bias" in n and ("gate" in n or "router" in n or "correction" in n):

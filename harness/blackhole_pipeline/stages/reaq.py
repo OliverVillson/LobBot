@@ -50,6 +50,8 @@ def run(bh, rj) -> None:
     block, top = p["reaq_block"], p["reaq_top"]
     emit(STAGE, pct=1, msg=f"loading {rj.out_dir.name}")
     m = Pruned(rj, p["gptq_calib"])
+    if m.fused:
+        raise RuntimeError("fused expert tensors (e.g. Qwen3.5 / 3.6) are not supported by this export yet; use the mlx stage")
     sal = {L["layer"]: [L["saliency"][j] for j in L["kept"]] for L in rj.read("work/saliency.json")["layers"]}
     emit(STAGE, pct=3, msg="activation energy per input channel (k-means weights)")
     energy = m.hessians(m.blocks, diag=True)

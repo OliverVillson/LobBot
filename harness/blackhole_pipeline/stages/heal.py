@@ -113,8 +113,10 @@ def quantize_like(student, mlx_dir: Path) -> dict:
     from safetensors import safe_open
     from torch.nn.utils import parametrize
 
+    from blackhole_pipeline.mlx_layout import layout_of_folder
     from blackhole_pipeline.serve import _mlx_state, mask_head
     cfg = json.loads((mlx_dir / "config.json").read_text())
+    lay = layout_of_folder(cfg)
     q = cfg.get("quantization") or {}
     dtype = next(student.parameters()).dtype
     st = _mlx_state(mlx_dir, dtype)
@@ -130,13 +132,14 @@ def quantize_like(student, mlx_dir: Path) -> dict:
     dev = next(student.parameters()).device
     fq = {}
     for name, mod in student.named_modules():
-        if (isinstance(mod, torch.nn.Linear) and isinstance(q.get(name), dict) and ".experts." not in name
+        mn = lay.to_mlx(name)
+        if (isinstance(mod, torch.nn.Linear) and isinstance(q.get(mn), dict) and ".experts." not in name
                 and name != "lm_head"):
-            spec = {"bits": q[name]["bits"], "group_size": q[name]["group_size"]}
-            with safe_open(str(mlx_dir / where[f"{name}.scales"]), "pt") as f:
-                sc = f.get_tensor(f"{name}.scales").to(dev)
-            with safe_open(str(mlx_dir / where[f"{name}.biases"]), "pt") as f:
-                bi = f.get_tensor(f"{name}.biases").to(dev)
+            spec = {"bits": q[mn]["bits"], "group_size": q[mn]["group_size"]}
+            with safe_open(str(mlx_dir / where[f"{mn}.scales"]), "pt") as f:
+                sc = f.get_tensor(f"{mn}.scales").to(dev)
+            with safe_open(str(mlx_dir / where[f"{mn}.biases"]), "pt") as f:
+                bi = f.get_tensor(f"{mn}.biases").to(dev)
             parametrize.register_parametrization(mod, "weight", FakeQuant(sc, bi, spec["bits"], spec["group_size"]))
             fq[name] = spec
     return fq
@@ -149,7 +152,9 @@ def write_mlx(student, fq: dict, src: Path, dst: Path) -> None:
     from safetensors.torch import load_file, save_file
     from torch.nn.utils import parametrize
 
+    from blackhole_pipeline.mlx_layout import layout_of_folder
     from blackhole_pipeline.pack import mlx_pack
+    lay = layout_of_folder(json.loads((src / "config.json").read_text()))
     new = {}
     for name, spec in fq.items():
         mod = student.get_submodule(name)
@@ -157,11 +162,12 @@ def write_mlx(student, fq: dict, src: Path, dst: Path) -> None:
         sc, bi = fqm.scales, fqm.biases
         parametrize.remove_parametrizations(mod, "weight", leave_parametrized=False)
         u = grid_codes(mod.weight.detach(), sc, bi, spec["bits"], spec["group_size"])
-        new[f"{name}.weight"] = mlx_pack(u, spec["bits"]).cpu()
+        new[f"{lay.to_mlx(name)}.weight"] = mlx_pack(u, spec["bits"]).cpu()
     for n, prm in student.named_parameters():
         if ".experts." in n or "embed_tokens" in n or n.startswith("lm_head") or n.rsplit(".", 1)[0] in fq:
             continue
-        new[n] = prm.detach().to(torch.float32 if n.endswith("softmax_offset") else prm.dtype).cpu().contiguous()
+        t = prm.detach().to(torch.float32 if n.endswith(("softmax_offset", "A_log")) else prm.dtype).cpu()
+        new[lay.to_mlx(n)] = lay.tensor_to_mlx(n, t).contiguous()
     tmp = dst.with_name(dst.name + ".tmp")
     shutil.rmtree(tmp, ignore_errors=True)
     shutil.copytree(src, tmp)
@@ -185,22 +191,38 @@ def run(bh, rj, quantized: bool = False) -> None:
     from reaper_pipeline.stages._common import encode, profile, read_jsonl, write_jsonl
     from reaper_pipeline.stages.eval import compare
 
+    from blackhole_pipeline import hfmoe
+
     p = bh.params
     stage = "qheal" if quantized else STAGE
     t_start = time.time()
     tok = load_tokenizer(rj.model_dir, rj.config.trust_remote_code)
     prof = profile(rj)
+    # REAPer's Flint has its own fast generation and layer loop; other models (Qwen3.5 / 3.6, ...)
+    # run on transformers' code and generate through vLLM when it is installed
+    flint = json.loads((rj.model_dir / "config.json").read_text()).get("model_type") == "flint"
+    use_vllm = not flint and hfmoe.can_vllm()
+    try:
+        from transformers import GenerationConfig
+        gc = GenerationConfig.from_pretrained(rj.model_dir)
+    except Exception:  # noqa: BLE001
+        gc = None
     data_path = rj.path("work", "heal_data.jsonl")
     calib = p["heal_calib"] or rj.config.calib or "mix"
     meta = {"calib": calib, "max_tokens": p["heal_max_tokens"], "samples": p["heal_samples"]}
     rows = read_jsonl(data_path) if (rj.read("work/heal_data_meta.json") or meta) == meta else []
-    emit(stage, pct=1, msg="loading the teacher")
-    teacher = load_model(rj.model_dir, prof, rj.config.trust_remote_code).eval()
-    for q in teacher.parameters():
-        q.requires_grad_(False)
-    dev = input_device(teacher)
-    ge = teacher.generation_config.eos_token_id
+    ge = getattr(gc, "eos_token_id", None)
     eos = sorted({t for t in [tok.eos_token_id, *(ge if isinstance(ge, list) else [ge])] if t is not None})
+    loaded = {}
+
+    def load_teacher():
+        if "t" not in loaded:
+            emit(stage, pct=1, msg="loading the teacher")
+            t = load_model(rj.model_dir, prof, rj.config.trust_remote_code).eval()
+            for q in t.parameters():
+                q.requires_grad_(False)
+            loaded["t"] = t
+        return loaded["t"]
 
     def teacher_answers(enc, temperature, top_p, top_k, what):
         done = [0]
@@ -211,23 +233,21 @@ def run(bh, rj, quantized: bool = False) -> None:
             done[0] += 1
             if done[0] % 16 == 0:
                 emit(stage, pct=3 + 27 * done[0] / len(enc), msg=f"teacher {what} {done[0]}/{len(enc)}")
+        if use_vllm:  # the original model in vLLM, in its own process (before the teacher is loaded here)
+            def on_line(line):
+                if line.startswith("vllm_gen: done"):
+                    a, b = line.split()[-1].split("/")
+                    emit(stage, pct=3 + 27 * int(a) / int(b), msg=f"teacher {what} {a}/{b} (vLLM)")
+            return hfmoe.vllm_generate(rj.model_dir, enc, p["heal_max_tokens"], temperature, top_p, top_k, eos,
+                                       on_line=on_line)
+        teacher = load_teacher()
         if hasattr(teacher, "generate_many"):
             from blackhole_pipeline.bench import fit_batch
             slots = fit_batch(teacher, min(len(enc), 256), max(map(len, enc)) + p["heal_max_tokens"])
             teacher.generate_many(enc, p["heal_max_tokens"], temperature, top_p, eos, slots=slots, on_done=on_done,
                                   top_k=top_k)
-        else:  # any other model: plain HF generate, 16 prompts at a time
-            for b0 in range(0, len(enc), 16):
-                grp = enc[b0:b0 + 16]
-                T = max(map(len, grp))
-                ids = torch.tensor([[tok.pad_token_id or 0] * (T - len(e)) + e for e in grp], device=dev)
-                am = torch.tensor([[0] * (T - len(e)) + [1] * len(e) for e in grp], device=dev)
-                with torch.no_grad():
-                    g = teacher.generate(input_ids=ids, attention_mask=am, max_new_tokens=p["heal_max_tokens"],
-                                         do_sample=True, temperature=temperature, top_p=top_p, top_k=top_k or None)
-                for j, r in enumerate(g[:, T:].tolist()):
-                    cut = next((i + 1 for i, t in enumerate(r) if t in eos), len(r))
-                    on_done(b0 + j, r[:cut])
+        else:  # any other model without vLLM: plain HF generate, 16 prompts at a time
+            hfmoe.hf_answers(teacher, tok, enc, p["heal_max_tokens"], temperature, top_p, top_k, eos, on_done)
         return [a or [] for a in answers]
 
     samples = p["heal_samples"]
@@ -239,11 +259,10 @@ def run(bh, rj, quantized: bool = False) -> None:
                 raise RuntimeError("heal_samples > 1 needs heal_calib = contest (problems with tests)")
             emit(stage, pct=2, msg=f"loading {p['heal_prompts']} code_contests problems")
             probs = traces.contest_problems(p["heal_prompts"])
-            gc = teacher.generation_config
             sampled = getattr(gc, "do_sample", False)
             temp = (gc.temperature or 1.0) if sampled else 1.0
             top_p = (gc.top_p or 0.95) if sampled else 0.95
-            top_k = int(gc.to_diff_dict().get("top_k") or 20)
+            top_k = int((gc.to_diff_dict() if gc is not None else {}).get("top_k") or 20)
 
             def gen(jobs):
                 texts = [tok.apply_chat_template(prompt(pr), tokenize=False, add_generation_prompt=True) for pr, _ in jobs]
@@ -267,6 +286,8 @@ def run(bh, rj, quantized: bool = False) -> None:
         write_jsonl(data_path, rows)
         rj.write("work/heal_data_meta.json", meta)
     free()
+    teacher = load_teacher()
+    dev = input_device(teacher)
 
     fq, mlx_info = {}, {}
     if quantized:
@@ -291,8 +312,17 @@ def run(bh, rj, quantized: bool = False) -> None:
         if hasattr(mdl, "stack_experts"):
             mdl.stack_experts()
     rank = 0 if quantized else p["heal_expert_rank"]
-    if rank and hasattr(student, "add_expert_lora"):  # the routed experts learn too, as low-rank updates
-        student.add_expert_lora(rank)
+    if rank:  # the routed experts learn too, as low-rank updates
+        if hasattr(student, "add_expert_lora"):
+            student.add_expert_lora(rank)
+        else:
+            hfmoe.add_expert_lora(student, rank)
+
+    def merge_lora():
+        if hasattr(student, "merge_expert_lora"):
+            student.merge_expert_lora()
+        else:
+            hfmoe.merge_expert_lora(student)
     params = [(n, q) for n, q in student.named_parameters() if trainable(n)]
     for n, q in student.named_parameters():
         q.requires_grad_(False)
@@ -343,6 +373,8 @@ def run(bh, rj, quantized: bool = False) -> None:
         hooks += [gt.register_forward_hook(th), gs.register_forward_hook(sh)]
 
     def hidden(model, ids, grad: bool, layers: bool = False):
+        if not flint:
+            return hfmoe.hidden(model, ids, grad, layers)
         x = model.model.embed_tokens(ids)
         pos = torch.arange(ids.shape[1], device=ids.device)[None]
         mask = torch.ones_like(ids, dtype=torch.bool)
@@ -476,20 +508,19 @@ def run(bh, rj, quantized: bool = False) -> None:
     phase(rows, p["heal_epochs"], (p["qheal_minutes"] if quantized else p["heal_minutes"]) * 60, False, "distil", 36,
           50 if not opd_rounds else 25)
     opd = []
-    if opd_rounds and hasattr(student, "generate_many"):
+    if opd_rounds:
         # on-policy distillation: the student writes the answers, the teacher grades every token
         # (reverse KL), so it learns to recover from its own mistakes instead of only copying
         restore_best()
-        if hasattr(student, "merge_expert_lora") and any(".lora_" in n for n, _ in params):
-            student.merge_expert_lora()     # the student's fast decoder runs merged weights
+        if any(".lora_" in n for n, _ in params):
+            merge_lora()     # the student's fast decoder (or vLLM) runs merged weights
             params = [(n, q) for n, q in params if ".lora_" not in n]
             master = [q.detach().float().clone().requires_grad_(True) for _, q in params]
             if best.get("state") is not None:
                 best["state"] = [q.detach().to("cpu", copy=True) for _, q in params]
         opt = make_opt()
         prompts = [r["ids"][:r["start"]] for r in rows]
-        gc = teacher.generation_config
-        top_k = int(gc.to_diff_dict().get("top_k") or 20)
+        top_k = int((gc.to_diff_dict() if gc is not None else {}).get("top_k") or 20)
         n_opd = min(len(prompts), p["heal_opd_prompts"])
         for rnd in range(opd_rounds):
             batch = random.Random(100 + rnd).sample(prompts, n_opd)
@@ -497,9 +528,17 @@ def run(bh, rj, quantized: bool = False) -> None:
                                                             f"the student answers {n_opd} prompts")
             student.eval()
             from blackhole_pipeline.bench import fit_batch
-            with torch.no_grad():
-                slots = fit_batch(student, min(n_opd, 256), max(map(len, batch)) + p["heal_max_tokens"])
-                outs = student.generate_many(batch, p["heal_max_tokens"], 1.0, 0.95, eos, slots=slots, top_k=top_k)
+            if hasattr(student, "generate_many"):
+                with torch.no_grad():
+                    slots = fit_batch(student, min(n_opd, 256), max(map(len, batch)) + p["heal_max_tokens"])
+                    outs = student.generate_many(batch, p["heal_max_tokens"], 1.0, 0.95, eos, slots=slots, top_k=top_k)
+            elif use_vllm:   # the student as it is now, saved in the checkpoint's layout, answers in vLLM
+                sdir = rj.path("work", "opd-student")
+                hfmoe.save_like(student, tok, rj.out_dir, sdir)
+                outs = hfmoe.vllm_generate(sdir, batch, p["heal_max_tokens"], 1.0, 0.95, top_k, eos)
+                shutil.rmtree(sdir, ignore_errors=True)
+            else:
+                outs = hfmoe.hf_answers(student, tok, batch, p["heal_max_tokens"], 1.0, 0.95, top_k, eos)
             roll = [{"ids": list(pr) + list(o), "start": len(pr)} for pr, o in zip(batch, outs) if len(o) > 1]
             opd.append({"round": rnd + 1, "rollouts": len(roll),
                         "tokens_mean": round(sum(len(r["ids"]) - r["start"] for r in roll) / max(1, len(roll)), 1)})
@@ -518,6 +557,7 @@ def run(bh, rj, quantized: bool = False) -> None:
         q.requires_grad_(False)
     student.eval()
     del teacher
+    loaded.clear()
     free()
     after = (best["r"] or before) if refs else {}
     better = not refs or best["r"] is not None
@@ -542,13 +582,15 @@ def run(bh, rj, quantized: bool = False) -> None:
         shutil.rmtree(dst, ignore_errors=True)
         if better:
             emit(stage, pct=93, msg=f"writing {dst.name}")
-            if hasattr(student, "merge_expert_lora"):
-                student.merge_expert_lora()
-            student.save_pretrained(dst, safe_serialization=True)
-            tok.save_pretrained(dst)
-            for f in rj.out_dir.iterdir():
-                if f.suffix in (".py", ".jinja") or f.name == "generation_config.json":
-                    shutil.copy2(f, dst / f.name)
+            merge_lora()
+            if not flint:   # in the pruned checkpoint's own layout (image-text configs, vLLM-loadable)
+                hfmoe.save_like(student, tok, rj.out_dir, dst)
+            else:
+                student.save_pretrained(dst, safe_serialization=True)
+                tok.save_pretrained(dst)
+                for f in rj.out_dir.iterdir():
+                    if f.suffix in (".py", ".jinja") or f.name == "generation_config.json":
+                        shutil.copy2(f, dst / f.name)
     res = {"trainable_params": n_train, "sequences": len(rows), "steps": step, "minutes": round((time.time() - t0) / 60, 1),
            "kl_before": round(before.get("kl", float("nan")), 4), "kl_after": round(after.get("kl", float("nan")), 4),
            "top1_before": round(before.get("top1_agreement", float("nan")), 4),

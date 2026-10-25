@@ -376,13 +376,24 @@ class MoE(nn.Module):
                                 else SwitchGLU(H, I, n_hot))
         self.shared_expert = MLP(H, args.shared_expert_intermediate_size)
 
-    def __call__(self, x):
+    def route(self, x):
+        """(expert ids [..., k], weights [..., k]): Flint's sigmoid router."""
         scores = mx.sigmoid(self.gate(x).astype(mx.float32))
         ids = mx.stop_gradient(mx.argpartition(-scores, kth=self.k - 1, axis=-1)[..., :self.k])
         w = mx.take_along_axis(scores, ids, axis=-1)
         if self.norm:
             w = w / (w.sum(-1, keepdims=True) + 1e-20)
-        w = w.astype(x.dtype)
+        return ids, w
+
+    def shared(self, x):
+        return self.shared_expert(x)
+
+    def __call__(self, x):
+        ids, w = self.route(x)
+        return (self.routed(x, ids) * w.astype(x.dtype)[..., None]).sum(-2) + self.shared(x)
+
+    def routed(self, x, ids):
+        """[..., k, H]: every (token, slot) through its expert's tier."""
         if self.n_hot and ids.size >= self.split_min:
             y = self._split_tiers(x, ids)
         elif self.n_hot and isinstance(self.experts, HexSwitchGLU) and isinstance(self.experts_hot, HexSwitchGLU):
@@ -397,7 +408,7 @@ class MoE(nn.Module):
                          self.experts(x, mx.where(hot, 0, ids - self.n_hot)))
         else:
             y = self.experts(x, ids)
-        return (y * w[..., None]).sum(-2) + self.shared_expert(x)
+        return y
 
 
 class DecoderLayer(nn.Module):

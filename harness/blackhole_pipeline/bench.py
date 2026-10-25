@@ -284,6 +284,71 @@ def generate(model, tok, probs: list[dict], max_tokens: int, batch: int, stage: 
     return out, temp, ntok, batch
 
 
+def sampling(gc) -> tuple[float, float, int]:
+    """The model's own temperature / top_p / top_k when its generation_config sets them, else
+    0.6 / 0.95 / 20 (not transformers' default top_k of 50)."""
+    sampled = gc is not None and getattr(gc, "do_sample", False)
+    temp = float(gc.temperature) if sampled and gc.temperature else 0.6
+    top_p = float(gc.top_p) if sampled and gc.top_p else 0.95
+    top_k = int((gc.to_diff_dict() if gc is not None else {}).get("top_k") or 20)
+    return temp, top_p, top_k
+
+
+def generate_vllm(model_dir: Path, cfg: dict, probs: list[dict], max_tokens: int, stage: str | None, pct: tuple):
+    """vLLM in its own process (models that run on transformers' code, e.g. Qwen3.5 / 3.6). A
+    BlackHole MLX folder is benched as exactly its weights: dequantized into a checkpoint in the
+    layout of the model it came from, its output-only vocab trim as vLLM's allowed tokens."""
+    import shutil
+
+    import torch
+    from transformers import GenerationConfig
+
+    from blackhole_pipeline import hfmoe, serve
+    from reaper_pipeline.load import free, load_tokenizer
+    tok = load_tokenizer(model_dir)
+    try:
+        gc = GenerationConfig.from_pretrained(model_dir)
+    except Exception:  # noqa: BLE001
+        gc = None
+    temp, top_p, top_k = sampling(gc)
+    e = getattr(gc, "eos_token_id", None)
+    eos = sorted({t for t in [tok.eos_token_id, *([e] if isinstance(e, int) else (e or []))] if t is not None})
+    serve_dir, allowed, tmp = model_dir, None, None
+    if serve._quant_method(model_dir) == "mlx":
+        emit(stage, pct[0], f"dequantizing {model_dir.name} for vLLM")
+        model, _ = serve.load(model_dir, "cuda" if torch.cuda.is_available() else "cpu")
+        from safetensors import safe_open
+        for f in model_dir.glob("model*.safetensors"):
+            with safe_open(str(f), "pt") as h:
+                if "lm_head_ids" in h.keys():
+                    allowed = sorted(set(h.get_tensor("lm_head_ids").tolist()))
+        tmp = model_dir.with_name(model_dir.name + ".vllm")
+        hfmoe.save_like(model, tok, Path(cfg["blackhole_source"]), tmp)
+        del model
+        free()
+        serve_dir = tmp
+    texts = [tok.apply_chat_template(prompt(p), tokenize=False, add_generation_prompt=True) for p in probs]
+    enc = [tok(t, add_special_tokens=False).input_ids for t in texts]
+    print(f"bench: vLLM, temperature {temp}, top_p {top_p}, top_k {top_k}, up to {max_tokens} tokens"
+          + (f", {len(allowed)} output tokens allowed" if allowed else ""), flush=True)
+
+    def on_line(line):
+        if line.startswith("vllm_gen: done"):
+            a, b = line.split()[-1].split("/")
+            emit(stage, pct[0] + (pct[1] - pct[0]) * int(a) / int(b), f"{a}/{b} solutions written (vLLM)")
+    ans = hfmoe.vllm_generate(serve_dir, enc, max_tokens, temp, top_p, top_k, eos, allowed, on_line)
+    if tmp is not None:
+        shutil.rmtree(tmp, ignore_errors=True)
+    replies = []
+    for r in ans:
+        cut = next((k for k, t in enumerate(r) if t in eos), len(r))
+        text = tok.decode(r[:cut], skip_special_tokens=False).rsplit("</think>", 1)[-1]
+        for t in tok.all_special_tokens:
+            text = text.replace(t, "")
+        replies.append(text)
+    return replies, temp, sum(len(r) for r in ans), len(enc)
+
+
 def run(model_dir: Path, out: Path, release: str, file: str | None, limit: int, max_tokens: int, batch: int,
         stage: str | None = None, pct: tuple = (0, 100), label: str = "") -> dict:
     from blackhole_pipeline import serve
@@ -293,12 +358,21 @@ def run(model_dir: Path, out: Path, release: str, file: str | None, limit: int, 
         raise RuntimeError("no problems loaded")
     emit(stage, pct[0], f"{label}: loading {model_dir.name} for {len(probs)} problems")
     import torch
-    model, tok = serve.load(model_dir, "cuda" if torch.cuda.is_available() else "cpu")
-    t0 = time.time()
+
+    from blackhole_pipeline import hfmoe
     span = pct[1] - pct[0]
-    replies, temp, ntok, batch = generate(model, tok, probs, max_tokens, batch, stage, (pct[0] + 0.03 * span, pct[0] + 0.9 * span))
+    cfg = json.loads((model_dir / "config.json").read_text())
+    if cfg.get("model_type") != "flint" and hfmoe.can_vllm():
+        t0 = time.time()
+        replies, temp, ntok, batch = generate_vllm(model_dir, cfg, probs, max_tokens, stage,
+                                                   (pct[0] + 0.03 * span, pct[0] + 0.9 * span))
+    else:
+        model, tok = serve.load(model_dir, "cuda" if torch.cuda.is_available() else "cpu")
+        t0 = time.time()
+        replies, temp, ntok, batch = generate(model, tok, probs, max_tokens, batch, stage,
+                                              (pct[0] + 0.03 * span, pct[0] + 0.9 * span))
+        del model
     gen_s = time.time() - t0
-    del model
     from reaper_pipeline.load import free
     free()
     emit(stage, pct[0] + 0.9 * span, f"{label}: running tests on {os.cpu_count()} CPUs")

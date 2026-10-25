@@ -171,6 +171,30 @@ SCHEMAS = [
            quant="mlx-3bit", tags=("mac", "code", "moe", "lab", "reaq", "distill"),
            stage_list=("detect", "plan", "weights", "calibrate", "score", "prune", "eval", "heal", "mlx", "qheal", "bench",
                        "package")),
+    Schema("qwen-mac-qhex", "REAP/Q-HEX Mac coder (Qwen3.6)", "blackhole", "The REAP/Q-HEX-distillation recipe "
+           "for Qwen3.6-35B-A3B (or another Qwen3.5 / 3.6 MoE) on a 16 GB Apple-silicon Mac (~10.3 GB, 50-60 tok/s "
+           "target): REAP drops 31.25% of routed experts on code (256 -> 176 per layer; 25% would be ~11 GB, too "
+           "close to the Mac's 12 GB GPU limit); distillation on the teacher's SHORTEST VERIFIED reasoning "
+           "(code_contests problems solved 3x in vLLM, answers run against the tests, the shortest pass kept), "
+           "experts learning through low-rank updates, every layer and router matched to the teacher; two "
+           "on-policy rounds (the student writes in vLLM, the teacher grades); MLX export with HEX experts (REAQ "
+           "tiers: top 10% by REAP 16-level tables, rest 8-level), GPTQ attention (q/o 3-bit), an output-only "
+           "vocab trim to the 64k tokens the teacher writes (of 248k); finally a heal around the quantized model. "
+           "Needs vLLM (setup-vm.sh installs it in ~/vllm-venv) and flash-linear-attention.",
+           (Step("reap", "drop 31.25% of routed experts, calibrated on code", {"prune": 0.3125, "calib": "code"}),
+            Step("heal", "shortest verified traces + on-policy distillation, layer and router matching",
+                 {"heal_calib": "contest", "heal_samples": 3, "heal_prompts": 768, "heal_max_tokens": 16384,
+                  "heal_seq": 18432, "heal_expert_rank": 16, "heal_layer_weight": 1.0, "heal_router_weight": 0.5,
+                  "heal_minutes": 150, "heal_opd_rounds": 2, "heal_opd_prompts": 256, "heal_opd_minutes": 90}),
+            Step("mlx", "MLX: HEX experts, REAQ tiers (top 10% 16-level, rest 8-level), GPTQ attention q/o 3-bit, "
+                 "64k output vocab",
+                 {"mlx_hex": 1, "mlx_bits": 3, "mlx_group": 128, "mlx_hot": 0.10, "mlx_hot_bits": 4, "mlx_attn_gptq": 1,
+                  "mlx_qo_bits": 3, "mlx_head_bits": 4, "mlx_embed_bits": 3, "mlx_head_vocab": 65536,
+                  "bench_models": "original,mlx"}),
+            Step("qheal", "distil again around the quantized model", {"qheal_minutes": 45})),
+           quant="mlx-3bit", tags=("mac", "code", "moe", "lab", "reaq", "distill", "qwen"),
+           stage_list=("detect", "plan", "weights", "calibrate", "score", "prune", "eval", "heal", "mlx", "qheal", "bench",
+                       "package")),
     Schema("reap-classic", "REAP classic", "blackhole", "REAPer's pipeline: prune experts by router-weighted "
            "activation on purpose-built calibration data, then store experts in fp8.",
            (Step("reap", "drop 50% of routed experts per layer", {"prune": 0.5}),), quant="fp8",

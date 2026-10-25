@@ -11,7 +11,8 @@ Output-only vocab trim (`mlx_head_vocab` = K > 0): the LM head keeps only K rows
 teacher actually writes (its distillation answers and calibration answers first, then the lowest
 ids, the tokenizer's most common merges); the model still reads every token, and the rest get
 -inf logits. Fewer head rows are both a smaller file and less memory read per generated token. The quantized model is compared with the teacher (KL / top-1) and written
-with flint_mlx.py, so `mlx_lm.server --model DIR --trust-remote-code` serves it.
+with its model file (flint_mlx.py for Flint, qwen_mlx.py for Qwen3.5 / 3.6 MoE; mlx_layout.py has
+the names), so `mlx_lm.server --model DIR --trust-remote-code` serves it.
 Writes work/mlx.json and out/<name>-MLX-<size>/.
 """
 
@@ -26,7 +27,6 @@ from blackhole_pipeline.common import Pruned, emit, gib, stage_main
 
 STAGE = "mlx"
 HEX_BLOCK = 32
-MODEL_FILE = Path(__file__).resolve().parents[1] / "mlx" / "flint_mlx.py"
 
 
 def gptq_fmt(bits: int, group: int) -> str:
@@ -105,6 +105,7 @@ def run(bh, rj) -> None:
     from gptq import gptq_table
     from headers import header_parts
 
+    from blackhole_pipeline.mlx_layout import MLX_DIR, layout_for
     from blackhole_pipeline.pack import block_codes, codebook_dequant, expert_scale, pack_nibbles, table_indices
 
     p = bh.params
@@ -115,8 +116,7 @@ def run(bh, rj) -> None:
     emit(STAGE, pct=1, msg=f"loading {src.name}")
     m = Pruned(rj, p["gptq_calib"], src=src)
     cfg = json.loads((src / "config.json").read_text())
-    if cfg.get("model_type") != "flint":
-        raise RuntimeError(f"MLX export is written for Flint; this model is {cfg.get('model_type')!r}")
+    lay = layout_for(cfg)   # Flint (flint_mlx.py) or Qwen3.5 / 3.6 MoE (qwen_mlx.py): names and layouts in the folder
     dtype = torch.bfloat16
     sal = {}
     if hot_share > 0:
@@ -151,7 +151,7 @@ def run(bh, rj) -> None:
                 n_hot = int(round(E * hot_share))
             else:
                 order, n_hot = list(range(E)), 0
-            prefix = f"model.layers.{blk.layer}.mlp"
+            prefix = lay.to_mlx(f"model.layers.{blk.layer}.mlp")
             for name, js, nb in (("experts_hot", order[:n_hot], hot_bits), ("experts", order[n_hot:], bits)):
                 if not js:
                     continue
@@ -206,7 +206,9 @@ def run(bh, rj) -> None:
         free()
 
     expert_mods = {n for per in m.names.values() for e in per for n in e.values()}
-    lin = [n for n, mod in m.model.named_modules() if isinstance(mod, torch.nn.Linear) and n not in expert_mods]
+    # small gates (Qwen's shared-expert gate, linear attention's a / b projections) stay bf16
+    lin = [n for n, mod in m.model.named_modules() if isinstance(mod, torch.nn.Linear) and n not in expert_mods
+           and mod.out_features >= 64]
     head_ids = None
     if p["mlx_head_vocab"] and "lm_head" in lin and p["mlx_head_vocab"] < m.model.lm_head.out_features:
         from reaper_pipeline.load import load_tokenizer
@@ -247,22 +249,23 @@ def run(bh, rj) -> None:
                 mod.weight.copy_(full)
             else:
                 mod.weight.copy_(deq)
-            put_q(name, u, s_, b, nb, "rest")
+            put_q(lay.to_mlx(name), u, s_, b, nb, "rest")
         del Hs
         for name, mod in m.model.named_modules():
             if isinstance(mod, torch.nn.Embedding):
                 u, s_, b = mlx_rtn(mod.weight, p["mlx_embed_bits"], group, dtype)
                 mod.weight.copy_(mlx_dequant(u, s_, b, group).to(mod.weight.dtype))
-                put_q(name, u, s_, b, p["mlx_embed_bits"], "rest")
+                put_q(lay.to_mlx(name), u, s_, b, p["mlx_embed_bits"], "rest")
         if head_ids is not None:
             out["lm_head_ids"] = torch.tensor(head_ids, dtype=torch.int32)
             mask_head(m.model, head_ids)
         for name, prm in m.model.named_parameters():  # routers (done above), norms, sinks: unquantized
             mod_name = name.rsplit(".", 1)[0]
-            if name in out or mod_name in quant or mod_name in expert_mods:
+            if lay.to_mlx(name) in out or lay.to_mlx(mod_name) in quant or mod_name in expert_mods:
                 continue
-            t = prm.detach().to(torch.float32 if name.endswith("softmax_offset") else dtype).cpu()
-            out[name] = t
+            t = prm.detach().to(torch.float32 if name.endswith(("softmax_offset", "A_log")) else dtype).cpu()
+            t = lay.tensor_to_mlx(name, t)
+            out[lay.to_mlx(name)] = t
             nbytes["rest"] += t.numel() * t.element_size()
 
     emit(STAGE, pct=80, msg="MLX model vs teacher on held-out answers")
@@ -301,15 +304,27 @@ def run(bh, rj) -> None:
                 or f.name in ("model.safetensors.index.json", "config.json", "README.md"):
             continue
         shutil.copy2(f, tmp / f.name)
-    shutil.copy2(MODEL_FILE, tmp / MODEL_FILE.name)
+    for f in lay.files:
+        shutil.copy2(MLX_DIR / f, tmp / f)
     if hexcfg:
-        shutil.copy2(MODEL_FILE.with_name("hex_check.py"), tmp / "hex_check.py")
+        shutil.copy2(MLX_DIR / "hex_check.py", tmp / "hex_check.py")
     cfg.pop("quantization_config", None)
+    tc = cfg.get("text_config")
+    if isinstance(tc, dict):   # Qwen3.5 / 3.6: what mlx-lm's text model reads
+        tc.pop("quantization_config", None)
+        types_ = tc.get("layer_types") or []
+        full = [i for i, t in enumerate(types_) if t == "full_attention"]
+        if full:
+            iv = full[0] + 1
+            if [i for i in range(len(types_)) if (i + 1) % iv == 0] != full:
+                raise RuntimeError("mlx-lm's Qwen3.5 needs full attention every n-th layer; this model mixes them otherwise")
+            tc["full_attention_interval"] = iv
+        tc.setdefault("norm_topk_prob", True)   # transformers' Qwen3.5 router always renormalizes the top k
     if head_ids is not None:
         cfg["head_vocab"] = len(head_ids)
     if hexcfg:
         cfg["hex"] = hexcfg
-    cfg.update({"model_file": MODEL_FILE.name, "expert_tiers": tiers,
+    cfg.update({"model_file": lay.model_file, "expert_tiers": tiers, "blackhole_source": str(src),
                 "quantization": {"group_size": group, "bits": bits, **quant}})
     (tmp / "config.json").write_text(json.dumps(cfg, indent=2) + "\n")
     shutil.rmtree(dst, ignore_errors=True)

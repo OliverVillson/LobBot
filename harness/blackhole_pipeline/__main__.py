@@ -273,6 +273,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--job", required=True, help="TUI job directory (holds config.json)")
     ap.add_argument("--from", dest="start", choices=STAGES, help="rerun from this stage onward")
     a = ap.parse_args(argv)
+    venv = Path.home() / "vllm-venv" / "bin" / "python"   # setup-vllm.sh: vLLM in its own venv
+    if venv.exists() and not os.environ.get("BLACKHOLE_NO_VLLM"):
+        os.environ.setdefault("REAPER_VLLM_PY", str(venv))
+        os.environ.setdefault("BLACKHOLE_VLLM_PY", str(venv))
     bh = BHJob(a.job)
     (bh.root / "pid").write_text(str(os.getpid()))
     signal.signal(signal.SIGTERM, _stop)

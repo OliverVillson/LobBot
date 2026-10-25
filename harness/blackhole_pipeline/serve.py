@@ -33,8 +33,9 @@ THINK_RE = re.compile(r"^\s*<think>(.*?)</think>\s*", re.S)
 
 
 def _quant_method(path: Path) -> str:
+    from blackhole_pipeline.mlx_layout import layout_of_folder
     cfg = json.loads((path / "config.json").read_text())
-    if cfg.get("model_file") == "flint_mlx.py":
+    if layout_of_folder(cfg) is not None:
         return "mlx"
     return str((cfg.get("quantization_config") or {}).get("quant_method", "")).lower()
 
@@ -83,14 +84,17 @@ def _unpacked_state(path: Path, dtype):
 
 
 def _mlx_state(path: Path, dtype):
-    """bf16 tensors (Hugging Face Flint names) of a BlackHole MLX folder: quantized modules are
-    dequantized, the stacked hot/cold expert tensors split back into one module per expert (the
-    router rows are already in the stacked order)."""
+    """bf16 tensors (the PyTorch model's names) of a BlackHole MLX folder: quantized modules are
+    dequantized, names and layouts go back through mlx_layout, and the stacked hot/cold expert
+    tensors become one module per expert (Flint) or the fused [E, ...] tensors (Qwen3.5 / 3.6),
+    hot tier first (the router rows are already in that order)."""
     import torch
     from safetensors.torch import load_file
 
+    from blackhole_pipeline.mlx_layout import layout_of_folder
     from blackhole_pipeline.pack import mlx_dequant, mlx_unpack
     cfg = json.loads((path / "config.json").read_text())
+    lay = layout_of_folder(cfg)
     q = cfg.get("quantization") or {}
     tiers = {int(k): v for k, v in (cfg.get("expert_tiers") or {}).items()}
     raw = {}
@@ -117,23 +121,34 @@ def _mlx_state(path: Path, dtype):
         spec = q.get(mod, {"bits": q.get("bits", 4), "group_size": q.get("group_size", 64)})
         u = mlx_unpack(raw.pop(k), spec["bits"])
         raw[k] = mlx_dequant(u, raw.pop(f"{mod}.scales"), raw.pop(f"{mod}.biases"), spec["group_size"]).to(dtype)
+    raw = {lay.to_hf(k): lay.tensor_to_hf(lay.to_hf(k), v) for k, v in raw.items()}
     ids = raw.pop("lm_head_ids", None)
     if ids is not None:  # output-trimmed LM head: back to full size, the dropped rows zero (see mask_head)
         ids = ids.to(torch.long)
         W = raw["lm_head.weight"]
-        full = torch.zeros(cfg["vocab_size"], W.shape[1], dtype=W.dtype)
+        vocab = cfg.get("vocab_size") or cfg["text_config"]["vocab_size"]
+        full = torch.zeros(vocab, W.shape[1], dtype=W.dtype)
         full[ids] = W
         raw["lm_head.weight"] = full
         out["lm_head_ids"] = ids
+    fused = {}
     for k, v in raw.items():
         m = re.match(r"model\.layers\.(\d+)\.mlp\.(experts_hot|experts)\.(gate_proj|up_proj|down_proj)\.weight$", k)
         if not m:
-            out[k] = v.to(dtype) if v.is_floating_point() and not k.endswith("softmax_offset") else v
+            out[k] = v.to(dtype) if v.is_floating_point() and not k.endswith(("softmax_offset", "A_log")) else v
             continue
         layer, tier, name = int(m.group(1)), m.group(2), m.group(3)
+        if lay.fused_experts:
+            fused.setdefault(layer, {})[(tier, name)] = v.to(dtype)
+            continue
         base = 0 if tier == "experts_hot" else tiers.get(layer, 0)
         for j in range(v.shape[0]):
             out[f"model.layers.{layer}.mlp.experts.{base + j}.{name}.weight"] = v[j].to(dtype)
+    for layer, t in fused.items():   # [E, 2I, H] gate+up and [E, H, I] down, hot tier first
+        tiers_ = [x for x in ("experts_hot", "experts") if (x, "gate_proj") in t]
+        out[f"model.layers.{layer}.mlp.experts.gate_up_proj"] = torch.cat(
+            [torch.cat([t[(x, "gate_proj")], t[(x, "up_proj")]], 1) for x in tiers_])
+        out[f"model.layers.{layer}.mlp.experts.down_proj"] = torch.cat([t[(x, "down_proj")] for x in tiers_])
     return out
 
 
@@ -169,7 +184,8 @@ def load(path: Path, device: str):
     dtype = torch.bfloat16 if device == "cuda" else torch.float32
     cfg = AutoConfig.from_pretrained(path)
     for c in (cfg, getattr(cfg, "text_config", None)):
-        for a in ("quantization_config", "quantization", "model_file", "expert_tiers", "head_vocab"):
+        for a in ("quantization_config", "quantization", "model_file", "expert_tiers", "head_vocab", "hex",
+                  "blackhole_source"):
             if c is not None and hasattr(c, a):
                 delattr(c, a)
     try:
