@@ -187,9 +187,9 @@ SCHEMAS = [
                   "heal_seq": 18432, "heal_expert_rank": 16, "heal_layer_weight": 1.0, "heal_router_weight": 0.5,
                   "heal_minutes": 150, "heal_opd_rounds": 2, "heal_opd_prompts": 256, "heal_opd_minutes": 90}),
             Step("mlx", "MLX: HEX experts, REAQ tiers (top 10% 16-level, rest 8-level), GPTQ attention q/o 3-bit, "
-                 "64k output vocab",
+                 "full output vocab",
                  {"mlx_hex": 1, "mlx_bits": 3, "mlx_group": 128, "mlx_hot": 0.10, "mlx_hot_bits": 4, "mlx_attn_gptq": 1,
-                  "mlx_qo_bits": 3, "mlx_head_bits": 4, "mlx_embed_bits": 3, "mlx_head_vocab": 65536,
+                  "mlx_qo_bits": 3, "mlx_head_bits": 4, "mlx_embed_bits": 3, "mlx_head_vocab": 0,
                   "bench_models": "original,mlx"}),
             Step("qheal", "distil again around the quantized model", {"qheal_minutes": 45})),
            quant="mlx-3bit", tags=("mac", "code", "moe", "lab", "reaq", "distill", "qwen"),

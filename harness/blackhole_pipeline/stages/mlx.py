@@ -258,7 +258,6 @@ def run(bh, rj) -> None:
                 put_q(lay.to_mlx(name), u, s_, b, p["mlx_embed_bits"], "rest")
         if head_ids is not None:
             out["lm_head_ids"] = torch.tensor(head_ids, dtype=torch.int32)
-            mask_head(m.model, head_ids)
         for name, prm in m.model.named_parameters():  # routers (done above), norms, sinks: unquantized
             mod_name = name.rsplit(".", 1)[0]
             if lay.to_mlx(name) in out or lay.to_mlx(mod_name) in quant or mod_name in expert_mods:
@@ -269,7 +268,11 @@ def run(bh, rj) -> None:
             nbytes["rest"] += t.numel() * t.element_size()
 
     emit(STAGE, pct=80, msg="MLX model vs teacher on held-out answers")
-    r = m.compare(lambda i, n: emit(STAGE, pct=80 + 12 * i / n, msg=f"held-out {i}/{n} vs teacher"))
+    r = m.compare(lambda i, n: emit(STAGE, pct=80 + 6 * i / n, msg=f"held-out {i}/{n} vs teacher, full vocab"))
+    r_full = r
+    if head_ids is not None:   # the trim scored apart: a trimmed teacher top-20 token alone inflates KL
+        mask_head(m.model, head_ids)
+        r = m.compare(lambda i, n: emit(STAGE, pct=86 + 6 * i / n, msg=f"held-out {i}/{n} vs teacher, trimmed vocab"))
     expert_params = m.params
     del m
     free()
@@ -346,6 +349,8 @@ def run(bh, rj) -> None:
            f" {p['mlx_attn_bits']}-bit" + (f", q/o {p['mlx_qo_bits']}-bit" if p["mlx_qo_bits"] else ""),
            "head_vocab": len(head_ids) if head_ids is not None else None}
     if r:
+        if head_ids is not None:
+            res.update(kl_full_vocab=round(r_full["kl"], 4), top1_full_vocab=round(r_full["top1_agreement"], 4))
         res.update(top1=round(r["top1_agreement"], 4), kl=round(r["kl"], 4), ppl_teacher=round(r["ppl_teacher"], 3),
                    ppl_student=round(r["ppl_pruned"], 3))
     rj.write("work/mlx.json", res)
@@ -353,6 +358,8 @@ def run(bh, rj) -> None:
     msg = f"MLX {res['size_gb']:.1f} GB (experts {res['expert_gb']:.1f} GB)"
     if r:
         msg += f" · KL {res['kl']:.3f} · top-1 {res['top1']:.0%}"
+        if "kl_full_vocab" in res:
+            msg += f" (full vocab KL {res['kl_full_vocab']:.3f})"
     emit(STAGE, "done", 100, msg, **{k: res[k] for k in ("kl", "top1", "size_gb", "expert_gb") if k in res})
 
 
