@@ -36,13 +36,13 @@ def run(bh, rj) -> None:
             slug = "".join(c if c.isalnum() or c in "-." else "-" for c in str(bh.config["model"]))[-80:]
             out = home() / "bench" / f"{slug}-{p['bench']}-{p['bench_max_tokens']}-{p['bench_limit']}"
         old = json.loads((out / "summary.json").read_text()) if (out / "summary.json").exists() else {}
-        if old.get("max_tokens") != p["bench_max_tokens"] or (label != "original" and old.get("model") != str(path)):
+        if old.get("max_tokens") != p["bench_max_tokens"] or (p["bench_budgets"] and "budgets" not in old) or (label != "original" and old.get("model") != str(path)):
             # missing, run with another token limit, or the model folder changed (qheal)
             if not (path / "config.json").exists():
                 raise RuntimeError(f"no model to bench in {path}")
             cmd = [sys.executable, "-u", "-m", "blackhole_pipeline.bench", "--model", str(path), "--out", str(out),
                    "--release", release, "--max-tokens", str(p["bench_max_tokens"]), "--stage", STAGE,
-                   "--pct", f"{100 * i / len(models)},{100 * (i + 1) / len(models)}", "--label", label]
+                   "--pct", f"{100 * i / len(models)},{100 * (i + 1) / len(models)}", "--label", label, "--budgets", p["bench_budgets"]]
             if p["bench_limit"]:
                 cmd += ["--limit", str(p["bench_limit"])]
             if p["bench_file"]:
@@ -54,6 +54,9 @@ def run(bh, rj) -> None:
         s = res[label]
         print(f"bench: {label} pass@1 {s['pass@1']:.1%} ({s['problems']} problems, {s['bench']}), "
               f"{s.get('tok_s', 0):.0f} tok/s", flush=True)
+        if s.get("budgets"):
+            print(f"bench: {label} thinking budgets " + " · ".join(f"{b} tokens {v['pass@1']:.1%}" for b, v in
+                                                                s["budgets"].items()), flush=True)
     first = res[models[0][0]]
     summary = {"bench": first["bench"], "problems": first["problems"], "runs": res,
                **{m: r["pass@1"] for m, r in res.items()}, "tok_s": {m: r.get("tok_s") for m, r in res.items()}}
@@ -65,6 +68,9 @@ def run(bh, rj) -> None:
     rj.mark_done(STAGE, {k: v for k, v in summary.items() if k != "runs"})
     msg = f"{summary['bench']} pass@1: " + " · ".join(f"{m} {r['pass@1']:.1%}" for m, r in res.items()) \
         + f" on {summary['problems']} problems"
+    last = res[models[-1][0]]
+    if last.get("budgets"):
+        msg += " · thinking budget " + ", ".join(f"{int(b) // 1024}k {v['pass@1']:.1%}" for b, v in last["budgets"].items())
     emit(STAGE, "done", 100, msg, problems=summary["problems"], **{f"lcb_{m}": r["pass@1"] for m, r in res.items()})
 
 

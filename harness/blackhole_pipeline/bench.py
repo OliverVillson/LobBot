@@ -295,10 +295,20 @@ def sampling(gc) -> tuple[float, float, int]:
     return temp, top_p, top_k
 
 
-def generate_vllm(model_dir: Path, cfg: dict, probs: list[dict], max_tokens: int, stage: str | None, pct: tuple):
+FORCE_ANSWER = "\n\nConsidering the limited time by the user, I have to give the solution based on the thinking directly now.\n</think>\n\n"
+ANSWER_TOKENS = 4096   # the answer written after a thinking budget ran out
+
+
+def generate_vllm(model_dir: Path, cfg: dict, probs: list[dict], max_tokens: int, stage: str | None, pct: tuple,
+                  budgets: tuple = ()):
     """vLLM in its own process (models that run on transformers' code, e.g. Qwen3.5 / 3.6). A
     BlackHole MLX folder is benched as exactly its weights: dequantized into a checkpoint in the
-    layout of the model it came from, its output-only vocab trim as vLLM's allowed tokens."""
+    layout of the model it came from, its output-only vocab trim as vLLM's allowed tokens.
+
+    Thinking budgets (budget forcing): for each budget B, an answer still thinking after B tokens
+    is cut there, told to answer now and closes its thinking (Qwen's own wording), then writes
+    up to ANSWER_TOKENS; answers that finished thinking within B stay as they are. Returns the
+    replies per budget too ({B: replies}) and each answer's thinking length (None: never closed)."""
     import shutil
 
     import torch
@@ -338,20 +348,35 @@ def generate_vllm(model_dir: Path, cfg: dict, probs: list[dict], max_tokens: int
             a, b = line.split()[-1].split("/")
             emit(stage, pct[0] + (pct[1] - pct[0]) * int(a) / int(b), f"{a}/{b} solutions written (vLLM)")
     ans = hfmoe.vllm_generate(serve_dir, enc, max_tokens, temp, top_p, top_k, eos, allowed, on_line)
-    if tmp is not None:
-        shutil.rmtree(tmp, ignore_errors=True)
-    replies = []
-    for r in ans:
+
+    def reply(r):
         cut = next((k for k, t in enumerate(r) if t in eos), len(r))
         text = tok.decode(r[:cut], skip_special_tokens=False).rsplit("</think>", 1)[-1]
         for t in tok.all_special_tokens:
             text = text.replace(t, "")
-        replies.append(text)
-    return replies, temp, sum(len(r) for r in ans), len(enc)
+        return text
+    replies = [reply(r) for r in ans]
+    end = tok.get_vocab().get("</think>")   # None: not a thinking model
+    think = [r.index(end) if end in r else None for r in ans] if end is not None else []
+    by_budget = {}
+    budgets = [b for b in budgets if b < max_tokens]
+    if budgets and end is not None:
+        force = tok(FORCE_ANSWER, add_special_tokens=False).input_ids
+        jobs = [(b, i) for b in budgets for i, n in enumerate(think) if n is None or n > b]
+        emit(stage, pct[1], f"thinking budgets {', '.join(map(str, budgets))}: {len(jobs)} answers cut and finished")
+        forced = hfmoe.vllm_generate(serve_dir, [enc[i] + ans[i][:b] + force for b, i in jobs], ANSWER_TOKENS, temp,
+                                     top_p, top_k, eos, allowed) if jobs else []
+        for b in budgets:
+            by_budget[b] = list(replies)
+        for (b, i), r in zip(jobs, forced):
+            by_budget[b][i] = reply(r)
+    if tmp is not None:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return replies, temp, sum(len(r) for r in ans), len(enc), by_budget, think
 
 
 def run(model_dir: Path, out: Path, release: str, file: str | None, limit: int, max_tokens: int, batch: int,
-        stage: str | None = None, pct: tuple = (0, 100), label: str = "") -> dict:
+        stage: str | None = None, pct: tuple = (0, 100), label: str = "", budgets: tuple = ()) -> dict:
     from blackhole_pipeline import serve
     out.mkdir(parents=True, exist_ok=True)
     probs = load_problems(release, file, limit)
@@ -365,13 +390,14 @@ def run(model_dir: Path, out: Path, release: str, file: str | None, limit: int, 
     cfg = json.loads((model_dir / "config.json").read_text())
     if cfg.get("model_type") != "flint" and hfmoe.can_vllm():
         t0 = time.time()
-        replies, temp, ntok, batch = generate_vllm(model_dir, cfg, probs, max_tokens, stage,
-                                                   (pct[0] + 0.03 * span, pct[0] + 0.9 * span))
+        replies, temp, ntok, batch, by_budget, think = generate_vllm(
+            model_dir, cfg, probs, max_tokens, stage, (pct[0] + 0.03 * span, pct[0] + 0.85 * span), budgets)
     else:
         model, tok = serve.load(model_dir, "cuda" if torch.cuda.is_available() else "cpu")
         t0 = time.time()
         replies, temp, ntok, batch = generate(model, tok, probs, max_tokens, batch, stage,
                                               (pct[0] + 0.03 * span, pct[0] + 0.9 * span))
+        by_budget, think = {}, []
         del model
     gen_s = time.time() - t0
     from reaper_pipeline.load import free
@@ -395,6 +421,25 @@ def run(model_dir: Path, out: Path, release: str, file: str | None, limit: int, 
                "no_code": sum(1 for c in codes if not c.strip()), "max_tokens": max_tokens, "temperature": temp,
                "gen_s": round(gen_s, 1), "tokens": ntok, "tok_s": round(ntok / gen_s, 1),
                "batch": batch, "dates": [rows[0]["date"], rows[-1]["date"]]}
+    if think:
+        done = sorted(n for n in think if n is not None)
+        summary["thinking"] = {"median": done[len(done) // 2] if done else None, "mean": round(sum(done) / len(done))
+                               if done else None, "never_closed": sum(1 for n in think if n is None)}
+    if by_budget:   # budget forcing: only the answers cut at a budget are tested again
+        emit(stage, pct[0] + 0.95 * span, f"{label}: testing the thinking budgets")
+        summary["budgets"] = {}
+        for b, reps in by_budget.items():
+            changed = [i for i, n in enumerate(think) if n is None or n > int(b)]
+            got = {i: run_problem(probs[i], extract_code(reps[i])) for i in changed} if len(changed) < 2 else {}
+            if len(changed) >= 2:
+                with ThreadPoolExecutor(max(1, (os.cpu_count() or 4) - 1)) as ex:
+                    got = dict(zip(changed, ex.map(lambda i: run_problem(probs[i], extract_code(reps[i])), changed)))
+            passed = [got[i]["passed"] if i in got else rows[i]["passed"] for i in range(len(rows))]
+            summary["budgets"][str(b)] = {"pass@1": round(sum(passed) / len(rows), 4), "cut": len(changed)}
+            with open(out / f"samples-think{b}.jsonl", "w") as f:
+                for i in changed:
+                    f.write(json.dumps({"id": rows[i]["id"], "passed": got[i]["passed"], "why": got[i]["why"],
+                                        "reply": reps[i]}) + "\n")
     (out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     return summary
 
@@ -406,11 +451,12 @@ def main(argv=None) -> int:
     ap.add_argument("--release", default="v6")
     ap.add_argument("--file", default=None)
     ap.add_argument("--limit", type=int, default=0)
-    ap.add_argument("--max-tokens", type=int, default=32768)
+    ap.add_argument("--max-tokens", type=int, default=65536)
     ap.add_argument("--batch", type=int, default=int(os.environ.get("BLACKHOLE_BENCH_BATCH", "256")))
     ap.add_argument("--stage", default=None, help="emit TUI progress events as this stage")
     ap.add_argument("--pct", default="0,100")
     ap.add_argument("--label", default="")
+    ap.add_argument("--budgets", default="", help="thinking budgets to score too, e.g. 8192,16384")
     a = ap.parse_args(argv)
     lo, hi = (float(x) for x in a.pct.split(","))
     model = Path(a.model).expanduser()
@@ -418,7 +464,7 @@ def main(argv=None) -> int:
         from huggingface_hub import snapshot_download
         model = Path(snapshot_download(a.model))
     s = run(model.resolve(), Path(a.out), a.release, a.file, a.limit, a.max_tokens, a.batch,
-            a.stage, (lo, hi), a.label or Path(a.model).name)
+            a.stage, (lo, hi), a.label or Path(a.model).name, tuple(int(b) for b in a.budgets.split(",") if b))
     print(json.dumps(s), flush=True)
     return 0
 

@@ -90,6 +90,7 @@ DEFAULTS = {
     "bench_models": "original,reaq",  # any of original, int4, reaq, mlx
     "bench_limit": 0,        # 0 = every problem of the release
     "bench_max_tokens": 65536,  # reasoning models think for tens of thousands of tokens (Qwen3.6: 32k cut 38% off)
+    "bench_budgets": "8192,16384,32768",  # thinking budgets also scored (budget forcing, vLLM only); "" = none
     "bench_file": "",        # a local jsonl in LiveCodeBench's format instead of the download
 }
 
