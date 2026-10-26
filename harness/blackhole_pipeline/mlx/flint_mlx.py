@@ -215,53 +215,57 @@ _HEX_DEQUANT = """
 HEX_SG, HEX_RPS = 4, 4
 
 # Prompt processing straight from HEX (tiled grouped matmul): rows ((token, slot) pairs) arrive
-# sorted by expert; one threadgroup computes a 32 x 32 output tile. Per 32-wide K block (one HEX
-# block: one fp8 scale per row) it dequantizes the expert's 32 x 32 weight tile into threadgroup
+# sorted by expert; one threadgroup computes a 32 x 64 output tile. Per 32-wide K block (one HEX
+# block: one fp8 scale per row) it dequantizes the expert's 64 x 32 weight tile into threadgroup
 # memory, each weight once per tile and never into device memory, and multiplies with 8 x 8
-# simdgroup matrices (4 simdgroups, a 16 x 16 quarter each). A tile whose rows span several
+# simdgroup matrices (4 simdgroups, a 16 x 32 quarter each). A tile whose rows span several
 # experts runs once per expert with the other experts' rows masked to zero.
 _HEX_GMM_HEADER = _HEX_HEADER + "#include <metal_simdgroup_matrix>\n"
+HEX_GMM_BN = 64
 
 
 def _hex_gmm_source(glu: bool) -> str:
     sets = ("", "2") if glu else ("",)
     decl = "".join(f"""
     threadgroup float ws{s}[BK * BN];
-    simdgroup_float8x8 acc{s}[2][2];
-    for (uint i = 0; i < 2; i++) for (uint j = 0; j < 2; j++) acc{s}[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);""" for s in sets)
+    threadgroup float tlv{s}[1u << BITS];
+    simdgroup_float8x8 acc{s}[2][4];
+    for (uint i = 0; i < 2; i++) for (uint j = 0; j < 4; j++) acc{s}[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);""" for s in sets)
+    tables = "".join(f"""
+        if (tid < (1u << BITS)) tlv{s}[tid] = levels{s}[e * (1u << BITS) + tid];
+        float es{s} = expert_scale{s}[e];""" for s in sets)
     deq = "".join(f"""
             {{
                 ulong b = ((ulong)e * OUT + n0 + dn) * NBLK + kb;
-                float sc = hex_fp8(block_scale{s}[b]) * expert_scale{s}[e];
+                float sc = hex_fp8(block_scale{s}[b]) * es{s};
                 const device uint32_t* w = idx{s} + b * BITS;
-                uint off = dq * 8u * BITS, wi = off >> 5;
+                uint off = dh * 16u * BITS, wi = off >> 5;
                 ulong v = (ulong)w[wi];
                 if (wi + 1u < BITS) v |= (ulong)w[wi + 1u] << 32;
                 v >>= (off & 31u);
-                const device float* lv = levels{s} + e * (1u << BITS);
-                for (uint j = 0; j < 8; j++) ws{s}[(dq * 8u + j) * BN + dn] = lv[(uint)(v >> (j * BITS)) & MASK] * sc;
+                for (uint j = 0; j < 16; j++) ws{s}[(dh * 16u + j) * BN + dn] = tlv{s}[(uint)(v >> (j * BITS)) & MASK] * sc;
             }}""" for s in sets)
     mma = "".join(f"""
-                for (uint j = 0; j < 2; j++) simdgroup_load(bm[j], ws{s} + kk * BN + cn + j * 8u, BN);
-                for (uint i = 0; i < 2; i++) for (uint j = 0; j < 2; j++)
+                for (uint j = 0; j < 4; j++) simdgroup_load(bm[j], ws{s} + kk * BN + cn + j * 8u, BN);
+                for (uint i = 0; i < 2; i++) for (uint j = 0; j < 4; j++)
                     simdgroup_multiply_accumulate(acc{s}[i][j], av[i], bm[j], acc{s}[i][j]);""" for s in sets)
-    ys = {"": "xs", "2": "ws2"}
     store = "".join(f"""
-    for (uint i = 0; i < 2; i++) for (uint j = 0; j < 2; j++)
-        simdgroup_store(acc{s}[i][j], {ys[s]} + (rm + i * 8u) * BN + cn + j * 8u, BN);""" for s in sets)
+    for (uint i = 0; i < 2; i++) for (uint j = 0; j < 4; j++)
+        simdgroup_store(acc{s}[i][j], ws{s} + (rm + i * 8u) * BN + cn + j * 8u, BN);""" for s in sets)
     out = "g / (1.0f + metal::exp(-g)) * ws2[i]" if glu else "g"
     return """
-    constexpr uint BM = 32, BN = 32, BK = 32, NBLK = IN / 32;
+    constexpr uint BM = 32, BN = 64, BK = 32, NBLK = IN / 32;
     constexpr uint MASK = (1u << BITS) - 1u;
     uint tid = thread_position_in_threadgroup.x, sg = tid >> 5;
     uint n0 = threadgroup_position_in_grid.x * BN, m0 = threadgroup_position_in_grid.y * BM;
     uint R = sid_shape[0];
     uint mend = min(m0 + BM, R);
-    uint rm = (sg >> 1) * 16u, cn = (sg & 1u) * 16u;
-    uint dn = tid >> 2, dq = tid & 3u;
+    uint rm = (sg >> 1) * 16u, cn = (sg & 1u) * 32u;
+    uint dn = tid >> 1, dh = tid & 1u;
     threadgroup float xs[BM * BK];""" + decl + """
     uint e = sid[m0], elast = sid[mend - 1];
-    while (true) {
+    while (true) {""" + tables + """
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint kb = 0; kb < NBLK; kb++) {
             for (uint i = tid; i < BM * BK; i += 128u) {
                 uint row = m0 + i / BK;
@@ -269,7 +273,7 @@ def _hex_gmm_source(glu: bool) -> str:
             }""" + deq + """
             threadgroup_barrier(mem_flags::mem_threadgroup);
             for (uint kk = 0; kk < BK; kk += 8u) {
-                simdgroup_float8x8 av[2], bm[2];
+                simdgroup_float8x8 av[2], bm[4];
                 for (uint i = 0; i < 2; i++) simdgroup_load(av[i], xs + (rm + i * 8u) * BK + kk, BK);""" + mma + """
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -283,7 +287,7 @@ def _hex_gmm_source(glu: bool) -> str:
     for (uint i = tid; i < BM * BN; i += 128u) {{
         uint row = m0 + i / BN;
         if (row < mend) {{
-            float g = xs[i];
+            float g = ws[i];
             y[(ulong)row * OUT + n0 + i % BN] = static_cast<T>({out});
         }}
     }}
@@ -303,7 +307,7 @@ def _hex_kernel(kind: str):
             names = ["x"] + parts + ([p + "2" for p in parts] if kind == "glu" else []) + ["experts"]
             out, src = ["y"], _hex_source(kind == "glu")
         _HEX_KERNELS[kind] = mx.fast.metal_kernel(
-            name=f"blackhole_hex_{kind}_v3", input_names=names, output_names=out, source=src, header=header)
+            name=f"blackhole_hex_{kind}_v4", input_names=names, output_names=out, source=src, header=header)
     return _HEX_KERNELS[kind]
 
 
@@ -370,7 +374,7 @@ class HexSwitchLinear(nn.Module):
         return _hex_kernel("gmm_glu" if other is not None else "gmm")(
             inputs=[xs, *self.parts(), *(other.parts() if other is not None else []), sid.astype(mx.uint32)],
             template=[("T", xs.dtype), ("BITS", self.bits), ("IN", self.in_dims), ("OUT", self.out_dims)],
-            grid=(128 * (self.out_dims // 32), -(-R // 32), 1), threadgroup=(128, 1, 1),
+            grid=(128 * (self.out_dims // HEX_GMM_BN), -(-R // 32), 1), threadgroup=(128, 1, 1),
             output_shapes=[(R, self.out_dims)], output_dtypes=[xs.dtype])[0]
 
     def dequant(self, dtype=mx.bfloat16):
@@ -434,8 +438,8 @@ class HexSwitchGLU(nn.Module):
         if HexSwitchGLU._tiled is None:
             dims = {self.gate_proj.in_dims, self.gate_proj.out_dims}
             try:
-                if any(d % 32 for d in dims):
-                    raise ValueError(f"dims {sorted(dims)} not multiples of 32")
+                if any(d % HEX_GMM_BN for d in dims):
+                    raise ValueError(f"dims {sorted(dims)} not multiples of {HEX_GMM_BN}")
                 n = min(ids.size, 96)
                 sub = ids[:n]
                 live = sub != HEX_SKIP
