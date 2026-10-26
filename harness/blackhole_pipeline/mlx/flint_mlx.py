@@ -30,6 +30,7 @@ Output-only vocab trim: with `head_vocab` = K the LM head has K rows for the tok
 `lm_head_ids`; logits of every other token are -inf (the model still reads all tokens).
 """
 
+import os
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -120,6 +121,9 @@ class MLP(nn.Module):
 
 
 HEX_BLOCK = 32
+# prompt path: tiled (fused dequant + matmul, no extra memory), dequant (dense copy per layer,
+# ~1 GB transient), matvec (one matrix-vector product per pair: least memory, slowest)
+HEX_PROMPT = os.environ.get("BLACKHOLE_HEX_PROMPT", "tiled")
 HEX_SKIP = 0xFFFFFFFF   # expert id of a (token, slot) another tier serves: output 0, no weights read
 _HEX_KERNELS = {}
 
@@ -210,17 +214,96 @@ _HEX_DEQUANT = """
 
 HEX_SG, HEX_RPS = 4, 4
 
+# Prompt processing straight from HEX (tiled grouped matmul): rows ((token, slot) pairs) arrive
+# sorted by expert; one threadgroup computes a 32 x 32 output tile. Per 32-wide K block (one HEX
+# block: one fp8 scale per row) it dequantizes the expert's 32 x 32 weight tile into threadgroup
+# memory, each weight once per tile and never into device memory, and multiplies with 8 x 8
+# simdgroup matrices (4 simdgroups, a 16 x 16 quarter each). A tile whose rows span several
+# experts runs once per expert with the other experts' rows masked to zero.
+_HEX_GMM_HEADER = _HEX_HEADER + "#include <metal_simdgroup_matrix>\n"
+
+
+def _hex_gmm_source(glu: bool) -> str:
+    sets = ("", "2") if glu else ("",)
+    decl = "".join(f"""
+    threadgroup float ws{s}[BK * BN];
+    simdgroup_float8x8 acc{s}[2][2];
+    for (uint i = 0; i < 2; i++) for (uint j = 0; j < 2; j++) acc{s}[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);""" for s in sets)
+    deq = "".join(f"""
+            {{
+                ulong b = ((ulong)e * OUT + n0 + dn) * NBLK + kb;
+                float sc = hex_fp8(block_scale{s}[b]) * expert_scale{s}[e];
+                const device uint32_t* w = idx{s} + b * BITS;
+                uint off = dq * 8u * BITS, wi = off >> 5;
+                ulong v = (ulong)w[wi];
+                if (wi + 1u < BITS) v |= (ulong)w[wi + 1u] << 32;
+                v >>= (off & 31u);
+                const device float* lv = levels{s} + e * (1u << BITS);
+                for (uint j = 0; j < 8; j++) ws{s}[(dq * 8u + j) * BN + dn] = lv[(uint)(v >> (j * BITS)) & MASK] * sc;
+            }}""" for s in sets)
+    mma = "".join(f"""
+                for (uint j = 0; j < 2; j++) simdgroup_load(bm[j], ws{s} + kk * BN + cn + j * 8u, BN);
+                for (uint i = 0; i < 2; i++) for (uint j = 0; j < 2; j++)
+                    simdgroup_multiply_accumulate(acc{s}[i][j], av[i], bm[j], acc{s}[i][j]);""" for s in sets)
+    ys = {"": "xs", "2": "ws2"}
+    store = "".join(f"""
+    for (uint i = 0; i < 2; i++) for (uint j = 0; j < 2; j++)
+        simdgroup_store(acc{s}[i][j], {ys[s]} + (rm + i * 8u) * BN + cn + j * 8u, BN);""" for s in sets)
+    out = "g / (1.0f + metal::exp(-g)) * ws2[i]" if glu else "g"
+    return """
+    constexpr uint BM = 32, BN = 32, BK = 32, NBLK = IN / 32;
+    constexpr uint MASK = (1u << BITS) - 1u;
+    uint tid = thread_position_in_threadgroup.x, sg = tid >> 5;
+    uint n0 = threadgroup_position_in_grid.x * BN, m0 = threadgroup_position_in_grid.y * BM;
+    uint R = sid_shape[0];
+    uint mend = min(m0 + BM, R);
+    uint rm = (sg >> 1) * 16u, cn = (sg & 1u) * 16u;
+    uint dn = tid >> 2, dq = tid & 3u;
+    threadgroup float xs[BM * BK];""" + decl + """
+    uint e = sid[m0], elast = sid[mend - 1];
+    while (true) {
+        for (uint kb = 0; kb < NBLK; kb++) {
+            for (uint i = tid; i < BM * BK; i += 128u) {
+                uint row = m0 + i / BK;
+                xs[i] = (row < mend && sid[row] == e) ? float(x[(ulong)row * IN + kb * BK + i % BK]) : 0.0f;
+            }""" + deq + """
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint kk = 0; kk < BK; kk += 8u) {
+                simdgroup_float8x8 av[2], bm[2];
+                for (uint i = 0; i < 2; i++) simdgroup_load(av[i], xs + (rm + i * 8u) * BK + kk, BK);""" + mma + """
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (e >= elast) break;
+        uint nx = elast;
+        for (uint m = m0; m < mend; m++) { uint q = sid[m]; if (q > e) { nx = q; break; } }
+        e = nx;
+    }""" + store + f"""
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < BM * BN; i += 128u) {{
+        uint row = m0 + i / BN;
+        if (row < mend) {{
+            float g = xs[i];
+            y[(ulong)row * OUT + n0 + i % BN] = static_cast<T>({out});
+        }}
+    }}
+"""
+
 
 def _hex_kernel(kind: str):
     if kind not in _HEX_KERNELS:
         parts = ["idx", "block_scale", "expert_scale", "levels"]
+        header = _HEX_HEADER
         if kind == "dequant":
             names, out, src = parts, ["w_out"], _HEX_DEQUANT
+        elif kind.startswith("gmm"):
+            names = ["x"] + parts + ([p + "2" for p in parts] if kind == "gmm_glu" else []) + ["sid"]
+            out, src, header = ["y"], _hex_gmm_source(kind == "gmm_glu"), _HEX_GMM_HEADER
         else:
             names = ["x"] + parts + ([p + "2" for p in parts] if kind == "glu" else []) + ["experts"]
             out, src = ["y"], _hex_source(kind == "glu")
         _HEX_KERNELS[kind] = mx.fast.metal_kernel(
-            name=f"blackhole_hex_{kind}_v3", input_names=names, output_names=out, source=src, header=_HEX_HEADER)
+            name=f"blackhole_hex_{kind}_v3", input_names=names, output_names=out, source=src, header=header)
     return _HEX_KERNELS[kind]
 
 
@@ -280,6 +363,16 @@ class HexSwitchLinear(nn.Module):
             grid=(32 * HEX_SG * ntg, R, 1), threadgroup=(32 * HEX_SG, 1, 1),
             output_shapes=[(R, self.out_dims)], output_dtypes=[x.dtype])[0]
 
+    def _gmm(self, xs, sid, other=None):
+        """Metal, prompts: xs [R, in] rows sorted by expert sid [R] -> [R, out]; `other` (the up
+        projection) fuses silu(self) * other. Weights are read straight from HEX (no dense copy)."""
+        R = sid.shape[0]
+        return _hex_kernel("gmm_glu" if other is not None else "gmm")(
+            inputs=[xs, *self.parts(), *(other.parts() if other is not None else []), sid.astype(mx.uint32)],
+            template=[("T", xs.dtype), ("BITS", self.bits), ("IN", self.in_dims), ("OUT", self.out_dims)],
+            grid=(128 * (self.out_dims // 32), -(-R // 32), 1), threadgroup=(128, 1, 1),
+            output_shapes=[(R, self.out_dims)], output_dtypes=[xs.dtype])[0]
+
     def dequant(self, dtype=mx.bfloat16):
         """All experts as dense [E, out, in] weights (Metal), for prompt processing."""
         E = self.idx.shape[0]
@@ -319,13 +412,48 @@ class HexSwitchGLU(nn.Module):
         live = ids != HEX_SKIP
         order = mx.argsort(mx.where(live, ids, E - 1))
         sid = mx.minimum(ids[order], E - 1)
-        xs = xf[order // k][:, None].astype(mx.bfloat16)                                  # [R, 1, H]
-        mm = lambda a, lin: mx.gather_mm(a, lin.dequant().swapaxes(-1, -2), rhs_indices=sid,  # noqa: E731
-                                         sorted_indices=True)
-        a = nn.silu(mm(xs, self.gate_proj)) * mm(xs, self.up_proj)
-        y = mm(a, self.down_proj)[:, 0]
+        if HEX_PROMPT == "tiled":
+            xs = xf[order // k]                                                             # [R, H]
+            y = self.down_proj._gmm(self.gate_proj._gmm(xs, sid, self.up_proj), sid)
+        else:   # dequant: a dense bf16 copy of the tier per projection (fast, ~1 GB transient)
+            xs = xf[order // k][:, None].astype(mx.bfloat16)                              # [R, 1, H]
+            mm = lambda a, lin: mx.gather_mm(a, lin.dequant().swapaxes(-1, -2), rhs_indices=sid,  # noqa: E731
+                                             sorted_indices=True)
+            a = nn.silu(mm(xs, self.gate_proj)) * mm(xs, self.up_proj)
+            y = mm(a, self.down_proj)[:, 0]
         y = y[mx.argsort(order)]
         return mx.where(live[:, None], y, 0).astype(xf.dtype)
+
+    _tiled = None   # the tiled kernel's first-use check: None (not run), True, False
+
+    def _tiled_ok(self, xf, ids, k) -> bool:
+        """Once per process: the tiled kernel against the per-pair kernels on 96 of this prompt's
+        pairs. On a compile error or mismatch every prompt uses the matrix-vector path instead
+        (the least memory) and a warning says so."""
+        global HEX_PROMPT
+        if HexSwitchGLU._tiled is None:
+            dims = {self.gate_proj.in_dims, self.gate_proj.out_dims}
+            try:
+                if any(d % 32 for d in dims):
+                    raise ValueError(f"dims {sorted(dims)} not multiples of 32")
+                n = min(ids.size, 96)
+                sub = ids[:n]
+                live = sub != HEX_SKIP
+                sid = mx.sort(mx.where(live, sub, 0))
+                xs = xf[mx.arange(n) // k]
+                a = self.gate_proj._matvec(xs, sid, self.up_proj)
+                ref = self.down_proj._matvec(a, sid).astype(mx.float32)
+                got = self.down_proj._gmm(self.gate_proj._gmm(xs, sid, self.up_proj), sid).astype(mx.float32)
+                err = (mx.abs(got - ref).max() / (mx.abs(ref).max() + 1e-6)).item()
+                if not err < 3e-2:
+                    raise ValueError(f"relative error {err:.3g}")
+                HexSwitchGLU._tiled = True
+            except Exception as ex:  # noqa: BLE001
+                import warnings
+                warnings.warn(f"HEX tiled prompt kernel off ({ex}); prompts use the matrix-vector path")
+                HexSwitchGLU._tiled = False
+                HEX_PROMPT = "matvec"
+        return HexSwitchGLU._tiled
 
     def __call__(self, x, indices):
         """x [..., H], indices [..., k] -> [..., k, H] (like SwitchGLU)."""
@@ -333,7 +461,8 @@ class HexSwitchGLU(nn.Module):
         xf = x.reshape(-1, shp[-1])
         ids = indices.reshape(-1).astype(mx.uint32)   # HEX_SKIP marks slots another tier serves
         if _on_gpu():
-            if ids.size >= self.dequant_min_per_expert * self.gate_proj.idx.shape[0]:
+            if HEX_PROMPT != "matvec" and ids.size >= self.dequant_min_per_expert * self.gate_proj.idx.shape[0] \
+                    and (HEX_PROMPT != "tiled" or self._tiled_ok(xf, ids, k)):
                 y = self._dense(xf, ids, k)
             else:
                 a = self.gate_proj._matvec(xf, ids, self.up_proj)                       # silu(gate) * up, fused

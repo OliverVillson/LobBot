@@ -70,7 +70,7 @@ def affine_glu(E, H, I, bits):
 
 def main():
     assert mx.metal.is_available(), "needs an Apple-silicon GPU"
-    E, H, I, k = 160, 2048, 512, 6
+    E, H, I, k = 160, 2048, 512, 8   # Qwen3.6 after REAP 31.25%: 176 experts in two tiers, top 8
     ok = True
     for bits in (3, 4):
         glu = F.HexSwitchGLU(H, I, E, bits)
@@ -89,14 +89,16 @@ def main():
             errs.append(rel(glu.gate_proj._matvec(x, ids, glu.up_proj), a_ref))
             a = a_ref.astype(mx.bfloat16)
             errs.append(rel(glu.down_proj(a, ids, False), reference(glu.down_proj, a, ids)))
-            yd = glu._dense(x, ids, k)
             yr = reference(glu.down_proj, (nn.silu(g) * u).astype(mx.bfloat16), ids)
-            errs.append(rel(yd, yr))
+            for mode in ("dequant", "tiled"):
+                F.HEX_PROMPT = mode
+                errs.append(rel(glu._dense(x, ids, k), yr))
         with mx.stream(mx.cpu):
             wr = F.hex_dequant(*glu.down_proj.parts(), bits)
         errs.append(rel(glu.down_proj.dequant(mx.float32), wr))
         err = max(errs)
-        print(f"bits {bits}: max rel error over matvec / fused gate-up / down / prompt path / dequant: {err:.2e}")
+        print(f"bits {bits}: max rel error over matvec / fused gate-up / down / prompt paths (dequant, tiled) / "
+              f"dequant: {err:.2e}")
         ok &= err < 2e-2
 
         aff = affine_glu(E, H, I, bits)
@@ -110,13 +112,17 @@ def main():
         T = 1024
         x = mx.random.normal((T, H)).astype(mx.bfloat16)
         ids = mx.random.randint(0, E, (T, k)).astype(mx.uint32)
+        F.HEX_PROMPT = "tiled"
+        t_tiled = bench(lambda: glu(x, ids), n=5, chain=8)
+        F.HEX_PROMPT = "dequant"
         t_dense = bench(lambda: glu(x, ids), n=5, chain=8)
         saved = glu.dequant_min_per_expert
         glu.dequant_min_per_expert = 1 << 30
         t_mv = bench(lambda: glu(x, ids), n=2, chain=4)
         glu.dequant_min_per_expert = saved
         t_aff = bench(lambda: aff(x, ids, sort=True), n=5, chain=8)
-        print(f"  prompt, {T} tokens: HEX dequant+matmul {t_dense / 1e3:6.1f} ms · HEX matvec {t_mv / 1e3:6.1f} ms"
+        print(f"  prompt, {T} tokens: HEX tiled {t_tiled / 1e3:6.1f} ms · HEX dequant+matmul {t_dense / 1e3:6.1f} ms"
+              f" · HEX matvec {t_mv / 1e3:6.1f} ms"
               f" · MLX affine {bits}-bit {t_aff / 1e3:6.1f} ms  (per MoE layer)")
     print("HEX kernels OK" if ok else "HEX kernel MISMATCH: send this output")
 
