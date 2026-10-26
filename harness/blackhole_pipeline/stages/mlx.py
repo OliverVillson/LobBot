@@ -327,6 +327,10 @@ def run(bh, rj) -> None:
         cfg["head_vocab"] = len(head_ids)
     if hexcfg:
         cfg["hex"] = hexcfg
+    if p["mlx_think_budget"] and lay.model_file == "qwen_mlx.py":
+        from blackhole_pipeline.mlx.think_budget import think_config
+        from reaper_pipeline.load import load_tokenizer
+        cfg.update(think_config(load_tokenizer(src, rj.config.trust_remote_code), p["mlx_think_budget"]))
     cfg.update({"model_file": lay.model_file, "expert_tiers": tiers, "blackhole_source": str(src),
                 "quantization": {"group_size": group, "bits": bits, **quant}})
     (tmp / "config.json").write_text(json.dumps(cfg, indent=2) + "\n")

@@ -185,7 +185,7 @@ def load(path: Path, device: str):
     cfg = AutoConfig.from_pretrained(path)
     for c in (cfg, getattr(cfg, "text_config", None)):
         for a in ("quantization_config", "quantization", "model_file", "expert_tiers", "head_vocab", "hex",
-                  "blackhole_source"):
+                  "blackhole_source", "think_budget", "think_ids"):
             if c is not None and hasattr(c, a):
                 delattr(c, a)
     try:

@@ -85,6 +85,7 @@ DEFAULTS = {
     "mlx_attn_bits": 4,      # attention, shared experts, dense MLPs
     "mlx_attn_gptq": 1,      # GPTQ (1) or round-to-nearest (0) for those and the LM head
     "mlx_qo_bits": 0,        # q/o projections (the big attention matrices); 0 = mlx_attn_bits
+    "mlx_think_budget": 32768,  # Qwen exports: thinking tokens before the model must answer (0 = off; LCB v6: 32k cost nothing)
     "mlx_head_vocab": 0,     # output-only vocab trim: LM head rows kept (0 = all)
     "mlx_embed_bits": 4,
     "mlx_head_bits": 6,

@@ -483,3 +483,35 @@ def test_qwen_mac_schema_on_a_tiny_qwen3_6(tmp_path):
             layer.mlp.split_min = 1
     split = np.array(mm(mx.array(ids.numpy()))[0].astype(mx.float32))
     assert np.abs(split[fin] - out[fin]).max() < 1e-4 * np.abs(out[fin]).max()
+    # thinking budget: 4 tokens after <think> (id 5 here), then the forced line [7, 8, </think> = 6]
+    c = json.loads((xdir / "config.json").read_text())
+    c.update(think_budget=4, think_ids={"start": 5, "end": 6, "force": [7, 8, 6]})
+    (xdir / "config.json").write_text(json.dumps(c))
+    from mlx_lm.generate import generate_step
+    mt, _ = load_model(xdir, trust_remote_code=True)
+    gen = [int(t) for t, _ in generate_step(mx.array([20, 21, 5]), mt, max_tokens=9,
+                                              sampler=lambda lp: mx.argmax(lp, axis=-1))]
+    assert gen[4:7] == [7, 8, 6] and 5 not in gen[:4] and 6 not in gen[:4], gen
+
+
+def test_think_budget_forces_the_answer_line():
+    """qwen_mlx's budget forcing: past the budget the next tokens are the answer-now line ending in
+    </think>; a reply that closes its thinking in time is never touched; a new prompt re-syncs."""
+    pytest.importorskip("mlx")
+    sys.path.insert(0, str(HARNESS / "blackhole_pipeline" / "mlx"))
+    from qwen_mlx import ThinkBudget
+    S, E, F = 1, 2, [7, 8, 2]
+    tb = ThinkBudget(3, S, E, F)
+    assert tb.step([5, 6, S]) is None              # prompt ends with <think>
+    assert tb.step([10]) is None and tb.step([11]) is None
+    out, fed = [], [12]
+    for _ in range(4):                              # the model's choice is overridden each step
+        t = tb.step(fed)
+        out.append(t)
+        fed = [t] if t is not None else [99]
+    assert out == [7, 8, 2, None]
+    assert tb.step([5, S]) is None and tb.step([10]) is None and tb.step([E]) is None
+    assert tb.step([13]) is None and tb.step([14]) is None and tb.step([15]) is None and tb.step([16]) is None
+    tb = ThinkBudget(2, S, E, F)
+    tb.step([S]); tb.step([1 + 30]); assert tb.step([32]) == 7
+    assert tb.step([4, 4, S]) is None               # new request mid-forcing: re-synced
