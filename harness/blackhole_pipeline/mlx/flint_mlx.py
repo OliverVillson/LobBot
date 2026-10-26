@@ -121,9 +121,10 @@ class MLP(nn.Module):
 
 
 HEX_BLOCK = 32
-# prompt path: tiled (fused dequant + matmul, no extra memory), dequant (dense copy per layer,
-# ~1 GB transient), matvec (one matrix-vector product per pair: least memory, slowest)
-HEX_PROMPT = os.environ.get("BLACKHOLE_HEX_PROMPT", "tiled")
+# prompt path: dequant (a dense bf16 copy of one projection at a time, ~0.35 GB transient on
+# Qwen3.6; fastest: M5 22 ms per layer per 1k tokens), tiled (fused dequant + matmul, no copy;
+# 39 ms), matvec (one matrix-vector product per pair: least memory, 85 ms)
+HEX_PROMPT = os.environ.get("BLACKHOLE_HEX_PROMPT", "dequant")
 HEX_SKIP = 0xFFFFFFFF   # expert id of a (token, slot) another tier serves: output 0, no weights read
 _HEX_KERNELS = {}
 
@@ -419,11 +420,15 @@ class HexSwitchGLU(nn.Module):
         if HEX_PROMPT == "tiled":
             xs = xf[order // k]                                                             # [R, H]
             y = self.down_proj._gmm(self.gate_proj._gmm(xs, sid, self.up_proj), sid)
-        else:   # dequant: a dense bf16 copy of the tier per projection (fast, ~1 GB transient)
+        else:   # dequant: a dense bf16 copy of the tier, one projection at a time
             xs = xf[order // k][:, None].astype(mx.bfloat16)                              # [R, 1, H]
-            mm = lambda a, lin: mx.gather_mm(a, lin.dequant().swapaxes(-1, -2), rhs_indices=sid,  # noqa: E731
-                                             sorted_indices=True)
-            a = nn.silu(mm(xs, self.gate_proj)) * mm(xs, self.up_proj)
+
+            def mm(a, lin):
+                out = mx.gather_mm(a, lin.dequant().swapaxes(-1, -2), rhs_indices=sid, sorted_indices=True)
+                mx.eval(out)   # frees this copy before the next is made (3 copies at once overflowed 16 GB Macs)
+                return out
+            g = mm(xs, self.gate_proj)
+            a = nn.silu(g) * mm(xs, self.up_proj)
             y = mm(a, self.down_proj)[:, 0]
         y = y[mx.argsort(order)]
         return mx.where(live[:, None], y, 0).astype(xf.dtype)
